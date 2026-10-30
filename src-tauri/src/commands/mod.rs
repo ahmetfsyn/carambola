@@ -27,19 +27,29 @@ pub struct AnnotationElementDto {
 #[tauri::command]
 pub fn get_display_info(state: State<'_, AppState>) -> Result<DisplayInfo, String> {
     if let Some(frame) = state.get_frame() {
-        Ok(frame.display_info)
+        Ok(frame.display_info.clone())
     } else {
         Err("No captured frame available".to_string())
     }
 }
 
+/// Returns the freshly captured PNG as a raw binary IPC body. Returning
+/// `Vec<u8>` directly would serialize every byte as a JSON number, which costs
+/// several megabytes of string parsing inside the webview on every activation.
 #[tauri::command]
-pub fn get_current_frame(state: State<'_, AppState>) -> Result<Vec<u8>, String> {
+pub fn get_current_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Response, String> {
     if let Some(frame) = state.get_frame() {
-        Ok(frame.png_bytes)
+        Ok(tauri::ipc::Response::new(frame.png_bytes.clone()))
     } else {
         Err("No captured frame available".to_string())
     }
+}
+
+/// Second half of the activation handshake: called by the frontend once the new
+/// screenshot has been decoded and the previous session state has been cleared.
+#[tauri::command]
+pub fn present_overlay(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    crate::window::present_overlay(&app_handle, &state)
 }
 
 fn extract_cropped_rgba(
@@ -82,13 +92,8 @@ pub fn copy_crop(
         .get_frame()
         .ok_or_else(|| "No captured frame available".to_string())?;
 
-    let (crop_rgba, w, h) = extract_cropped_rgba(
-        &frame.rgba,
-        frame.width,
-        frame.height,
-        &crop,
-        scale_factor,
-    )?;
+    let (crop_rgba, w, h) =
+        extract_cropped_rgba(&frame.rgba, frame.width, frame.height, &crop, scale_factor)?;
 
     copy_rgba_to_clipboard(&crop_rgba, w, h)?;
     info!("Successfully copied {}x{} crop to clipboard", w, h);
@@ -106,13 +111,8 @@ pub fn save_crop(
         .get_frame()
         .ok_or_else(|| "No captured frame available".to_string())?;
 
-    let (crop_rgba, w, h) = extract_cropped_rgba(
-        &frame.rgba,
-        frame.width,
-        frame.height,
-        &crop,
-        scale_factor,
-    )?;
+    let (crop_rgba, w, h) =
+        extract_cropped_rgba(&frame.rgba, frame.width, frame.height, &crop, scale_factor)?;
 
     let pictures_dir = dirs::picture_dir().unwrap_or_else(|| std::env::current_dir().unwrap());
     let carambola_dir = pictures_dir.join("Carambola");
@@ -155,13 +155,8 @@ pub fn extract_ocr(
         .get_frame()
         .ok_or_else(|| "No captured frame available".to_string())?;
 
-    let (crop_rgba, w, h) = extract_cropped_rgba(
-        &frame.rgba,
-        frame.width,
-        frame.height,
-        &crop,
-        scale_factor,
-    )?;
+    let (crop_rgba, w, h) =
+        extract_cropped_rgba(&frame.rgba, frame.width, frame.height, &crop, scale_factor)?;
 
     let text = extract_text(&crop_rgba, w as u32, h as u32)?;
     let _ = copy_text_to_clipboard(&text);

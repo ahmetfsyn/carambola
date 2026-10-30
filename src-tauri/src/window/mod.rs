@@ -1,19 +1,34 @@
 use crate::app_state::{AppState, DisplayBounds};
 use crate::capture::capture_screen;
 use log::{error, info, warn};
+use serde::Serialize;
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
 
 /// Label of the single, pre-created screenshot overlay window.
 pub const OVERLAY_LABEL: &str = "overlay-main";
 
-/// Applies the frameless, always-on-top, full-monitor geometry required for a
-/// Lightshot-style overlay.
-///
-/// The position/size are applied in **physical** pixels straight from the
-/// captured monitor rectangle, so the overlay exactly covers the target display
-/// regardless of Windows DPI scaling and no matter what its native resolution is.
-pub fn apply_overlay_geometry(window: &WebviewWindow, bounds: &DisplayBounds) -> Result<(), String> {
-    // No title bar, frame, resize borders or drop shadow.
+/// Payload emitted to the hidden overlay as soon as a fresh frame is frozen in
+/// the backend. The frontend must reset its session and decode this frame
+/// *before* asking the backend to present the window (`present_overlay`), so the
+/// overlay is never shown with stale pixels or a stale selection.
+#[derive(Clone, Debug, Serialize)]
+pub struct CaptureReadyPayload {
+    #[serde(rename = "triggeredAt")]
+    pub triggered_at_ms: u64,
+    pub display: crate::app_state::DisplayInfo,
+    #[serde(rename = "captureMs")]
+    pub capture_ms: f64,
+    #[serde(rename = "encodeMs")]
+    pub encode_ms: f64,
+    #[serde(rename = "pngBytes")]
+    pub png_bytes: usize,
+}
+
+/// Applies the one-time, per-window style required by the screenshot overlay.
+/// These properties do not change between activations, so they are applied once
+/// during setup instead of on every shortcut press.
+fn configure_overlay(window: &WebviewWindow) -> Result<(), String> {
     window
         .set_decorations(false)
         .map_err(|e| format!("Failed to remove window decorations: {e}"))?;
@@ -29,7 +44,19 @@ pub fn apply_overlay_geometry(window: &WebviewWindow, bounds: &DisplayBounds) ->
     window
         .set_always_on_top(true)
         .map_err(|e| format!("Failed to raise overlay: {e}"))?;
+    Ok(())
+}
 
+/// Applies the frameless, always-on-top, full-monitor geometry required for a
+/// Lightshot-style overlay.
+///
+/// The position/size are applied in **physical** pixels straight from the
+/// captured monitor rectangle, so the overlay exactly covers the target display
+/// regardless of Windows DPI scaling and no matter what its native resolution is.
+pub fn apply_overlay_geometry(
+    window: &WebviewWindow,
+    bounds: &DisplayBounds,
+) -> Result<(), String> {
     let x = bounds.x.round() as i32;
     let y = bounds.y.round() as i32;
     let width = bounds.width.round().max(1.0) as u32;
@@ -73,6 +100,20 @@ pub fn leave_native_fullscreen(window: &WebviewWindow) {
     }
 }
 
+/// Blocks until the desktop composition pass has consumed pending window
+/// updates. Only used when the overlay is already visible and must be excluded
+/// from the next capture.
+#[cfg(target_os = "windows")]
+fn flush_composition() {
+    use windows::Win32::Graphics::Dwm::DwmFlush;
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn flush_composition() {}
+
 /// Called once during application setup. Sizes the hidden overlay to the
 /// captured monitor so it is never presented at the default window size and so
 /// the webview lays out at the correct dimensions ahead of the first capture.
@@ -81,9 +122,15 @@ pub fn prime_overlay(app_handle: &AppHandle, state: &AppState) {
         return;
     };
 
+    if let Err(e) = configure_overlay(&window) {
+        warn!("Failed to configure overlay window: {e}");
+    }
+
     if let Some(frame) = state.get_frame() {
         if let Err(e) = apply_overlay_geometry(&window, &frame.display_info.bounds) {
             warn!("Failed to prime overlay geometry: {e}");
+        } else {
+            state.set_last_overlay_bounds(frame.display_info.bounds.clone());
         }
     }
 
@@ -91,66 +138,95 @@ pub fn prime_overlay(app_handle: &AppHandle, state: &AppState) {
     let _ = window.hide();
 }
 
+/// First phase of an activation: freeze the current desktop and hand it to the
+/// (still hidden) webview. The window is intentionally **not** shown here.
 pub fn activate_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
+    let activation_started = Instant::now();
     info!("Activating screenshot overlay...");
 
-    // 1. Capture the target monitor immediately and freeze the frame in memory.
-    //    The desktop is captured exactly once per activation; it is never
-    //    re-captured while the overlay is shown.
+    let window = app_handle
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "Overlay window not found".to_string())?;
+
+    // If the overlay is currently on screen, remove it before capturing so the
+    // frozen frame contains the real desktop rather than our own UI. DwmFlush
+    // waits for the window removal to reach the screen instead of sleeping.
+    if state.is_overlay_visible() {
+        leave_native_fullscreen(&window);
+        let _ = window.hide();
+        state.set_overlay_visible(false);
+        flush_composition();
+    }
+
+    // Capture the target monitor immediately and freeze the frame in memory.
+    // The desktop is captured exactly once per activation; it is never
+    // re-captured while the overlay is shown.
     let frame = capture_screen().map_err(|e| {
         error!("Screen capture failed: {e}");
         e
     })?;
 
-    // TEMP diagnostic: dump the captured frame for offline comparison.
-    #[cfg(debug_assertions)]
-    let _ = std::fs::write(
-        r"C:\Users\furka\AppData\Local\Temp\kilo\frame.png",
-        &frame.png_bytes,
+    let bounds = frame.display_info.bounds.clone();
+    let payload = CaptureReadyPayload {
+        triggered_at_ms: frame.triggered_at_ms,
+        display: frame.display_info.clone(),
+        capture_ms: frame.capture_ms,
+        encode_ms: frame.encode_ms,
+        png_bytes: frame.png_bytes.len(),
+    };
+    state.set_frame(frame);
+
+    // Geometry is applied while the window is still hidden, so the webview has
+    // already laid out at the target size by the time it becomes visible.
+    if state.overlay_geometry_changed(&bounds) {
+        apply_overlay_geometry(&window, &bounds)?;
+        state.set_last_overlay_bounds(bounds);
+    }
+
+    info!(
+        "[perf] native prepare: {} ({:.1}ms since activation start)",
+        summarize(&payload),
+        activation_started.elapsed().as_secs_f64() * 1000.0
     );
 
-    let bounds = frame.display_info.bounds.clone();
-    let frame_scale = frame.display_info.scale_factor;
-    let frame_dims = (frame.width, frame.height);
-    state.set_frame(frame);
-    state.set_overlay_visible(true);
+    // Phase 2 is driven by the frontend: it resets the session, decodes this
+    // frame, then invokes `present_overlay`.
+    window
+        .emit("capture_triggered", payload)
+        .map_err(|e| format!("Failed to notify overlay frontend: {e}"))?;
 
-    // 2. Present the pre-created, frameless, fullscreen overlay window.
+    Ok(())
+}
+
+fn summarize(payload: &CaptureReadyPayload) -> String {
+    format!(
+        "capture={:.1}ms encode={:.1}ms png={}B display={}x{}",
+        payload.capture_ms,
+        payload.encode_ms,
+        payload.png_bytes,
+        payload.display.bounds.width,
+        payload.display.bounds.height
+    )
+}
+
+/// Second phase of an activation: the frontend has reset its session and
+/// decoded the fresh frame, so the pre-created window can be presented.
+pub fn present_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
     let window = app_handle
         .get_webview_window(OVERLAY_LABEL)
         .ok_or_else(|| "Overlay window not found".to_string())?;
 
-    // Geometry is applied *before* the window becomes visible so the user never
-    // sees an application window at the wrong size.
-    apply_overlay_geometry(&window, &bounds)?;
-    enter_native_fullscreen(&window);
+    if state.get_frame().is_none() {
+        return Err("No captured frame is ready".to_string());
+    }
 
+    enter_native_fullscreen(&window);
     window
         .show()
         .map_err(|e| format!("Failed to show overlay: {e}"))?;
     let _ = window.set_focus();
+    state.set_overlay_visible(true);
 
-    // Temporary pipeline diagnostics.
-    if let Ok(pos) = window.outer_position() {
-        info!("[diag] native outer_position = ({}, {})", pos.x, pos.y);
-    }
-    if let Ok(size) = window.inner_size() {
-        info!(
-            "[diag] native inner_size = {}x{} (physical)",
-            size.width, size.height
-        );
-    }
-    if let Ok(sf) = window.scale_factor() {
-        info!("[diag] native window scale_factor = {sf}");
-    }
-    info!(
-        "[diag] captured frame = {}x{} px, bounds = {}x{} at ({}, {}), scale_factor = {}",
-        frame_dims.0, frame_dims.1, bounds.width, bounds.height, bounds.x, bounds.y, frame_scale
-    );
-
-    // 3. Tell the frontend a fresh frozen frame is ready to be displayed.
-    let _ = window.emit("capture_triggered", ());
-
-    info!("Overlay presented successfully");
+    info!("[perf] overlay presented (window visible and focused)");
     Ok(())
 }

@@ -27,7 +27,13 @@ pub fn run() {
                 .with_handler(move |app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
                         info!("Global shortcut triggered");
-                        let _ = window::activate_overlay(app, &state_for_hotkey);
+                        let started = std::time::Instant::now();
+                        let result = window::activate_overlay(app, &state_for_hotkey);
+                        info!(
+                            "[perf] shortcut handler completed in {:.1}ms ({:?})",
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            result
+                        );
                     }
                 })
                 .build(),
@@ -41,6 +47,7 @@ pub fn run() {
             commands::copy_crop,
             commands::save_crop,
             commands::hide_overlay,
+            commands::present_overlay,
             commands::extract_ocr,
             commands::get_shortcut,
             commands::set_shortcut,

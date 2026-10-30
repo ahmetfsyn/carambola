@@ -27,7 +27,8 @@
         "shadow": false,
         "focus": false,
         "visible": false,
-        "fullscreen": false
+        "fullscreen": false,
+        "backgroundThrottling": "disabled"
       }
     ],
     "security": {

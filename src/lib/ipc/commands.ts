@@ -25,9 +25,25 @@ export async function getDisplayInfo(): Promise<DisplayInfo> {
   }
 }
 
-export async function getCurrentFrameBytes(): Promise<Uint8Array> {
-  const bytes = await invoke<number[] | Uint8Array>("get_current_frame");
-  return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+/** Returns the frozen frame PNG as raw bytes (Tauri binary IPC body). */
+export async function getCurrentFrameBytes(): Promise<ArrayBuffer> {
+  const bytes = await invoke<ArrayBuffer | Uint8Array | number[]>("get_current_frame");
+  if (bytes instanceof ArrayBuffer) return bytes;
+  if (bytes instanceof Uint8Array) {
+    return bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength
+    ) as ArrayBuffer;
+  }
+  return new Uint8Array(bytes).buffer;
+}
+
+/**
+ * Second half of an activation: shows the pre-created overlay window only after
+ * the frontend has decoded the fresh frame and cleared the previous session.
+ */
+export async function presentOverlay(): Promise<void> {
+  await invoke("present_overlay");
 }
 
 export async function copyCropToClipboard(

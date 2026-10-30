@@ -26,12 +26,46 @@ dirs = "5.0"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Media_Ocr",
     "Graphics_Imaging",
     "Foundation",
     "Foundation_Collections",
     "Storage_Streams",
 ] }
+
+# PNG encoding is the only CPU-heavy dependency on the activation path. Keep
+# the dev profile interactive by optimizing just the codec crates; the rest of
+# the application remains unoptimized for debugging.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.simd-adler32]
+opt-level = 3
+
+[profile.dev.package.xcap]
+opt-level = 2
+
+# The activation path deliberately uses tight pixel loops (BGRA -> RGBA,
+# clipboard cropping). Optimize this crate in dev so `tauri dev` activation
+# latency tracks the release build.
+[profile.dev.package.carambola]
+opt-level = 2
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"

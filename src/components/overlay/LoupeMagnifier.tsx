@@ -26,14 +26,16 @@ export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
 
   // The cursor is reported in CSS pixels, but the screenshot is stored in
   // natural (physical) pixels. `imageScale` converts between the two so the
-  // loupe always shows the exact pixel under the pointer.
-  const imageScale =
-    backgroundImage &&
-    "naturalWidth" in backgroundImage &&
-    backgroundImage.naturalWidth &&
-    canvasWidth
-      ? backgroundImage.naturalWidth / canvasWidth
-      : 1;
+  // loupe always shows the exact pixel under the pointer. `ImageBitmap` exposes
+  // its size as `width`/`height`, `HTMLImageElement` as `naturalWidth`.
+  const imageWidth = !backgroundImage
+    ? 0
+    : "naturalWidth" in backgroundImage && backgroundImage.naturalWidth
+      ? backgroundImage.naturalWidth
+      : "width" in backgroundImage && typeof backgroundImage.width === "number"
+        ? backgroundImage.width
+        : 0;
+  const imageScale = imageWidth && canvasWidth ? imageWidth / canvasWidth : 1;
 
   // Screenshot-pixel position under the cursor (what the user is actually
   // hovering in the original capture).

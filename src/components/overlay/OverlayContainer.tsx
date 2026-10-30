@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect, useCallback } from "react";
+import React, { useRef, useState, useEffect, useLayoutEffect, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Settings } from "lucide-react";
 import { Point, Rect, DragState, HandleType } from "../../types/crop";
@@ -91,11 +91,13 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     };
   }, []);
 
-  // Every new capture resets the selection/annotations and re-measures the
-  // window so the canvas always matches the (possibly relocated) overlay.
-  useEffect(() => {
+  // Every new capture starts a completely new session. This runs as a layout
+  // effect so the reset is committed (and the canvas redrawn) synchronously,
+  // before the window is shown, rather than after a visible stale frame.
+  useLayoutEffect(() => {
     setWindowSize({ width: window.innerWidth, height: window.innerHeight });
     setCrop(null);
+    setCursorPos({ x: 0, y: 0 });
     setElements([]);
     setUndoStack([]);
     setRedoStack([]);
@@ -107,10 +109,21 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       initialRect: null,
       activeHandle: null,
     });
+    // A new session always starts with the selection tool.
+    setActiveTool("select");
+    setCopiedFeedback(false);
+    setOcrLoading(false);
+    setToastMessage(null);
+
+    logDiagnostics("session_reset", {
+      captureToken,
+      viewport: `${window.innerWidth}x${window.innerHeight}`,
+    });
   }, [captureToken]);
 
-  // Main canvas render effect
-  useEffect(() => {
+  // Main canvas render. Layout effect so a fresh frame + reset session are
+  // painted before the overlay window is presented.
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -127,13 +140,23 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       activeElement: currentDrawing,
       isHovered: false,
     });
-  }, [windowSize, backgroundImage, crop, elements, currentDrawing, dpr]);
+  }, [windowSize, backgroundImage, crop, elements, currentDrawing, dpr, captureToken]);
 
   // Temporary pipeline diagnostics (canvas / viewport / image relationship).
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const img = backgroundImage as HTMLImageElement | null;
+    const img = backgroundImage as HTMLImageElement | ImageBitmap | null;
+    const imageWidth = img
+      ? "naturalWidth" in img && img.naturalWidth
+        ? img.naturalWidth
+        : img.width
+      : null;
+    const imageHeight = img
+      ? "naturalHeight" in img && img.naturalHeight
+        ? img.naturalHeight
+        : img.height
+      : null;
     logDiagnostics("canvas", {
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
@@ -142,12 +165,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       canvasBackingHeight: canvas.height,
       canvasCssWidth: canvas.clientWidth,
       canvasCssHeight: canvas.clientHeight,
-      imageNaturalWidth: img && "naturalWidth" in img ? img.naturalWidth : null,
-      imageNaturalHeight: img && "naturalHeight" in img ? img.naturalHeight : null,
+      imageNaturalWidth: imageWidth,
+      imageNaturalHeight: imageHeight,
       imageScale:
-        img && "naturalWidth" in img && img.naturalWidth && canvas.clientWidth
-          ? img.naturalWidth / canvas.clientWidth
-          : null,
+        imageWidth && canvas.clientWidth ? imageWidth / canvas.clientWidth : null,
       renderedWidth: windowSize.width,
       renderedHeight: windowSize.height,
     });
@@ -483,6 +504,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
       {/* 4x Magnifier Loupe */}
       <LoupeMagnifier
+        key={captureToken}
         cursor={cursorPos}
         visible={dragState.mode === "creating" || (!crop && dragState.mode === "none")}
         backgroundImage={backgroundImage}

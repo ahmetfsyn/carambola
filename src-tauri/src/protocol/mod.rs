@@ -17,7 +17,7 @@ pub fn handle_carambola_protocol(
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "image/png")
                     .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
-                    .body(frame.png_bytes)
+                    .body(frame.png_bytes.clone())
                     .unwrap();
             }
         }
@@ -29,4 +29,3 @@ pub fn handle_carambola_protocol(
         .body(Vec::new())
         .unwrap()
 }
-
