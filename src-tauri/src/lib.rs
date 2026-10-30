@@ -37,12 +37,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_display_info,
+            commands::get_current_frame,
             commands::copy_crop,
             commands::save_crop,
             commands::hide_overlay,
             commands::extract_ocr,
             commands::get_shortcut,
             commands::set_shortcut,
+            commands::frontend_log,
         ])
         .setup(move |app| {
             info!("Running application setup...");
@@ -63,9 +65,12 @@ pub fn run() {
                 info!("Initial screen frame primed in background");
             }
 
+            // Size the hidden overlay to the target monitor up front so it is
+            // never shown at the default window size.
+            window::prime_overlay(app.handle(), &state_for_setup);
+
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("Error while running Carambola application");
 }
-

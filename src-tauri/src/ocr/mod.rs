@@ -1,7 +1,7 @@
 use log::info;
 
 pub fn extract_text(
-    _rgba: &[u8],
+    rgba: &[u8],
     width: u32,
     height: u32,
 ) -> Result<String, String> {
@@ -16,9 +16,19 @@ pub fn extract_text(
         let engine = OcrEngine::TryCreateFromUserProfileLanguages()
             .map_err(|e| format!("Windows OCR engine init error: {e}"))?;
 
-        // Construct WinRT SoftwareBitmap from raw RGBA bytes
+        // Write RGBA pixel data into a WinRT IBuffer via DataWriter
+        let writer = DataWriter::new()
+            .map_err(|e| format!("Failed to create DataWriter: {e}"))?;
+        writer
+            .WriteBytes(rgba)
+            .map_err(|e| format!("Failed to write pixel data: {e}"))?;
+        let buffer = writer
+            .DetachBuffer()
+            .map_err(|e| format!("Failed to detach buffer: {e}"))?;
+
+        // Construct WinRT SoftwareBitmap from the pixel buffer
         let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
-            &windows::Storage::Streams::Buffer::Create(width * height * 4).unwrap(),
+            &buffer,
             BitmapPixelFormat::Rgba8,
             width as i32,
             height as i32,
@@ -58,4 +68,3 @@ pub fn extract_text(
         Ok("[Carambola OCR]: OCR not supported on this platform.".into())
     }
 }
-

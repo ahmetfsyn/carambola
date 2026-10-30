@@ -25,6 +25,11 @@ export async function getDisplayInfo(): Promise<DisplayInfo> {
   }
 }
 
+export async function getCurrentFrameBytes(): Promise<Uint8Array> {
+  const bytes = await invoke<number[] | Uint8Array>("get_current_frame");
+  return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+}
+
 export async function copyCropToClipboard(
   crop: Rect,
   elements: AnnotationElement[],
@@ -71,4 +76,11 @@ export async function getGlobalShortcut(): Promise<string> {
 
 export async function setGlobalShortcut(shortcut: string): Promise<void> {
   await invoke("set_shortcut", { shortcut });
+}
+
+/// Temporary geometry diagnostics forwarded to the Rust log stream.
+export function logDiagnostics(tag: string, data: Record<string, unknown>): void {
+  invoke("frontend_log", { message: `${tag} ${JSON.stringify(data)}` }).catch(() => {
+    // Diagnostics must never affect runtime behaviour.
+  });
 }

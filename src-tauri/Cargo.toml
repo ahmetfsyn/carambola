@@ -28,9 +28,10 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     "Media_Ocr",
     "Graphics_Imaging",
-    "Foundation"
+    "Foundation",
+    "Foundation_Collections",
+    "Storage_Streams",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
-

@@ -13,12 +13,19 @@
     "windows": [
       {
         "label": "overlay-main",
-        "title": "Carambola Overlay",
-        "transparent": true,
+        "title": "Carambola",
+        "width": 200,
+        "height": 200,
+        "transparent": false,
         "decorations": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false,
+        "shadow": false,
+        "focus": false,
         "visible": false,
         "fullscreen": false
       }

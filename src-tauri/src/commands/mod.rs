@@ -33,6 +33,15 @@ pub fn get_display_info(state: State<'_, AppState>) -> Result<DisplayInfo, Strin
     }
 }
 
+#[tauri::command]
+pub fn get_current_frame(state: State<'_, AppState>) -> Result<Vec<u8>, String> {
+    if let Some(frame) = state.get_frame() {
+        Ok(frame.png_bytes)
+    } else {
+        Err("No captured frame available".to_string())
+    }
+}
+
 fn extract_cropped_rgba(
     frame_rgba: &[u8],
     frame_w: u32,
@@ -129,7 +138,8 @@ pub fn save_crop(
 #[tauri::command]
 pub fn hide_overlay(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.set_overlay_visible(false);
-    if let Some(window) = app_handle.get_webview_window("overlay-main") {
+    if let Some(window) = app_handle.get_webview_window(crate::window::OVERLAY_LABEL) {
+        crate::window::leave_native_fullscreen(&window);
         let _ = window.hide();
     }
     Ok(())
@@ -164,9 +174,14 @@ pub fn get_shortcut() -> Result<String, String> {
     Ok(crate::hotkey::load_or_create_config())
 }
 
+/// Temporary diagnostic sink so frontend-measured geometry appears in the same
+/// log stream as the native window/capture measurements.
+#[tauri::command]
+pub fn frontend_log(message: String) {
+    info!("[diag] {message}");
+}
+
 #[tauri::command]
 pub fn set_shortcut(app_handle: AppHandle, shortcut: String) -> Result<(), String> {
     crate::hotkey::update_global_shortcut(&app_handle, &shortcut)
 }
-
-

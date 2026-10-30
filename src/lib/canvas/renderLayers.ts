@@ -5,8 +5,12 @@ import { getHandlePositions, HANDLE_SIZE } from "./geometry";
 
 export interface RenderParams {
   ctx: CanvasRenderingContext2D;
+  /** Layout width of the canvas in CSS pixels. */
   canvasWidth: number;
+  /** Layout height of the canvas in CSS pixels. */
   canvasHeight: number;
+  /** Device pixel ratio of the canvas backing store. */
+  dpr: number;
   backgroundImage: ImageBitmap | HTMLImageElement | null;
   cropRect: Rect | null;
   elements: AnnotationElement[];
@@ -14,21 +18,47 @@ export interface RenderParams {
   isHovered: boolean;
 }
 
+/** Reports the natural pixel width of a canvas image source, if known. */
+function imageNaturalWidth(
+  image: ImageBitmap | HTMLImageElement | null
+): number | null {
+  if (!image) return null;
+  if ("naturalWidth" in image && image.naturalWidth) return image.naturalWidth;
+  if ("width" in image && typeof image.width === "number" && image.width) {
+    return image.width;
+  }
+  return null;
+}
+
 export function renderCanvas(params: RenderParams) {
   const {
     ctx,
     canvasWidth,
     canvasHeight,
+    dpr,
     backgroundImage,
     cropRect,
     elements,
     activeElement,
   } = params;
 
-  // Clear entire canvas
+  // The canvas backing store is sized in physical pixels (`css * dpr`) while
+  // every coordinate in this module is expressed in CSS pixels. Scaling the
+  // context once here keeps a single, consistent coordinate system: the
+  // pointer, the selection rectangle, the annotations and the screenshot all
+  // share the same CSS-pixel space and the browser maps it 1:1 onto the
+  // physical display.
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // Clear entire canvas (CSS-pixel extents cover the full backing store).
   ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
-  // 1. Draw background image
+  // 1. Draw background image, mapping the screenshot (natural/physical pixels)
+  //    onto the CSS-pixel canvas. `imageScale` is the factor between the two
+  //    spaces and must be applied to every source-image rectangle.
+  const imageScale =
+    (imageNaturalWidth(backgroundImage) ?? canvasWidth) / canvasWidth;
+
   if (backgroundImage) {
     ctx.drawImage(backgroundImage, 0, 0, canvasWidth, canvasHeight);
   }
@@ -45,14 +75,16 @@ export function renderCanvas(params: RenderParams) {
     ctx.fillRect(cropRect.x, cropRect.y, cropRect.width, cropRect.height);
     ctx.globalCompositeOperation = "source-over";
 
-    // Redraw the crisp background inside the cutout
+    // Redraw the crisp background inside the cutout. The source rectangle is in
+    // screenshot (image) pixels, so it must be scaled from the CSS-pixel crop
+    // rect by `imageScale`; the destination stays in CSS pixels.
     if (backgroundImage) {
       ctx.drawImage(
         backgroundImage,
-        cropRect.x,
-        cropRect.y,
-        cropRect.width,
-        cropRect.height,
+        cropRect.x * imageScale,
+        cropRect.y * imageScale,
+        cropRect.width * imageScale,
+        cropRect.height * imageScale,
         cropRect.x,
         cropRect.y,
         cropRect.width,

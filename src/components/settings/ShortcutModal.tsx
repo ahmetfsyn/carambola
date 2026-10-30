@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Keyboard, Check, X, AlertCircle } from "lucide-react";
 import { getGlobalShortcut, setGlobalShortcut } from "../../lib/ipc/commands";
 
@@ -9,13 +9,133 @@ interface ShortcutModalProps {
 }
 
 const PRESETS = [
-  { label: "Cmd/Ctrl + Shift + X (Default)", value: "CommandOrControl+Shift+X" },
+  { label: "PrintScreen (Windows Default)", value: "PrintScreen" },
+  { label: "Cmd/Ctrl + Shift + X (macOS Default)", value: "CommandOrControl+Shift+X" },
   { label: "Alt + A (Lightshot Style)", value: "Alt+A" },
   { label: "Cmd/Ctrl + Shift + S", value: "CommandOrControl+Shift+S" },
-  { label: "PrintScreen (Windows)", value: "PrintScreen" },
   { label: "F10 Function Key", value: "F10" },
   { label: "Ctrl + Alt + S", value: "Control+Alt+S" },
 ];
+
+/**
+ * Mapping of physical keyboard `code` and symbolic `key` values
+ * to Tauri `global-hotkey` compatible key identifiers.
+ */
+const CODE_TO_TAURI_KEY: Record<string, string> = {
+  Quote: "Quote",
+  Backquote: "Backquote",
+  Slash: "Slash",
+  Backslash: "Backslash",
+  Semicolon: "Semicolon",
+  Equal: "Equal",
+  Minus: "Minus",
+  Comma: "Comma",
+  Period: "Period",
+  BracketLeft: "BracketLeft",
+  BracketRight: "BracketRight",
+  PrintScreen: "PrintScreen",
+  Space: "Space",
+  Enter: "Enter",
+  Tab: "Tab",
+  Backspace: "Backspace",
+  Delete: "Delete",
+  Insert: "Insert",
+  Home: "Home",
+  End: "End",
+  PageUp: "PageUp",
+  PageDown: "PageDown",
+  ArrowUp: "ArrowUp",
+  ArrowDown: "ArrowDown",
+  ArrowLeft: "ArrowLeft",
+  ArrowRight: "ArrowRight",
+  Escape: "Escape",
+};
+
+/**
+ * Fallback mapping for typed characters if code mapping needs alias
+ */
+const CHAR_TO_TAURI_KEY: Record<string, string> = {
+  '"': "Quote",
+  "'": "Quote",
+  "`": "Backquote",
+  "~": "Backquote",
+  ";": "Semicolon",
+  ":": "Semicolon",
+  "=": "Equal",
+  "+": "Equal",
+  "-": "Minus",
+  "_": "Minus",
+  "/": "Slash",
+  "?": "Slash",
+  "\\": "Backslash",
+  "|": "Backslash",
+  ",": "Comma",
+  "<": "Comma",
+  ".": "Period",
+  ">": "Period",
+  "[": "BracketLeft",
+  "{": "BracketLeft",
+  "]": "BracketRight",
+  "}": "BracketRight",
+};
+
+/**
+ * Maps a KeyboardEvent into a Tauri-compatible shortcut string
+ * (e.g. CommandOrControl, Control, Alt, Shift, Key, Function keys)
+ */
+function parseKeyboardEventToShortcut(e: React.KeyboardEvent): string | null {
+  // Ignore lonely modifier presses
+  if (["Control", "Shift", "Alt", "Meta", "AltGraph"].includes(e.key)) {
+    return null;
+  }
+
+  const parts: string[] = [];
+
+  // Modifiers in standard order
+  if (e.metaKey || e.ctrlKey) {
+    parts.push("CommandOrControl");
+  }
+  if (e.altKey) {
+    parts.push("Alt");
+  }
+  if (e.shiftKey) {
+    parts.push("Shift");
+  }
+
+  let key: string | undefined;
+
+  // 1. Check known physical codes (e.g., Code 'Quote' for ' or ", 'Backquote' for `)
+  if (CODE_TO_TAURI_KEY[e.code]) {
+    key = CODE_TO_TAURI_KEY[e.code];
+  } else if (e.code.startsWith("F") && /^F\d{1,2}$/.test(e.code)) {
+    key = e.code;
+  } else if (e.code.startsWith("Key") && e.code.length === 4) {
+    key = e.code.slice(3).toUpperCase();
+  } else if (e.code.startsWith("Digit") && e.code.length === 6) {
+    key = e.code.slice(5);
+  } else if (e.code.startsWith("Numpad") && /^Numpad\d$/.test(e.code)) {
+    key = `Numpad${e.code.slice(6)}`;
+  } else if (CHAR_TO_TAURI_KEY[e.key]) {
+    key = CHAR_TO_TAURI_KEY[e.key];
+  } else if (e.key.length === 1) {
+    key = e.key.toUpperCase();
+  }
+
+  if (!key) {
+    return null;
+  }
+
+  // If only a standalone key without modifiers is pressed, only allow certain keys
+  if (parts.length === 0) {
+    if (key === "PrintScreen" || /^F\d{1,2}$/.test(key)) {
+      return key;
+    }
+    return null;
+  }
+
+  parts.push(key);
+  return parts.join("+");
+}
 
 export const ShortcutModal: React.FC<ShortcutModalProps> = ({
   isOpen,
@@ -25,8 +145,10 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
   const [currentShortcut, setCurrentShortcut] = useState<string>("");
   const [selectedShortcut, setSelectedShortcut] = useState<string>("");
   const [customInput, setCustomInput] = useState<string>("");
+  const [isRecording, setIsRecording] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (isOpen) {
@@ -34,6 +156,7 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
         setCurrentShortcut(sc);
         setSelectedShortcut(sc);
         setCustomInput(sc);
+        setIsRecording(false);
         setErrorMessage(null);
       });
     }
@@ -41,12 +164,38 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
 
   if (!isOpen) return null;
 
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (e.key === "Escape") {
+      setIsRecording(false);
+      inputRef.current?.blur();
+      return;
+    }
+
+    const shortcut = parseKeyboardEventToShortcut(e);
+    if (shortcut) {
+      setCustomInput(shortcut);
+      setSelectedShortcut(shortcut);
+      setErrorMessage(null);
+      setIsRecording(false);
+      inputRef.current?.blur();
+    }
+  };
+
   const handleSave = async () => {
-    const toSave = customInput.trim() || selectedShortcut;
+    // Normalize custom string if user typed double quote or single quote directly
+    let toSave = (customInput.trim() || selectedShortcut);
     if (!toSave) {
       setErrorMessage("Please enter or select a shortcut.");
       return;
     }
+
+    // Auto-normalize common punctuation representations to Tauri names
+    toSave = toSave
+      .replace(/\+["']$/, "+Quote")
+      .replace(/\+`$/, "+Backquote");
 
     setIsSaving(true);
     setErrorMessage(null);
@@ -68,6 +217,8 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
       .replace("Control", "Ctrl")
       .replace("Shift", "⇧")
       .replace("Alt", "⌥ / Alt")
+      .replace("Quote", '"')
+      .replace("Backquote", "`")
       .replace(/\+/g, " + ");
   };
 
@@ -114,7 +265,7 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
           <label className="text-xs font-semibold text-slate-300 block">
             Popular Presets:
           </label>
-          <div className="grid grid-cols-1 gap-1.5 max-h-44 overflow-y-auto pr-1">
+          <div className="grid grid-cols-1 gap-1.5 max-h-40 overflow-y-auto pr-1">
             {PRESETS.map((p) => {
               const isSelected = selectedShortcut === p.value;
               return (
@@ -124,6 +275,8 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
                   onClick={() => {
                     setSelectedShortcut(p.value);
                     setCustomInput(p.value);
+                    setIsRecording(false);
+                    setErrorMessage(null);
                   }}
                   className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left text-xs transition-colors border ${
                     isSelected
@@ -133,7 +286,7 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
                 >
                   <span>{p.label}</span>
                   <span className="font-mono text-[11px] text-slate-400">
-                    {p.value}
+                    {formatBadge(p.value)}
                   </span>
                 </button>
               );
@@ -141,23 +294,56 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
           </div>
         </div>
 
-        {/* Custom Shortcut Input */}
+        {/* Custom Shortcut Input with Keyboard Listener */}
         <div className="space-y-1.5 mb-5">
-          <label className="text-xs font-semibold text-slate-300 block">
-            Custom Shortcut Definition:
-          </label>
-          <input
-            type="text"
-            value={customInput}
-            onChange={(e) => {
-              setCustomInput(e.target.value);
-              setSelectedShortcut("");
-            }}
-            placeholder="e.g. CommandOrControl+Shift+X or Alt+A"
-            className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 focus:border-carambola-cyan text-sm font-mono text-white placeholder-slate-500 outline-none transition-colors"
-          />
-          <p className="text-[11px] text-slate-500">
-            Supported modifiers: <code>CommandOrControl</code>, <code>Alt</code>, <code>Shift</code>, <code>Control</code>.
+          <div className="flex items-center justify-between">
+            <label className="text-xs font-semibold text-slate-300 block">
+              Custom Shortcut Definition:
+            </label>
+            {isRecording && (
+              <span className="text-[11px] text-carambola-cyan animate-pulse font-medium">
+                Listening for keys...
+              </span>
+            )}
+          </div>
+          <div className="relative">
+            <input
+              ref={inputRef}
+              type="text"
+              readOnly
+              value={isRecording ? "Press key combination..." : (customInput ? formatBadge(customInput) : "")}
+              onFocus={() => {
+                setIsRecording(true);
+                setErrorMessage(null);
+              }}
+              onBlur={() => {
+                setIsRecording(false);
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder="Click here and press key combo..."
+              className={`w-full px-3 py-2.5 rounded-xl bg-slate-950 border text-sm font-mono transition-colors outline-none cursor-pointer ${
+                isRecording
+                  ? "border-carambola-cyan text-carambola-cyan ring-2 ring-carambola-cyan/20"
+                  : "border-slate-700 focus:border-carambola-cyan text-white placeholder-slate-500"
+              }`}
+            />
+            {customInput && !isRecording && (
+              <button
+                type="button"
+                onClick={() => {
+                  setCustomInput("");
+                  setSelectedShortcut("");
+                  inputRef.current?.focus();
+                }}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 p-1"
+                title="Clear"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
+          <p className="text-[11px] text-slate-400">
+            Click the input field and press any key combination (e.g. <code>Alt + "</code>, <code>Alt + A</code>, or <code>PrintScreen</code>). Press <code>Esc</code> to cancel recording.
           </p>
         </div>
 
@@ -192,4 +378,3 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
     </div>
   );
 };
-

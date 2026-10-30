@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "PATH=\"$HOME/.cargo/bin:$PATH\" tauri"
+    "tauri": "set PATH=%USERPROFILE%\\.cargo\\bin;%PATH%&& tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

@@ -19,18 +19,27 @@ import {
   saveCropToDisk,
   hideOverlay,
   extractOcrText,
+  logDiagnostics,
 } from "../../lib/ipc/commands";
 
 interface OverlayContainerProps {
   backgroundImage: ImageBitmap | HTMLImageElement | null;
   scaleFactor: number;
+  captureToken: number;
 }
 
 export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   backgroundImage,
   scaleFactor,
+  captureToken,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Device pixel ratio for this webview. The canvas backing store is sized in
+  // physical pixels (`css * dpr`) so the screenshot is rendered crisply at the
+  // display's native resolution, while all interaction coordinates stay in CSS
+  // pixels (the canvas context is scaled by `dpr` in `renderCanvas`).
+  const dpr = window.devicePixelRatio || 1;
 
   // Crop & interaction state
   const [crop, setCrop] = useState<Rect | null>(null);
@@ -82,6 +91,24 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     };
   }, []);
 
+  // Every new capture resets the selection/annotations and re-measures the
+  // window so the canvas always matches the (possibly relocated) overlay.
+  useEffect(() => {
+    setWindowSize({ width: window.innerWidth, height: window.innerHeight });
+    setCrop(null);
+    setElements([]);
+    setUndoStack([]);
+    setRedoStack([]);
+    setCurrentDrawing(null);
+    setEditingText(null);
+    setDragState({
+      mode: "none",
+      startPoint: { x: 0, y: 0 },
+      initialRect: null,
+      activeHandle: null,
+    });
+  }, [captureToken]);
+
   // Main canvas render effect
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -93,13 +120,38 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       ctx,
       canvasWidth: windowSize.width,
       canvasHeight: windowSize.height,
+      dpr,
       backgroundImage,
       cropRect: crop,
       elements,
       activeElement: currentDrawing,
       isHovered: false,
     });
-  }, [windowSize, backgroundImage, crop, elements, currentDrawing]);
+  }, [windowSize, backgroundImage, crop, elements, currentDrawing, dpr]);
+
+  // Temporary pipeline diagnostics (canvas / viewport / image relationship).
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const img = backgroundImage as HTMLImageElement | null;
+    logDiagnostics("canvas", {
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      canvasBackingWidth: canvas.width,
+      canvasBackingHeight: canvas.height,
+      canvasCssWidth: canvas.clientWidth,
+      canvasCssHeight: canvas.clientHeight,
+      imageNaturalWidth: img && "naturalWidth" in img ? img.naturalWidth : null,
+      imageNaturalHeight: img && "naturalHeight" in img ? img.naturalHeight : null,
+      imageScale:
+        img && "naturalWidth" in img && img.naturalWidth && canvas.clientWidth
+          ? img.naturalWidth / canvas.clientWidth
+          : null,
+      renderedWidth: windowSize.width,
+      renderedHeight: windowSize.height,
+    });
+  }, [backgroundImage, windowSize, dpr]);
 
   // Push element to history
   const pushElement = useCallback((element: AnnotationElement) => {
@@ -415,8 +467,9 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       {/* 4-Layer Interactive HTML5 Canvas */}
       <canvas
         ref={canvasRef}
-        width={windowSize.width}
-        height={windowSize.height}
+        width={Math.round(windowSize.width * dpr)}
+        height={Math.round(windowSize.height * dpr)}
+        style={{ width: `${windowSize.width}px`, height: `${windowSize.height}px` }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}

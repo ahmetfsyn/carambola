@@ -9,6 +9,9 @@ interface LoupeMagnifierProps {
   canvasHeight: number;
 }
 
+const LOUPE_SIZE = 100;
+const SAMPLE_RADIUS = 10; // CSS pixels sampled around the cursor
+
 export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
   cursor,
   visible,
@@ -19,6 +22,24 @@ export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [hexColor, setHexColor] = React.useState<string>("#000000");
 
+  const dpr = window.devicePixelRatio || 1;
+
+  // The cursor is reported in CSS pixels, but the screenshot is stored in
+  // natural (physical) pixels. `imageScale` converts between the two so the
+  // loupe always shows the exact pixel under the pointer.
+  const imageScale =
+    backgroundImage &&
+    "naturalWidth" in backgroundImage &&
+    backgroundImage.naturalWidth &&
+    canvasWidth
+      ? backgroundImage.naturalWidth / canvasWidth
+      : 1;
+
+  // Screenshot-pixel position under the cursor (what the user is actually
+  // hovering in the original capture).
+  const screenshotX = Math.round(cursor.x * imageScale);
+  const screenshotY = Math.round(cursor.y * imageScale);
+
   useEffect(() => {
     if (!visible || !backgroundImage || !canvasRef.current) return;
 
@@ -26,19 +47,20 @@ export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const loupeSize = 100;
-    const sampleRadius = 10;
-    const zoom = 5;
-
+    // Work in CSS-pixel loupe units; the backing store is `LOUPE_SIZE * dpr`.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, loupeSize, loupeSize);
+    ctx.clearRect(0, 0, LOUPE_SIZE, LOUPE_SIZE);
+
+    // Source rectangle in screenshot pixels corresponding to the CSS-pixel
+    // sample window around the cursor.
+    const srcRadius = SAMPLE_RADIUS * imageScale;
+    const sx = cursor.x * imageScale - srcRadius;
+    const sy = cursor.y * imageScale - srcRadius;
+    const sWidth = srcRadius * 2;
+    const sHeight = srcRadius * 2;
 
     // Draw magnified center region
-    const sx = cursor.x - sampleRadius;
-    const sy = cursor.y - sampleRadius;
-    const sWidth = sampleRadius * 2;
-    const sHeight = sampleRadius * 2;
-
     ctx.drawImage(
       backgroundImage,
       sx,
@@ -47,13 +69,14 @@ export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
       sHeight,
       0,
       0,
-      loupeSize,
-      loupeSize
+      LOUPE_SIZE,
+      LOUPE_SIZE
     );
 
-    // Sample center pixel color
+    // Sample center pixel color (backing-store pixels).
     try {
-      const centerPixel = ctx.getImageData(loupeSize / 2, loupeSize / 2, 1, 1).data;
+      const center = Math.floor((LOUPE_SIZE * dpr) / 2);
+      const centerPixel = ctx.getImageData(center, center, 1, 1).data;
       const r = centerPixel[0].toString(16).padStart(2, "0");
       const g = centerPixel[1].toString(16).padStart(2, "0");
       const b = centerPixel[2].toString(16).padStart(2, "0");
@@ -68,19 +91,25 @@ export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
 
     // Horizontal crosshair
     ctx.beginPath();
-    ctx.moveTo(0, loupeSize / 2);
-    ctx.lineTo(loupeSize, loupeSize / 2);
+    ctx.moveTo(0, LOUPE_SIZE / 2);
+    ctx.lineTo(LOUPE_SIZE, LOUPE_SIZE / 2);
     ctx.stroke();
 
     // Vertical crosshair
     ctx.beginPath();
-    ctx.moveTo(loupeSize / 2, 0);
-    ctx.lineTo(loupeSize / 2, loupeSize);
+    ctx.moveTo(LOUPE_SIZE / 2, 0);
+    ctx.lineTo(LOUPE_SIZE / 2, LOUPE_SIZE);
     ctx.stroke();
 
-    // Center pixel highlight box
-    ctx.strokeRect(loupeSize / 2 - zoom / 2, loupeSize / 2 - zoom / 2, zoom, zoom);
-  }, [cursor, visible, backgroundImage]);
+    // Highlight a single screenshot pixel at the center of the loupe.
+    const pixelZoom = LOUPE_SIZE / sWidth; // loupe px per screenshot px
+    ctx.strokeRect(
+      LOUPE_SIZE / 2 - pixelZoom / 2,
+      LOUPE_SIZE / 2 - pixelZoom / 2,
+      pixelZoom,
+      pixelZoom
+    );
+  }, [cursor, visible, backgroundImage, imageScale, dpr]);
 
   if (!visible) return null;
 
@@ -103,8 +132,9 @@ export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
     >
       <canvas
         ref={canvasRef}
-        width={100}
-        height={100}
+        width={LOUPE_SIZE * dpr}
+        height={LOUPE_SIZE * dpr}
+        style={{ width: `${LOUPE_SIZE}px`, height: `${LOUPE_SIZE}px` }}
         className="rounded-lg border border-slate-700/60"
       />
       <div className="mt-1 flex items-center justify-between w-full px-1 text-[11px] font-mono text-slate-300">
@@ -116,10 +146,9 @@ export const LoupeMagnifier: React.FC<LoupeMagnifierProps> = ({
           <span className="font-semibold text-white">{hexColor}</span>
         </span>
         <span className="text-[10px] text-slate-400">
-          {cursor.x}, {cursor.y}
+          {screenshotX}, {screenshotY}
         </span>
       </div>
     </div>
   );
 };
-
