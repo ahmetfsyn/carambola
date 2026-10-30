@@ -1,0 +1,36 @@
+[package]
+name = "carambola"
+version = "0.1.0"
+description = "Lightweight cross-platform screenshot and annotation application"
+edition = "2021"
+default-run = "carambola"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.1", features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+xcap = "0.0.9"
+arboard = "3.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4"
+dirs = "5.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Foundation"
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+

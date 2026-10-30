@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Rust build artifacts
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# Web production bundle
+dist/
+
+# Logs & Temporary files
+*.log
+.DS_Store
+.vscode/
+.idea/
