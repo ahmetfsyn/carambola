@@ -30,7 +30,7 @@ These statuses describe available project evidence, not a guarantee of support o
 
 ## Installation
 
-No verified release installer is included in this repository. Check the [GitHub Releases](https://github.com/ahmetfsyn/carambola/releases) page for any published builds. To run Carambola now, build it from source using the instructions below.
+The first release provides a macOS Apple Silicon build only. Download `Carambola_0.1.0_aarch64.dmg` from the [v0.1.0 release](https://github.com/ahmetfsyn/carambola/releases/tag/v0.1.0), open it, and drag Carambola to Applications. Windows and Linux installers are not included.
 
 On macOS, screen capture requires Screen Recording permission. Allow Carambola under **System Settings → Privacy & Security → Screen & System Audio Recording**, then restart the app. Permission behavior can vary for locally built, ad hoc signed copies.
 
