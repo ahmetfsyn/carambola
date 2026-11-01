@@ -21,18 +21,24 @@ log = "0.4"
 env_logger = "0.11"
 chrono = "0.4"
 dirs = "5.0"
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-single-instance = "2.5.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
-    "Win32_Graphics_Dwm",
     "Media_Ocr",
     "Graphics_Imaging",
     "Foundation",
     "Foundation_Collections",
     "Storage_Streams",
 ] }
+
+# Wayland clipboard image support. Under X11/XWayland the default backend is
+# used; on native Wayland this feature enables the data-control protocol.
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.4", features = ["wayland-data-control"] }
 
 # PNG encoding is the only CPU-heavy dependency on the activation path. Keep
 # the dev profile interactive by optimizing just the codec crates; the rest of

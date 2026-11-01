@@ -1,6 +1,6 @@
 use crate::app_state::{AppState, DisplayBounds};
 use crate::capture::capture_screen;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
@@ -100,20 +100,6 @@ pub fn leave_native_fullscreen(window: &WebviewWindow) {
     }
 }
 
-/// Blocks until the desktop composition pass has consumed pending window
-/// updates. Only used when the overlay is already visible and must be excluded
-/// from the next capture.
-#[cfg(target_os = "windows")]
-fn flush_composition() {
-    use windows::Win32::Graphics::Dwm::DwmFlush;
-    unsafe {
-        let _ = DwmFlush();
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn flush_composition() {}
-
 /// Called once during application setup. Sizes the hidden overlay to the
 /// captured monitor so it is never presented at the default window size and so
 /// the webview lays out at the correct dimensions ahead of the first capture.
@@ -140,23 +126,38 @@ pub fn prime_overlay(app_handle: &AppHandle, state: &AppState) {
 
 /// First phase of an activation: freeze the current desktop and hand it to the
 /// (still hidden) webview. The window is intentionally **not** shown here.
+///
+/// Exactly one session may exist at a time: the session lock is claimed here and
+/// only released by `hide_overlay` once the overlay finishes its closing
+/// lifecycle. Repeated activations during a session are ignored, not queued.
 pub fn activate_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
     let activation_started = Instant::now();
+
+    if !state.try_begin_session() {
+        info!("Ignoring activation: a screenshot session is already active");
+        return Ok(());
+    }
+
+    match prepare_overlay(app_handle, state, activation_started) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Never leave the lock held when initialization fails.
+            state.end_session();
+            Err(err)
+        }
+    }
+}
+
+fn prepare_overlay(
+    app_handle: &AppHandle,
+    state: &AppState,
+    activation_started: Instant,
+) -> Result<(), String> {
     info!("Activating screenshot overlay...");
 
     let window = app_handle
         .get_webview_window(OVERLAY_LABEL)
         .ok_or_else(|| "Overlay window not found".to_string())?;
-
-    // If the overlay is currently on screen, remove it before capturing so the
-    // frozen frame contains the real desktop rather than our own UI. DwmFlush
-    // waits for the window removal to reach the screen instead of sleeping.
-    if state.is_overlay_visible() {
-        leave_native_fullscreen(&window);
-        let _ = window.hide();
-        state.set_overlay_visible(false);
-        flush_composition();
-    }
 
     // Capture the target monitor immediately and freeze the frame in memory.
     // The desktop is captured exactly once per activation; it is never
@@ -183,7 +184,7 @@ pub fn activate_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), 
         state.set_last_overlay_bounds(bounds);
     }
 
-    info!(
+    debug!(
         "[perf] native prepare: {} ({:.1}ms since activation start)",
         summarize(&payload),
         activation_started.elapsed().as_secs_f64() * 1000.0
@@ -216,6 +217,10 @@ pub fn present_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), S
         .get_webview_window(OVERLAY_LABEL)
         .ok_or_else(|| "Overlay window not found".to_string())?;
 
+    if !state.is_session_active() {
+        return Err("No active capture session".to_string());
+    }
+
     if state.get_frame().is_none() {
         return Err("No captured frame is ready".to_string());
     }
@@ -227,6 +232,14 @@ pub fn present_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), S
     let _ = window.set_focus();
     state.set_overlay_visible(true);
 
-    info!("[perf] overlay presented (window visible and focused)");
+    // Tray "Settings..." opens only after the fresh capture has been presented,
+    // so the session reset has already cleared any stale Settings state.
+    if state.take_settings_on_present() {
+        if let Err(e) = app_handle.emit("open_shortcut_settings", ()) {
+            warn!("Failed to open Settings after presentation: {e}");
+        }
+    }
+
+    debug!("[perf] overlay presented (window visible and focused)");
     Ok(())
 }

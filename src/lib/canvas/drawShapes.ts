@@ -62,6 +62,56 @@ export function drawRectShape(
   ctx.restore();
 }
 
+export function drawTriangleShape(
+  ctx: CanvasRenderingContext2D,
+  bounds: Rect,
+  color: string,
+  strokeWidth: number
+) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = strokeWidth;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  // Bounds are already normalized, so the apex is always top-center and the
+  // base is the bottom edge regardless of the drag direction.
+  ctx.beginPath();
+  ctx.moveTo(bounds.x + bounds.width / 2, bounds.y);
+  ctx.lineTo(bounds.x + bounds.width, bounds.y + bounds.height);
+  ctx.lineTo(bounds.x, bounds.y + bounds.height);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+export function drawCircleShape(
+  ctx: CanvasRenderingContext2D,
+  bounds: Rect,
+  color: string,
+  strokeWidth: number
+) {
+  if (bounds.width <= 0 || bounds.height <= 0) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = strokeWidth;
+  ctx.lineJoin = "round";
+
+  // Ellipse inscribed in the (normalized) drag bounds.
+  ctx.beginPath();
+  ctx.ellipse(
+    bounds.x + bounds.width / 2,
+    bounds.y + bounds.height / 2,
+    bounds.width / 2,
+    bounds.height / 2,
+    0,
+    0,
+    Math.PI * 2
+  );
+  ctx.stroke();
+  ctx.restore();
+}
+
 export function drawSmoothStroke(
   ctx: CanvasRenderingContext2D,
   points: Point[],
@@ -127,61 +177,145 @@ export function drawTextShape(
   ctx.restore();
 }
 
+/**
+ * Pixelation/redaction source. The mosaic is always sampled from the original
+ * screenshot pixels (never from the already-composited canvas), so the effect
+ * obscures the real content and never compounds with other annotations.
+ */
+export interface MosaicSource {
+  image: CanvasImageSource;
+  /** Screenshot pixels per CSS pixel. */
+  imageScale: number;
+}
+
+// Reused scratch canvas for the pixelation pass. Kept module-level so the
+// redaction of a committed element does not allocate on every redraw.
+let mosaicCanvas: HTMLCanvasElement | null = null;
+
+function getMosaicCanvas(width: number, height: number): HTMLCanvasElement {
+  if (!mosaicCanvas) {
+    mosaicCanvas = document.createElement("canvas");
+  }
+  if (mosaicCanvas.width !== width) mosaicCanvas.width = width;
+  if (mosaicCanvas.height !== height) mosaicCanvas.height = height;
+  return mosaicCanvas;
+}
+
 export function drawMosaicShape(
   ctx: CanvasRenderingContext2D,
   bounds: Rect,
-  blockSize: number
+  blockSize: number,
+  source: MosaicSource
 ) {
   if (bounds.width <= 0 || bounds.height <= 0) return;
 
-  ctx.save();
+  const scale = source.imageScale || 1;
+  const width = Math.max(1, Math.round(bounds.width * scale));
+  const height = Math.max(1, Math.round(bounds.height * scale));
+  const block = Math.max(1, Math.round(blockSize * scale));
+
+  // 1. Copy the pristine screenshot region into the scratch canvas at full
+  //    resolution, 1:1 with the captured pixels.
+  const scratch = getMosaicCanvas(width, height);
+  const sctx = scratch.getContext("2d");
+  if (!sctx) return;
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.clearRect(0, 0, width, height);
+  sctx.imageSmoothingEnabled = false;
+  sctx.drawImage(
+    source.image,
+    bounds.x * scale,
+    bounds.y * scale,
+    bounds.width * scale,
+    bounds.height * scale,
+    0,
+    0,
+    width,
+    height
+  );
+
+  // 2. Replace each pixel inside a block by the block's average colour. Using
+  //    the average (instead of a single sampled pixel) keeps the mosaic stable
+  //    while still destroying all readable detail.
+  let imageData: ImageData;
   try {
-    const imgData = ctx.getImageData(bounds.x, bounds.y, bounds.width, bounds.height);
-    const data = imgData.data;
-    const w = imgData.width;
-    const h = imgData.height;
+    imageData = sctx.getImageData(0, 0, width, height);
+  } catch {
+    // Tainted/unavailable canvas: fall back to a solid opaque fill so the area
+    // is still redacted rather than left readable.
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = "#3f3f46";
+    ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
+    ctx.restore();
+    return;
+  }
 
-    for (let y = 0; y < h; y += blockSize) {
-      for (let x = 0; x < w; x += blockSize) {
-        // Sample center pixel of current block
-        const sampleX = Math.min(x + Math.floor(blockSize / 2), w - 1);
-        const sampleY = Math.min(y + Math.floor(blockSize / 2), h - 1);
-        const sampleIdx = (sampleY * w + sampleX) * 4;
+  const data = imageData.data;
+  for (let by = 0; by < height; by += block) {
+    const maxY = Math.min(by + block, height);
+    for (let bx = 0; bx < width; bx += block) {
+      const maxX = Math.min(bx + block, width);
 
-        const r = data[sampleIdx];
-        const g = data[sampleIdx + 1];
-        const b = data[sampleIdx + 2];
-        const a = data[sampleIdx + 3];
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let a = 0;
+      let count = 0;
+      for (let y = by; y < maxY; y++) {
+        for (let x = bx; x < maxX; x++) {
+          const idx = (y * width + x) * 4;
+          r += data[idx];
+          g += data[idx + 1];
+          b += data[idx + 2];
+          a += data[idx + 3];
+          count++;
+        }
+      }
+      if (count === 0) continue;
+      r = Math.round(r / count);
+      g = Math.round(g / count);
+      b = Math.round(b / count);
+      a = Math.round(a / count);
 
-        // Fill all pixels in block with sample color
-        for (let dy = 0; dy < blockSize && y + dy < h; dy++) {
-          for (let dx = 0; dx < blockSize && x + dx < w; dx++) {
-            const pixelIdx = ((y + dy) * w + (x + dx)) * 4;
-            data[pixelIdx] = r;
-            data[pixelIdx + 1] = g;
-            data[pixelIdx + 2] = b;
-            data[pixelIdx + 3] = a;
-          }
+      for (let y = by; y < maxY; y++) {
+        for (let x = bx; x < maxX; x++) {
+          const idx = (y * width + x) * 4;
+          data[idx] = r;
+          data[idx + 1] = g;
+          data[idx + 2] = b;
+          data[idx + 3] = a;
         }
       }
     }
-
-    ctx.putImageData(imgData, bounds.x, bounds.y);
-  } catch (err) {
-    // If getImageData fails due to security or out of bounds, draw pixel pattern
-    ctx.fillStyle = "rgba(128, 128, 128, 0.8)";
-    ctx.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
   }
+  sctx.putImageData(imageData, 0, 0);
+
+  // 3. Draw the pixelated region back over the target rectangle. Smoothing is
+  //    disabled so the blocks stay crisp instead of blurring into a gradient.
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(scratch, 0, 0, width, height, bounds.x, bounds.y, bounds.width, bounds.height);
   ctx.restore();
 }
 
-export function renderElement(ctx: CanvasRenderingContext2D, el: AnnotationElement) {
+export function renderElement(
+  ctx: CanvasRenderingContext2D,
+  el: AnnotationElement,
+  mosaicSource?: MosaicSource
+) {
   switch (el.type) {
     case "arrow":
       drawArrow(ctx, el.start, el.end, el.color, el.strokeWidth);
       break;
     case "rect":
       drawRectShape(ctx, el.bounds, el.color, el.strokeWidth);
+      break;
+    case "triangle":
+      drawTriangleShape(ctx, el.bounds, el.color, el.strokeWidth);
+      break;
+    case "circle":
+      drawCircleShape(ctx, el.bounds, el.color, el.strokeWidth);
       break;
     case "pen":
       drawSmoothStroke(ctx, el.points, el.color, el.strokeWidth);
@@ -190,7 +324,9 @@ export function renderElement(ctx: CanvasRenderingContext2D, el: AnnotationEleme
       drawTextShape(ctx, el.position, el.text, el.color, el.fontSize);
       break;
     case "mosaic":
-      drawMosaicShape(ctx, el.bounds, el.blockSize);
+      if (mosaicSource) {
+        drawMosaicShape(ctx, el.bounds, el.blockSize, mosaicSource);
+      }
       break;
   }
 }

@@ -1,8 +1,10 @@
-import React from "react";
+import React, { useLayoutEffect, useRef, useState } from "react";
 import {
   MousePointer,
   ArrowUpRight,
   Square,
+  Triangle,
+  Circle,
   Pencil,
   Type,
   Grid,
@@ -16,12 +18,14 @@ import {
   Settings,
 } from "lucide-react";
 import { Rect } from "../../types/crop";
-import { ToolType } from "../../types/annotations";
+import { ShapeMode, ToolType } from "../../types/annotations";
 
 interface FloatingToolbarProps {
   crop: Rect;
   activeTool: ToolType;
+  shapeMode: ShapeMode;
   onSelectTool: (tool: ToolType) => void;
+  onCycleShape: () => void;
   activeColor: string;
   onSelectColor: (color: string) => void;
   activeStrokeWidth: number;
@@ -41,25 +45,77 @@ interface FloatingToolbarProps {
   windowHeight: number;
 }
 
-const COLORS = [
-  "#EF4444", // Red
-  "#10B981", // Green
-  "#06B6D4", // Cyan
-  "#FBBF24", // Yellow
-  "#FFFFFF", // White
-  "#0F172A", // Dark Slate / Black
+/** Lightweight MVP palette. Names are shown in the compact select box. */
+const COLOR_OPTIONS = [
+  { name: "Black", value: "#000000" },
+  { name: "White", value: "#FFFFFF" },
+  { name: "Red", value: "#EF4444" },
+  { name: "Orange", value: "#F97316" },
+  { name: "Yellow", value: "#FBBF24" },
+  { name: "Green", value: "#10B981" },
+  { name: "Blue", value: "#3B82F6" },
+  { name: "Purple", value: "#8B5CF6" },
 ];
 
-const STROKE_WIDTHS = [
-  { label: "S", width: 2 },
-  { label: "M", width: 4 },
-  { label: "L", width: 8 },
-];
+const STROKE_WIDTHS = Array.from({ length: 20 }, (_, i) => i + 1);
+const SHAPE_ORDER: ShapeMode[] = ["rect", "triangle", "circle"];
+const SHAPE_LABEL: Record<ShapeMode, string> = {
+  rect: "Rectangle",
+  triangle: "Triangle",
+  circle: "Circle",
+};
+
+export function nextShapeMode(current: ShapeMode): ShapeMode {
+  const index = SHAPE_ORDER.indexOf(current);
+  return SHAPE_ORDER[(index + 1) % SHAPE_ORDER.length];
+}
+
+const TOOLBAR_MARGIN = 8;
+const VIEWPORT_PAD = 12;
+const DEFAULT_TOOLBAR_SIZE = { width: 560, height: 44 };
+
+export interface ToolbarSize {
+  width: number;
+  height: number;
+}
+
+/**
+ * Anchors the toolbox to the LEFT edge of the selection and prefers the space
+ * immediately below it. Falls back to above, then clamps inside the viewport so
+ * the toolbar is always fully visible — regardless of selection width, screen
+ * edge proximity or DPI scale (all values are CSS pixels).
+ */
+export function computeToolbarPosition(
+  crop: Rect,
+  size: ToolbarSize,
+  windowWidth: number,
+  windowHeight: number
+): { left: number; top: number } {
+  const width = size.width;
+  const height = size.height;
+
+  let left = crop.x;
+  left = Math.max(VIEWPORT_PAD, Math.min(left, windowWidth - width - VIEWPORT_PAD));
+
+  let top = crop.y + crop.height + TOOLBAR_MARGIN;
+  if (top + height > windowHeight - VIEWPORT_PAD) {
+    const above = crop.y - height - TOOLBAR_MARGIN;
+    top =
+      above >= VIEWPORT_PAD
+        ? above
+        : Math.max(VIEWPORT_PAD, windowHeight - height - VIEWPORT_PAD);
+  }
+  top = Math.max(VIEWPORT_PAD, Math.min(top, windowHeight - height - VIEWPORT_PAD));
+
+  return { left, top };
+}
 
 export const FloatingToolbar: React.FC<FloatingToolbarProps> = ({
   crop,
   activeTool,
+  shapeMode,
   onSelectTool,
+  onCycleShape,
   activeColor,
   onSelectColor,
   activeStrokeWidth,
@@ -78,24 +134,58 @@ export const FloatingToolbar: React.FC<FloatingToolbarProps> = ({
   windowWidth,
   windowHeight,
 }) => {
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const [toolbarSize, setToolbarSize] = useState(DEFAULT_TOOLBAR_SIZE);
+
+  // Measure the real toolbar so clamping never relies on a guessed width; the
+  // select boxes can change the width slightly between platforms.
+  useLayoutEffect(() => {
+    const el = toolbarRef.current;
+    if (!el) return;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    if (width !== toolbarSize.width || height !== toolbarSize.height) {
+      setToolbarSize({ width, height });
+    }
+  }, [
+    toolbarSize.width,
+    toolbarSize.height,
+    crop.x,
+    crop.y,
+    crop.width,
+    crop.height,
+    activeTool,
+    shapeMode,
+    activeColor,
+    activeStrokeWidth,
+    windowWidth,
+    windowHeight,
+  ]);
+
   if (crop.width <= 0 || crop.height <= 0) return null;
 
-  // Calculate toolbar position: prefer below the crop box
-  const toolbarHeight = 44;
-  const margin = 8;
-  let top = crop.y + crop.height + margin;
-  let left = crop.x + crop.width - 480; // Align to bottom right of selection
+  const width = toolbarSize.width;
+  const height = toolbarSize.height;
+  const { left, top } = computeToolbarPosition(
+    crop,
+    { width, height },
+    windowWidth,
+    windowHeight
+  );
 
-  // If outside bottom edge, place above the crop box
-  if (top + toolbarHeight > windowHeight - 12) {
-    top = Math.max(12, crop.y - toolbarHeight - margin);
-  }
-
-  // Clamp within horizontal screen bounds
-  left = Math.max(12, Math.min(windowWidth - 490, left));
+  const shapeIcon =
+    shapeMode === "triangle" ? (
+      <Triangle size={16} />
+    ) : shapeMode === "circle" ? (
+      <Circle size={16} />
+    ) : (
+      <Square size={16} />
+    );
 
   return (
     <div
+      ref={toolbarRef}
+      data-carambola-toolbar
       style={{ top: `${top}px`, left: `${left}px` }}
       className="absolute z-50 flex items-center gap-1.5 p-1.5 rounded-xl bg-slate-900/95 backdrop-blur-md border border-slate-700/80 shadow-2xl text-slate-200 toolbar-fade-in"
       onClick={(e) => e.stopPropagation()}
@@ -127,15 +217,22 @@ export const FloatingToolbar: React.FC<FloatingToolbarProps> = ({
         </button>
 
         <button
-          title="Rectangle Tool"
-          onClick={() => onSelectTool("rect")}
+          title={`Shape: ${SHAPE_LABEL[shapeMode]} (click to cycle)`}
+          aria-label={`Shape tool: ${SHAPE_LABEL[shapeMode]}. Click to cycle to the next shape.`}
+          onClick={() => {
+            if (activeTool === "rect") {
+              onCycleShape();
+            } else {
+              onSelectTool("rect");
+            }
+          }}
           className={`p-1.5 rounded-md transition-colors ${
             activeTool === "rect"
               ? "bg-carambola-cyan text-slate-950 font-bold"
               : "hover:bg-slate-700 text-slate-300"
           }`}
         >
-          <Square size={16} />
+          {shapeIcon}
         </button>
 
         <button
@@ -175,39 +272,43 @@ export const FloatingToolbar: React.FC<FloatingToolbarProps> = ({
         </button>
       </div>
 
-      {/* Colors & Stroke Width (visible when vector tool is active) */}
+      {/* Color & stroke width (visible when a vector tool is active) */}
       {activeTool !== "select" && activeTool !== "mosaic" && (
         <div className="flex items-center gap-1.5 px-1 border-r border-slate-700/60">
           <div className="flex items-center gap-1">
-            {COLORS.map((c) => (
-              <button
-                key={c}
-                onClick={() => onSelectColor(c)}
-                className={`w-4 h-4 rounded-full border transition-transform ${
-                  activeColor === c
-                    ? "scale-125 border-white shadow-sm ring-1 ring-carambola-cyan"
-                    : "border-slate-600 hover:scale-110"
-                }`}
-                style={{ backgroundColor: c }}
-              />
-            ))}
+            <span
+              className="w-3.5 h-3.5 rounded-full border border-slate-500"
+              style={{ backgroundColor: activeColor }}
+              aria-hidden="true"
+            />
+            <select
+              aria-label="Annotation color"
+              title="Annotation color"
+              value={activeColor}
+              onChange={(e) => onSelectColor(e.target.value)}
+              className="h-7 rounded-md bg-slate-800 border border-slate-700 text-[11px] px-1 text-slate-200 outline-none focus:border-carambola-cyan"
+            >
+              {COLOR_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.name}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div className="flex items-center gap-0.5 bg-slate-800/60 rounded p-0.5 text-[10px] font-mono">
-            {STROKE_WIDTHS.map((sw) => (
-              <button
-                key={sw.width}
-                onClick={() => onSelectStrokeWidth(sw.width)}
-                className={`px-1.5 py-0.5 rounded ${
-                  activeStrokeWidth === sw.width
-                    ? "bg-slate-700 text-carambola-yellow font-bold"
-                    : "text-slate-400 hover:text-white"
-                }`}
-              >
-                {sw.label}
-              </button>
+          <select
+            aria-label="Stroke width in pixels"
+            title="Stroke width (px)"
+            value={activeStrokeWidth}
+            onChange={(e) => onSelectStrokeWidth(Number(e.target.value))}
+            className="h-7 w-[64px] rounded-md bg-slate-800 border border-slate-700 text-[11px] px-1 text-slate-200 outline-none focus:border-carambola-cyan"
+          >
+            {STROKE_WIDTHS.map((w) => (
+              <option key={w} value={w}>
+                {w} px
+              </option>
             ))}
-          </div>
+          </select>
         </div>
       )}
 
@@ -288,4 +389,3 @@ export const FloatingToolbar: React.FC<FloatingToolbarProps> = ({
     </div>
   );
 };
-

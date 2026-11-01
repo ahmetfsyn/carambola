@@ -1,10 +1,6 @@
 use log::info;
 
-pub fn extract_text(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-) -> Result<String, String> {
+pub fn extract_text(rgba: &[u8], width: u32, height: u32) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
         use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
@@ -17,8 +13,7 @@ pub fn extract_text(
             .map_err(|e| format!("Windows OCR engine init error: {e}"))?;
 
         // Write RGBA pixel data into a WinRT IBuffer via DataWriter
-        let writer = DataWriter::new()
-            .map_err(|e| format!("Failed to create DataWriter: {e}"))?;
+        let writer = DataWriter::new().map_err(|e| format!("Failed to create DataWriter: {e}"))?;
         writer
             .WriteBytes(rgba)
             .map_err(|e| format!("Failed to write pixel data: {e}"))?;
@@ -53,18 +48,28 @@ pub fn extract_text(
 
     #[cfg(target_os = "macos")]
     {
-        info!("macOS OCR extraction requested for {}x{} crop", width, height);
-        // On macOS, Apple Vision OCR via VNRecognizeTextRequest can be integrated.
-        // For baseline cross-platform reliability, provide clean text extraction feedback.
-        let msg = format!(
-            "[Carambola OCR]: Text extraction active. (Region: {}x{} px)",
+        info!(
+            "macOS OCR extraction requested for {}x{} crop",
             width, height
         );
-        Ok(msg)
+        let _ = rgba;
+        // Apple Vision (VNRecognizeTextRequest) integration is not implemented.
+        // Fail explicitly instead of returning placeholder text that could be
+        // mistaken for a successful recognition result.
+        Err(
+            "OCR is not available on macOS in this build. The screenshot itself was captured \
+             and can still be copied or saved."
+                .to_string(),
+        )
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        Ok("[Carambola OCR]: OCR not supported on this platform.".into())
+        let _ = (rgba, width, height);
+        Err(
+            "OCR is not supported on this platform. Install a system OCR engine or use a \
+             Windows build for text extraction."
+                .to_string(),
+        )
     }
 }

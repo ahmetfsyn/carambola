@@ -1,74 +1,26 @@
 use crate::app_state::AppState;
+use crate::config;
 use log::{info, warn};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct UserConfig {
-    pub shortcut: String,
-}
-
-fn get_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("carambola").join("config.json"))
-}
-
 pub fn load_or_create_config() -> String {
-    let default_shortcut = if cfg!(target_os = "macos") {
-        "CommandOrControl+Shift+X".to_string()
-    } else {
-        "PrintScreen".to_string()
-    };
-
-    if let Some(config_path) = get_config_path() {
-        if config_path.exists() {
-            if let Ok(content) = fs::read_to_string(&config_path) {
-                if let Ok(cfg) = serde_json::from_str::<UserConfig>(&content) {
-                    if !cfg.shortcut.trim().is_empty() {
-                        return cfg.shortcut;
-                    }
-                }
-            }
-        } else {
-            // Write default config for user convenience
-            if let Some(parent) = config_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let initial_cfg = UserConfig {
-                shortcut: default_shortcut.clone(),
-            };
-            if let Ok(json) = serde_json::to_string_pretty(&initial_cfg) {
-                let _ = fs::write(&config_path, json);
-                info!("Created default config file at {:?}", config_path);
-            }
-        }
-    }
-
-    default_shortcut
+    config::load_or_create().shortcut
 }
 
-pub fn save_config(shortcut: &str) -> Result<(), String> {
-    if let Some(config_path) = get_config_path() {
-        if let Some(parent) = config_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let cfg = UserConfig {
-            shortcut: shortcut.to_string(),
-        };
-        let json = serde_json::to_string_pretty(&cfg)
-            .map_err(|e| format!("Failed to serialize config: {e}"))?;
-        fs::write(&config_path, json)
-            .map_err(|e| format!("Failed to write config file: {e}"))?;
-        info!("Saved shortcut '{}' to {:?}", shortcut, config_path);
-        Ok(())
-    } else {
-        Err("Could not determine config directory".into())
+pub fn setup_hotkey(
+    app_handle: &AppHandle,
+    _state: AppState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        warn!(
+            "Wayland session detected: the global shortcut backend uses X11. \
+             It works through XWayland when available; otherwise bind the shortcut \
+             in your desktop's keyboard settings or run an X11 session."
+        );
     }
-}
 
-pub fn setup_hotkey(app_handle: &AppHandle, _state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let shortcut_str = load_or_create_config();
 
     let shortcut: Shortcut = match shortcut_str.parse() {
@@ -87,9 +39,26 @@ pub fn setup_hotkey(app_handle: &AppHandle, _state: AppState) -> Result<(), Box<
     match app_handle.global_shortcut().register(shortcut) {
         Ok(_) => {
             info!("Registered global shortcut: {:?}", shortcut);
+            #[cfg(target_os = "windows")]
+            if shortcut_str.eq_ignore_ascii_case("PrintScreen") {
+                // Windows 11 routes PrintScreen to Snipping Tool with a
+                // low-level hook by default. The hook wins over RegisterHotKey,
+                // so the registration above can succeed while the key never
+                // reaches the app. Surface it in the log instead of failing
+                // silently.
+                warn!(
+                    "PrintScreen is the configured shortcut. If pressing it does nothing, \
+                     disable 'Use the Print Screen key to open Snipping Tool' in Windows \
+                     Settings > Accessibility > Keyboard, or choose another shortcut in \
+                     Carambola Settings."
+                );
+            }
         }
         Err(err) => {
-            warn!("Failed to register {:?}: {err:?}. Trying fallback 'Alt+A'...", shortcut);
+            warn!(
+                "Failed to register {:?}: {err:?}. Trying fallback 'Alt+A'...",
+                shortcut
+            );
             if let Ok(fallback) = "Alt+A".parse::<Shortcut>() {
                 let _ = app_handle.global_shortcut().register(fallback);
             }
@@ -99,23 +68,49 @@ pub fn setup_hotkey(app_handle: &AppHandle, _state: AppState) -> Result<(), Box<
     Ok(())
 }
 
-pub fn update_global_shortcut(app_handle: &AppHandle, new_shortcut_str: &str) -> Result<(), String> {
+pub fn update_global_shortcut(
+    app_handle: &AppHandle,
+    new_shortcut_str: &str,
+) -> Result<(), String> {
     let shortcut: Shortcut = new_shortcut_str
         .parse()
         .map_err(|e| format!("Invalid shortcut combination '{new_shortcut_str}': {e:?}"))?;
 
-    // Unregister existing shortcuts
-    let _ = app_handle.global_shortcut().unregister_all();
+    let previous_str = config::load_or_create().shortcut;
+    let previous: Option<Shortcut> = previous_str.parse().ok();
 
-    // Register the new one
+    // Register the new shortcut first. If another application owns it, the
+    // registration fails and the currently working shortcut stays bound, so the
+    // user never loses capture access while editing Settings.
     app_handle
         .global_shortcut()
         .register(shortcut)
         .map_err(|e| format!("Could not register shortcut '{new_shortcut_str}': {e:?}"))?;
 
-    // Persist to disk
-    save_config(new_shortcut_str)?;
-    info!("Successfully re-bound global shortcut to: {}", new_shortcut_str);
+    // Only drop the old binding once the new one is confirmed. Registering the
+    // same combination twice is a no-op for the plugin, so skip it explicitly.
+    if let Some(old) = previous {
+        if old != shortcut {
+            let _ = app_handle.global_shortcut().unregister(old);
+        }
+    }
+
+    // Persist to disk while preserving other preferences (e.g. autostart).
+    let mut cfg = config::load_or_create();
+    cfg.shortcut = new_shortcut_str.to_string();
+    if let Err(err) = config::save(&cfg) {
+        // Keep the running app consistent with the persisted config.
+        let _ = app_handle.global_shortcut().unregister(shortcut);
+        if let Ok(old) = previous_str.parse::<Shortcut>() {
+            let _ = app_handle.global_shortcut().register(old);
+        }
+        return Err(err);
+    }
+
+    info!(
+        "Successfully re-bound global shortcut to: {}",
+        new_shortcut_str
+    );
 
     Ok(())
 }

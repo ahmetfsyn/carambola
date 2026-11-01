@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Rect } from "../../types/crop";
-import { AnnotationElement } from "../../types/annotations";
 import { DisplayInfo } from "../../types/display";
 
 export async function getDisplayInfo(): Promise<DisplayInfo> {
@@ -46,28 +45,17 @@ export async function presentOverlay(): Promise<void> {
   await invoke("present_overlay");
 }
 
-export async function copyCropToClipboard(
-  crop: Rect,
-  elements: AnnotationElement[],
-  scaleFactor: number
-): Promise<void> {
-  await invoke("copy_crop", {
-    crop,
-    elements,
-    scaleFactor,
-  });
+/**
+ * Sends the composited crop (raw RGBA with an 8-byte dimension header) to the
+ * backend as a raw binary IPC body. The backend copies it straight to the
+ * clipboard, so the redacted, annotated pixels are exactly what the user saw.
+ */
+export async function copyCropImage(rgbaWithHeader: Uint8Array): Promise<void> {
+  await invoke("copy_crop_image", rgbaWithHeader);
 }
 
-export async function saveCropToDisk(
-  crop: Rect,
-  elements: AnnotationElement[],
-  scaleFactor: number
-): Promise<string> {
-  return await invoke<string>("save_crop", {
-    crop,
-    elements,
-    scaleFactor,
-  });
+export async function saveCropImage(rgbaWithHeader: Uint8Array): Promise<string> {
+  return await invoke<string>("save_crop_image", rgbaWithHeader);
 }
 
 export async function hideOverlay(): Promise<void> {
@@ -94,9 +82,18 @@ export async function setGlobalShortcut(shortcut: string): Promise<void> {
   await invoke("set_shortcut", { shortcut });
 }
 
-/// Temporary geometry diagnostics forwarded to the Rust log stream.
-export function logDiagnostics(tag: string, data: Record<string, unknown>): void {
-  invoke("frontend_log", { message: `${tag} ${JSON.stringify(data)}` }).catch(() => {
-    // Diagnostics must never affect runtime behaviour.
-  });
+export interface AutostartStatus {
+  supported: boolean;
+  enabled: boolean;
+  reason: string | null;
 }
+
+/** Reads the real OS startup registration, not just the stored preference. */
+export async function getAutostartStatus(): Promise<AutostartStatus> {
+  return await invoke<AutostartStatus>("get_autostart");
+}
+
+export async function setAutostartEnabled(enabled: boolean): Promise<AutostartStatus> {
+  return await invoke<AutostartStatus>("set_autostart", { enabled });
+}
+

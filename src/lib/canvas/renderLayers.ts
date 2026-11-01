@@ -30,6 +30,20 @@ function imageNaturalWidth(
   return null;
 }
 
+/**
+ * Screenshot (physical) pixels per CSS pixel for a layout width. Used both for
+ * compositing the frozen screenshot and for redaction sampling so overlay and
+ * exported output share one coordinate mapping at any DPI scale.
+ */
+export function getImageScale(
+  image: ImageBitmap | HTMLImageElement | null,
+  cssWidth: number
+): number {
+  const natural = imageNaturalWidth(image);
+  if (!natural || !cssWidth) return 1;
+  return natural / cssWidth;
+}
+
 export function renderCanvas(params: RenderParams) {
   const {
     ctx,
@@ -56,8 +70,7 @@ export function renderCanvas(params: RenderParams) {
   // 1. Draw background image, mapping the screenshot (natural/physical pixels)
   //    onto the CSS-pixel canvas. `imageScale` is the factor between the two
   //    spaces and must be applied to every source-image rectangle.
-  const imageScale =
-    (imageNaturalWidth(backgroundImage) ?? canvasWidth) / canvasWidth;
+  const imageScale = getImageScale(backgroundImage, canvasWidth);
 
   if (backgroundImage) {
     ctx.drawImage(backgroundImage, 0, 0, canvasWidth, canvasHeight);
@@ -94,14 +107,16 @@ export function renderCanvas(params: RenderParams) {
   }
   ctx.restore();
 
-  // 3. Draw committed annotations
+  // 3. Draw committed annotations. Redaction samples the original screenshot,
+  //    so it stays non-destructive and never alters other annotations.
+  const mosaicSource = backgroundImage ? { image: backgroundImage, imageScale } : undefined;
   for (const el of elements) {
-    renderElement(ctx, el);
+    renderElement(ctx, el, mosaicSource);
   }
 
   // 4. Draw currently active / in-progress element
   if (activeElement) {
-    renderElement(ctx, activeElement);
+    renderElement(ctx, activeElement, mosaicSource);
   }
 
   // 5. Draw selection border & handles

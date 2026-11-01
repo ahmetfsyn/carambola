@@ -1,7 +1,7 @@
 use crate::app_state::{CapturedFrame, DisplayBounds, DisplayInfo};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::io::Cursor;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use xcap::Monitor;
@@ -166,9 +166,27 @@ fn gdi_capture(x: i32, y: i32, width: u32, height: u32) -> Result<(Vec<u8>, u32,
 
 #[cfg(not(target_os = "windows"))]
 fn capture_monitor_rgba(monitor: &Monitor) -> Result<(Vec<u8>, u32, u32), String> {
-    let image = monitor
-        .capture_image()
-        .map_err(|e| format!("Failed to capture display image: {e}"))?;
+    let image = monitor.capture_image().map_err(|e| {
+        #[cfg(target_os = "macos")]
+        {
+            format!(
+                "Failed to capture display image: {e}. Grant Carambola Screen Recording \
+                 permission in System Settings > Privacy & Security > Screen Recording, then \
+                 restart the app."
+            )
+        }
+        #[cfg(target_os = "linux")]
+        {
+            format!(
+                "Failed to capture display image: {e}. On Wayland, screen capture requires \
+                 the desktop screenshot portal and permission; X11 sessions are also supported."
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            format!("Failed to capture display image: {e}")
+        }
+    })?;
     let (width, height) = image.dimensions();
     let mut rgba = image.into_raw();
     for px in rgba.chunks_exact_mut(4) {
@@ -244,7 +262,7 @@ pub fn capture_screen() -> Result<CapturedFrame, String> {
         physical_height: physical_h,
     };
 
-    info!(
+    debug!(
         "[perf] capture pipeline: enumerate={:.1}ms capture={:.1}ms encode={:.1}ms png={}B {}x{}",
         enumerate_ms,
         capture_ms,

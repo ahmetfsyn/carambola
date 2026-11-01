@@ -1,26 +1,34 @@
 import React, { useRef, useState, useEffect, useLayoutEffect, useCallback } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Settings } from "lucide-react";
 import { Point, Rect, DragState, HandleType } from "../../types/crop";
-import { ToolType, AnnotationElement } from "../../types/annotations";
+import { ToolType, ShapeMode, AnnotationElement } from "../../types/annotations";
 import {
   pointInRect,
   normalizeRect,
   hitTestHandle,
   resizeRectWithHandle,
 } from "../../lib/canvas/geometry";
-import { renderCanvas } from "../../lib/canvas/renderLayers";
-import { FloatingToolbar } from "../toolbar/FloatingToolbar";
+import { renderCanvas, getImageScale } from "../../lib/canvas/renderLayers";
+import { composeCropRgba } from "../../lib/canvas/composeCrop";
+import { FloatingToolbar, nextShapeMode } from "../toolbar/FloatingToolbar";
 import { DimensionBadge } from "./DimensionBadge";
-import { LoupeMagnifier } from "./LoupeMagnifier";
 import { ShortcutModal } from "../settings/ShortcutModal";
 import {
-  copyCropToClipboard,
-  saveCropToDisk,
+  copyCropImage,
+  saveCropImage,
   hideOverlay,
   extractOcrText,
-  logDiagnostics,
 } from "../../lib/ipc/commands";
+
+/** Duration of the close (fade-out) transition, matching the CSS transition. */
+const CLOSE_FADE_MS = 180;
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
 
 interface OverlayContainerProps {
   backgroundImage: ImageBitmap | HTMLImageElement | null;
@@ -43,7 +51,6 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
   // Crop & interaction state
   const [crop, setCrop] = useState<Rect | null>(null);
-  const [cursorPos, setCursorPos] = useState<Point>({ x: 0, y: 0 });
   const [dragState, setDragState] = useState<DragState>({
     mode: "none",
     startPoint: { x: 0, y: 0 },
@@ -53,8 +60,9 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
   // Annotation tools & history state
   const [activeTool, setActiveTool] = useState<ToolType>("select");
+  const [shapeMode, setShapeMode] = useState<ShapeMode>("rect");
   const [activeColor, setActiveColor] = useState<string>("#EF4444");
-  const [activeStrokeWidth, setActiveStrokeWidth] = useState<number>(4);
+  const [activeStrokeWidth, setActiveStrokeWidth] = useState<number>(2);
   const [elements, setElements] = useState<AnnotationElement[]>([]);
   const [undoStack, setUndoStack] = useState<AnnotationElement[][]>([]);
   const [redoStack, setRedoStack] = useState<AnnotationElement[][]>([]);
@@ -69,6 +77,30 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
 
+  // Close (fade-out) lifecycle. The root layer fades to transparent, then the
+  // native window is hidden once the transition has finished.
+  const [closing, setClosing] = useState<boolean>(false);
+  const closingRef = useRef<boolean>(false);
+  const closeTimer = useRef<number | null>(null);
+  // Fixed origin of the shape/mosaic currently being drawn. Bounds must always
+  // be normalized against this point; normalizing against the previous (already
+  // normalized) bounds made reverse drags collapse the shape on every move.
+  const drawingOrigin = useRef<Point | null>(null);
+  const textInputRef = useRef<HTMLInputElement | null>(null);
+  const textEditing = editingText !== null;
+
+  // `autoFocus` alone did not focus the annotation input inside WebView2, so a
+  // user who placed a text box could type and nothing would happen until they
+  // clicked the input itself. Focus it explicitly once it is mounted, and again
+  // on the next task: the native mouse press finishes its own focus handling
+  // after React's effects run and would otherwise blur the input again.
+  useEffect(() => {
+    if (!textEditing) return;
+    textInputRef.current?.focus();
+    const timer = window.setTimeout(() => textInputRef.current?.focus(), 0);
+    return () => window.clearTimeout(timer);
+  }, [textEditing]);
+
   const [windowSize, setWindowSize] = useState<{ width: number; height: number }>({
     width: window.innerWidth,
     height: window.innerHeight,
@@ -81,13 +113,26 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     };
     window.addEventListener("resize", handleResize);
 
-    const unlistenPromise = listen("open_shortcut_settings", () => {
+    // Tear down safely even if registration resolves after unmount (StrictMode).
+    let disposed = false;
+    let unlistenSettings: (() => void) | null = null;
+    listen("open_shortcut_settings", () => {
       setIsSettingsOpen(true);
-    });
+    })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenSettings = unlisten;
+        }
+      })
+      .catch(() => {});
 
     return () => {
+      disposed = true;
       window.removeEventListener("resize", handleResize);
-      unlistenPromise.then((unlisten) => unlisten());
+      unlistenSettings?.();
+      unlistenSettings = null;
     };
   }, []);
 
@@ -97,7 +142,6 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   useLayoutEffect(() => {
     setWindowSize({ width: window.innerWidth, height: window.innerHeight });
     setCrop(null);
-    setCursorPos({ x: 0, y: 0 });
     setElements([]);
     setUndoStack([]);
     setRedoStack([]);
@@ -114,12 +158,48 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     setCopiedFeedback(false);
     setOcrLoading(false);
     setToastMessage(null);
-
-    logDiagnostics("session_reset", {
-      captureToken,
-      viewport: `${window.innerWidth}x${window.innerHeight}`,
-    });
+    // Screenshot sessions must never restore a previous Settings view. Settings
+    // is reopened explicitly through the tray/toolbar only, after presentation.
+    setIsSettingsOpen(false);
+    // Cancel any in-flight fade from the previous session and restore full
+    // opacity instantly (no fade-in animation) before the window is shown.
+    if (closeTimer.current !== null) {
+      window.clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+    closingRef.current = false;
+    setClosing(false);
+    drawingOrigin.current = null;
   }, [captureToken]);
+
+  // Smoothly fade the whole overlay (screenshot + dimming + toolbar) to
+  // transparent, then hide the native window. Only opacity is animated: no
+  // scaling, sliding or OS minimize animation is involved.
+  const requestClose = useCallback(() => {
+    // Guard in a ref: React StrictMode may invoke state updater functions more
+    // than once in development, and scheduling the hide timer inside an updater
+    // would call hide_overlay twice. Closing also dismisses Settings right away
+    // so no navigation state can outlive the cancelled screenshot session.
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setIsSettingsOpen(false);
+    setClosing(true);
+    const duration = prefersReducedMotion() ? 0 : CLOSE_FADE_MS;
+    closeTimer.current = window.setTimeout(() => {
+      closeTimer.current = null;
+      void hideOverlay();
+    }, duration);
+  }, []);
+
+  // Clear the pending fade timer if the component unmounts.
+  useEffect(() => {
+    return () => {
+      if (closeTimer.current !== null) {
+        window.clearTimeout(closeTimer.current);
+        closeTimer.current = null;
+      }
+    };
+  }, []);
 
   // Main canvas render. Layout effect so a fresh frame + reset session are
   // painted before the overlay window is presented.
@@ -141,38 +221,6 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       isHovered: false,
     });
   }, [windowSize, backgroundImage, crop, elements, currentDrawing, dpr, captureToken]);
-
-  // Temporary pipeline diagnostics (canvas / viewport / image relationship).
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const img = backgroundImage as HTMLImageElement | ImageBitmap | null;
-    const imageWidth = img
-      ? "naturalWidth" in img && img.naturalWidth
-        ? img.naturalWidth
-        : img.width
-      : null;
-    const imageHeight = img
-      ? "naturalHeight" in img && img.naturalHeight
-        ? img.naturalHeight
-        : img.height
-      : null;
-    logDiagnostics("canvas", {
-      innerWidth: window.innerWidth,
-      innerHeight: window.innerHeight,
-      devicePixelRatio: window.devicePixelRatio,
-      canvasBackingWidth: canvas.width,
-      canvasBackingHeight: canvas.height,
-      canvasCssWidth: canvas.clientWidth,
-      canvasCssHeight: canvas.clientHeight,
-      imageNaturalWidth: imageWidth,
-      imageNaturalHeight: imageHeight,
-      imageScale:
-        imageWidth && canvas.clientWidth ? imageWidth / canvas.clientWidth : null,
-      renderedWidth: windowSize.width,
-      renderedHeight: windowSize.height,
-    });
-  }, [backgroundImage, windowSize, dpr]);
 
   // Push element to history
   const pushElement = useCallback((element: AnnotationElement) => {
@@ -199,32 +247,36 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
   // Output handlers
   const handleCopy = useCallback(async () => {
-    if (!crop || crop.width <= 0 || crop.height <= 0) return;
+    if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage) return;
     try {
-      await copyCropToClipboard(crop, elements, scaleFactor);
+      const imageScale = getImageScale(backgroundImage, windowSize.width);
+      const bytes = composeCropRgba(crop, elements, backgroundImage, imageScale);
+      await copyCropImage(bytes);
       setCopiedFeedback(true);
       setTimeout(() => {
         setCopiedFeedback(false);
-        hideOverlay();
+        requestClose();
       }, 350);
     } catch (err) {
       console.error("Failed to copy crop:", err);
     }
-  }, [crop, elements, scaleFactor]);
+  }, [crop, elements, backgroundImage, windowSize.width, requestClose]);
 
   const handleSave = useCallback(async () => {
-    if (!crop || crop.width <= 0 || crop.height <= 0) return;
+    if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage) return;
     try {
-      const savedPath = await saveCropToDisk(crop, elements, scaleFactor);
+      const imageScale = getImageScale(backgroundImage, windowSize.width);
+      const bytes = composeCropRgba(crop, elements, backgroundImage, imageScale);
+      const savedPath = await saveCropImage(bytes);
       setToastMessage(`Saved to ${savedPath}`);
       setTimeout(() => {
         setToastMessage(null);
-        hideOverlay();
+        requestClose();
       }, 800);
     } catch (err) {
       console.error("Failed to save crop:", err);
     }
-  }, [crop, elements, scaleFactor]);
+  }, [crop, elements, backgroundImage, windowSize.width, requestClose]);
 
   const handleOcr = useCallback(async () => {
     if (!crop || crop.width <= 0 || crop.height <= 0) return;
@@ -237,12 +289,15 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     } catch (err) {
       setOcrLoading(false);
       console.error("Failed to run OCR:", err);
+      const message = typeof err === "string" ? err : "OCR is not available on this platform";
+      setToastMessage(message);
+      setTimeout(() => setToastMessage(null), 3500);
     }
   }, [crop, scaleFactor]);
 
   const handleClose = useCallback(() => {
-    hideOverlay();
-  }, []);
+    requestClose();
+  }, [requestClose]);
 
   // Global overlay key shortcuts (Escape, Ctrl+Z, Enter, etc.)
   useEffect(() => {
@@ -290,7 +345,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
         position: editingText.position,
         text: editingText.text,
         color: activeColor,
-        fontSize: activeStrokeWidth * 6,
+        fontSize: Math.max(16, activeStrokeWidth * 6),
       });
       setEditingText(null);
       return;
@@ -338,9 +393,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
             strokeWidth: activeStrokeWidth,
           });
         } else if (activeTool === "rect") {
+          drawingOrigin.current = pt;
           setCurrentDrawing({
             id,
-            type: "rect",
+            type: shapeMode,
             bounds: { x: pt.x, y: pt.y, width: 0, height: 0 },
             color: activeColor,
             strokeWidth: activeStrokeWidth,
@@ -354,11 +410,15 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
             strokeWidth: activeStrokeWidth,
           });
         } else if (activeTool === "mosaic") {
+          drawingOrigin.current = pt;
           setCurrentDrawing({
             id,
             type: "mosaic",
             bounds: { x: pt.x, y: pt.y, width: 0, height: 0 },
-            blockSize: 10,
+            // Redaction must destroy readable detail, not merely soften it.
+            // 32 CSS px blocks average away the strokes of normal UI text and
+            // remain irreversible in the exported pixels.
+            blockSize: 32,
           });
         }
         return;
@@ -380,7 +440,6 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const pt: Point = { x: e.clientX, y: e.clientY };
-    setCursorPos(pt);
 
     // Dynamic cursor styling
     const canvas = canvasRef.current;
@@ -411,13 +470,14 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     if (currentDrawing) {
       if (currentDrawing.type === "arrow") {
         setCurrentDrawing({ ...currentDrawing, end: pt });
-      } else if (currentDrawing.type === "rect") {
+      } else if (
+        currentDrawing.type === "rect" ||
+        currentDrawing.type === "triangle" ||
+        currentDrawing.type === "circle"
+      ) {
         setCurrentDrawing({
           ...currentDrawing,
-          bounds: normalizeRect(
-            { x: currentDrawing.bounds.x, y: currentDrawing.bounds.y },
-            pt
-          ),
+          bounds: normalizeRect(drawingOrigin.current ?? pt, pt),
         });
       } else if (currentDrawing.type === "pen") {
         setCurrentDrawing({
@@ -427,10 +487,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       } else if (currentDrawing.type === "mosaic") {
         setCurrentDrawing({
           ...currentDrawing,
-          bounds: normalizeRect(
-            { x: currentDrawing.bounds.x, y: currentDrawing.bounds.y },
-            pt
-          ),
+          bounds: normalizeRect(drawingOrigin.current ?? pt, pt),
         });
       }
       return;
@@ -474,6 +531,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       pushElement(currentDrawing);
       setCurrentDrawing(null);
     }
+    drawingOrigin.current = null;
 
     setDragState({
       mode: "none",
@@ -484,7 +542,16 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   };
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden select-none">
+    <div
+      className="relative w-screen h-screen overflow-hidden select-none"
+      style={{
+        opacity: closing ? 0 : 1,
+        // Only animate opacity while closing; a new session snaps back to full
+        // opacity instantly (no fade-in) because the window is still hidden.
+        transition: closing ? `opacity ${CLOSE_FADE_MS}ms ease-out` : "none",
+        pointerEvents: closing ? "none" : "auto",
+      }}
+    >
       {/* 4-Layer Interactive HTML5 Canvas */}
       <canvas
         ref={canvasRef}
@@ -502,22 +569,14 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
         <DimensionBadge crop={crop} scaleFactor={scaleFactor} />
       )}
 
-      {/* 4x Magnifier Loupe */}
-      <LoupeMagnifier
-        key={captureToken}
-        cursor={cursorPos}
-        visible={dragState.mode === "creating" || (!crop && dragState.mode === "none")}
-        backgroundImage={backgroundImage}
-        canvasWidth={windowSize.width}
-        canvasHeight={windowSize.height}
-      />
-
       {/* Floating Toolbar */}
       {crop && dragState.mode === "none" && !currentDrawing && (
         <FloatingToolbar
           crop={crop}
           activeTool={activeTool}
+          shapeMode={shapeMode}
           onSelectTool={setActiveTool}
+          onCycleShape={() => setShapeMode((mode) => nextShapeMode(mode))}
           activeColor={activeColor}
           onSelectColor={setActiveColor}
           activeStrokeWidth={activeStrokeWidth}
@@ -542,6 +601,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       {editingText && (
         <input
           type="text"
+          ref={textInputRef}
           autoFocus
           value={editingText.text}
           onChange={(e) => setEditingText({ ...editingText, text: e.target.value })}
@@ -554,7 +614,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
                   position: editingText.position,
                   text: editingText.text,
                   color: activeColor,
-                  fontSize: activeStrokeWidth * 6,
+                  fontSize: Math.max(16, activeStrokeWidth * 6),
                 });
               }
               setEditingText(null);
@@ -567,24 +627,11 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
             left: `${editingText.position.x}px`,
             top: `${editingText.position.y}px`,
             color: activeColor,
-            fontSize: `${activeStrokeWidth * 6}px`,
+            fontSize: `${Math.max(16, activeStrokeWidth * 6)}px`,
           }}
           className="z-50 bg-slate-900/80 border border-carambola-cyan rounded px-1.5 py-0.5 outline-none font-bold text-shadow shadow-lg"
           placeholder="Type annotation..."
         />
-      )}
-
-      {/* Top-right quick shortcut settings when idle */}
-      {!crop && dragState.mode === "none" && (
-        <div className="absolute top-4 right-4 z-40">
-          <button
-            onClick={() => setIsSettingsOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900/85 hover:bg-slate-800 backdrop-blur-md text-slate-300 hover:text-white border border-slate-700/60 shadow-lg text-xs font-medium transition-colors"
-          >
-            <Settings size={13} className="text-carambola-cyan" />
-            <span>Shortcut Settings</span>
-          </button>
-        </div>
       )}
 
       {/* Shortcut Configuration Modal */}

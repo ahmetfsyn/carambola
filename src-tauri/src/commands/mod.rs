@@ -7,6 +7,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufWriter;
+use tauri::ipc::InvokeBody;
 use tauri::{AppHandle, Manager, State};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -15,13 +16,6 @@ pub struct CropRect {
     pub y: f64,
     pub width: f64,
     pub height: f64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AnnotationElementDto {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub el_type: String,
 }
 
 #[tauri::command]
@@ -50,6 +44,72 @@ pub fn get_current_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Respo
 #[tauri::command]
 pub fn present_overlay(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     crate::window::present_overlay(&app_handle, &state)
+}
+
+/// Decodes the raw RGBA payload produced by the frontend compositor. The buffer
+/// is laid out as `[u32 LE width][u32 LE height][RGBA bytes...]` so the annotation
+/// compositing (including pixelation redaction) happens once, on the real
+/// screenshot pixels, with no extra image encode/decode round trip.
+fn parse_rgba_payload(bytes: &[u8]) -> Result<(u32, u32, &[u8]), String> {
+    if bytes.len() < 8 {
+        return Err("Image payload is too short".to_string());
+    }
+    let width = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let expected = 8usize
+        .checked_add((width as usize) * (height as usize) * 4)
+        .ok_or_else(|| "Image dimensions are too large".to_string())?;
+    if width == 0 || height == 0 || bytes.len() != expected {
+        return Err("Image payload has invalid dimensions".to_string());
+    }
+    Ok((width, height, &bytes[8..]))
+}
+
+fn raw_body<'a>(request: &'a tauri::ipc::Request<'_>) -> Result<&'a [u8], String> {
+    match request.body() {
+        InvokeBody::Raw(bytes) => Ok(bytes),
+        _ => Err("Expected raw RGBA request body".to_string()),
+    }
+}
+
+/// Copies the composited crop (annotations + redaction already applied) to the
+/// system clipboard.
+#[tauri::command]
+pub fn copy_crop_image(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let bytes = raw_body(&request)?;
+    let (width, height, rgba) = parse_rgba_payload(bytes)?;
+    copy_rgba_to_clipboard(rgba, width as usize, height as usize)?;
+    info!(
+        "Successfully copied {}x{} composite to clipboard",
+        width, height
+    );
+    Ok(())
+}
+
+/// Saves the composited crop (annotations + redaction already applied) to disk.
+#[tauri::command]
+pub fn save_crop_image(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let bytes = raw_body(&request)?;
+    let (width, height, rgba) = parse_rgba_payload(bytes)?;
+
+    let pictures_dir = dirs::picture_dir().unwrap_or_else(|| std::env::current_dir().unwrap());
+    let carambola_dir = pictures_dir.join("Carambola");
+    std::fs::create_dir_all(&carambola_dir)
+        .map_err(|e| format!("Failed to create save directory: {e}"))?;
+
+    let timestamp = Local::now().format("%Y-%m-%d_%H%M%S");
+    let file_path = carambola_dir.join(format!("Carambola_{timestamp}.png"));
+
+    let file = File::create(&file_path).map_err(|e| format!("Failed to create file: {e}"))?;
+    let mut writer = BufWriter::new(file);
+
+    PngEncoder::new(&mut writer)
+        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
+        .map_err(|e| format!("Failed to write PNG: {e}"))?;
+
+    let saved_str = file_path.to_string_lossy().to_string();
+    info!("Saved screenshot to: {}", saved_str);
+    Ok(saved_str)
 }
 
 fn extract_cropped_rgba(
@@ -82,66 +142,19 @@ fn extract_cropped_rgba(
 }
 
 #[tauri::command]
-pub fn copy_crop(
-    crop: CropRect,
-    _elements: Vec<AnnotationElementDto>,
-    scale_factor: f64,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    let frame = state
-        .get_frame()
-        .ok_or_else(|| "No captured frame available".to_string())?;
-
-    let (crop_rgba, w, h) =
-        extract_cropped_rgba(&frame.rgba, frame.width, frame.height, &crop, scale_factor)?;
-
-    copy_rgba_to_clipboard(&crop_rgba, w, h)?;
-    info!("Successfully copied {}x{} crop to clipboard", w, h);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn save_crop(
-    crop: CropRect,
-    _elements: Vec<AnnotationElementDto>,
-    scale_factor: f64,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let frame = state
-        .get_frame()
-        .ok_or_else(|| "No captured frame available".to_string())?;
-
-    let (crop_rgba, w, h) =
-        extract_cropped_rgba(&frame.rgba, frame.width, frame.height, &crop, scale_factor)?;
-
-    let pictures_dir = dirs::picture_dir().unwrap_or_else(|| std::env::current_dir().unwrap());
-    let carambola_dir = pictures_dir.join("Carambola");
-    std::fs::create_dir_all(&carambola_dir)
-        .map_err(|e| format!("Failed to create save directory: {e}"))?;
-
-    let timestamp = Local::now().format("%Y-%m-%d_%H%M%S");
-    let file_path = carambola_dir.join(format!("Carambola_{timestamp}.png"));
-
-    let file = File::create(&file_path).map_err(|e| format!("Failed to create file: {e}"))?;
-    let ref mut w_file = BufWriter::new(file);
-
-    let encoder = PngEncoder::new(w_file);
-    encoder
-        .write_image(&crop_rgba, w as u32, h as u32, ExtendedColorType::Rgba8)
-        .map_err(|e| format!("Failed to write PNG: {e}"))?;
-
-    let saved_str = file_path.to_string_lossy().to_string();
-    info!("Saved screenshot to: {}", saved_str);
-    Ok(saved_str)
-}
-
-#[tauri::command]
 pub fn hide_overlay(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.set_overlay_visible(false);
     if let Some(window) = app_handle.get_webview_window(crate::window::OVERLAY_LABEL) {
         crate::window::leave_native_fullscreen(&window);
         let _ = window.hide();
     }
+    // The overlay has fully closed: release the single-session lock so the next
+    // global shortcut activation can start a fresh capture. A Settings request
+    // that was never presented belongs to this aborted session and must not
+    // reopen Settings during a later capture.
+    state.clear_settings_on_present();
+    state.end_session();
+    info!("Overlay hidden; capture session released");
     Ok(())
 }
 
@@ -169,14 +182,52 @@ pub fn get_shortcut() -> Result<String, String> {
     Ok(crate::hotkey::load_or_create_config())
 }
 
-/// Temporary diagnostic sink so frontend-measured geometry appears in the same
-/// log stream as the native window/capture measurements.
-#[tauri::command]
-pub fn frontend_log(message: String) {
-    info!("[diag] {message}");
-}
-
 #[tauri::command]
 pub fn set_shortcut(app_handle: AppHandle, shortcut: String) -> Result<(), String> {
     crate::hotkey::update_global_shortcut(&app_handle, &shortcut)
+}
+
+/// Reports the real OS startup registration, not just the stored preference.
+#[tauri::command]
+pub fn get_autostart(app_handle: AppHandle) -> Result<crate::autostart::AutostartStatus, String> {
+    Ok(crate::autostart::status(&app_handle))
+}
+
+/// Enables/disables Start on Boot and persists the explicit choice.
+#[tauri::command]
+pub fn set_autostart(
+    app_handle: AppHandle,
+    enabled: bool,
+) -> Result<crate::autostart::AutostartStatus, String> {
+    crate::autostart::set_enabled(&app_handle, enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rgba_payload;
+
+    fn payload(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + (width * height * 4) as usize);
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend(std::iter::repeat(200u8).take((width * height * 4) as usize));
+        bytes
+    }
+
+    #[test]
+    fn parses_valid_rgba_payload() {
+        let bytes = payload(2, 1);
+        let (width, height, rgba) = parse_rgba_payload(&bytes).expect("valid payload");
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgba.len(), 8);
+    }
+
+    #[test]
+    fn rejects_short_and_mismatched_payloads() {
+        assert!(parse_rgba_payload(&[0, 1, 2]).is_err());
+        let mut wrong = payload(2, 2);
+        wrong.truncate(8 + 4);
+        assert!(parse_rgba_payload(&wrong).is_err());
+        assert!(parse_rgba_payload(&payload(0, 2)).is_err());
+    }
 }

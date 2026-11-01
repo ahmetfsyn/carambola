@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Keyboard, Check, X, AlertCircle } from "lucide-react";
-import { getGlobalShortcut, setGlobalShortcut } from "../../lib/ipc/commands";
+import { Keyboard, Check, X, AlertCircle, Power } from "lucide-react";
+import {
+  AutostartStatus,
+  getAutostartStatus,
+  getGlobalShortcut,
+  setAutostartEnabled,
+  setGlobalShortcut,
+} from "../../lib/ipc/commands";
 
 interface ShortcutModalProps {
   isOpen: boolean;
@@ -148,6 +154,8 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [isSaving, setIsSaving] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [autostart, setAutostart] = useState<AutostartStatus | null>(null);
+  const [autostartSaving, setAutostartSaving] = useState<boolean>(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -159,10 +167,36 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
         setIsRecording(false);
         setErrorMessage(null);
       });
+      getAutostartStatus()
+        .then(setAutostart)
+        .catch((err) =>
+          setAutostart({
+            supported: false,
+            enabled: false,
+            reason: `Could not read Start on Boot: ${String(err)}`,
+          })
+        );
     }
   }, [isOpen]);
 
   if (!isOpen) return null;
+
+  const handleToggleAutostart = async () => {
+    if (!autostart || !autostart.supported || autostartSaving) return;
+    setAutostartSaving(true);
+    try {
+      const next = await setAutostartEnabled(!autostart.enabled);
+      setAutostart(next);
+    } catch (err) {
+      setAutostart((prev) =>
+        prev
+          ? { ...prev, reason: typeof err === "string" ? err : "Failed to change Start on Boot" }
+          : prev
+      );
+    } finally {
+      setAutostartSaving(false);
+    }
+  };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     e.preventDefault();
@@ -240,8 +274,8 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
               <Keyboard size={20} />
             </div>
             <div>
-              <h2 className="text-base font-bold text-white">Capture Shortcut</h2>
-              <p className="text-xs text-slate-400">Configure global activation key</p>
+              <h2 className="text-base font-bold text-white">Settings</h2>
+              <p className="text-xs text-slate-400">Capture shortcut and startup behaviour</p>
             </div>
           </div>
           <button
@@ -251,6 +285,58 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
             <X size={18} />
           </button>
         </div>
+
+        {/* Start on Boot */}
+        <div className="mt-4 p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="p-2 bg-slate-800 text-slate-300 rounded-xl border border-slate-700/60">
+                <Power size={16} />
+              </div>
+              <div>
+                <div className="text-xs font-semibold text-slate-200">Start on Boot</div>
+                <div className="text-[11px] text-slate-400">
+                  Launch Carambola in the background at login.
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autostart?.enabled ?? false}
+              aria-label="Start on Boot"
+              disabled={
+                !autostart || !autostart.supported || autostartSaving || autostart === null
+              }
+              onClick={handleToggleAutostart}
+              className={`relative w-11 h-6 rounded-full border transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${
+                autostart?.enabled
+                  ? "bg-carambola-cyan border-carambola-cyan"
+                  : "bg-slate-700 border-slate-600"
+              }`}
+            >
+              <span
+                className={`absolute top-0.5 rounded-full bg-white shadow-sm transition-all ${
+                  autostart?.enabled ? "left-[22px]" : "left-0.5"
+                }`}
+                style={{ width: 18, height: 18 }}
+              />
+            </button>
+          </div>
+          {autostart?.reason && (
+            <p className="mt-2 text-[11px] text-amber-400/90 flex items-start gap-1.5">
+              <AlertCircle size={13} className="shrink-0 mt-0.5" />
+              <span>{autostart.reason}</span>
+            </p>
+          )}
+          {autostart && !autostart.supported && !autostart.reason && (
+            <p className="mt-2 text-[11px] text-amber-400/90">
+              Start on Boot is not supported on this platform.
+            </p>
+          )}
+        </div>
+
+        <div className="mt-4 text-xs font-semibold text-slate-300">Capture Shortcut</div>
 
         {/* Current Active Shortcut Badge */}
         <div className="my-4 p-3 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between">

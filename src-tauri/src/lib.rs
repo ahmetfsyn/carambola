@@ -1,7 +1,9 @@
 pub mod app_state;
+pub mod autostart;
 pub mod capture;
 pub mod clipboard;
 pub mod commands;
+pub mod config;
 pub mod hotkey;
 pub mod ocr;
 pub mod protocol;
@@ -21,19 +23,26 @@ pub fn run() {
     let state_for_setup = app_state.clone();
 
     tauri::Builder::default()
+        // Must be registered before other plugins so a second launch exits
+        // immediately instead of creating another tray/overlay instance.
+        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {
+            info!("Carambola is already running; ignoring duplicate launch");
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            // Start silent: the app is background/tray-first, so no overlay is
+            // shown until the user presses the capture shortcut.
+            Some(vec!["--background"]),
+        ))
         .manage(app_state.clone())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, _shortcut, event| {
                     if event.state() == ShortcutState::Pressed {
                         info!("Global shortcut triggered");
-                        let started = std::time::Instant::now();
-                        let result = window::activate_overlay(app, &state_for_hotkey);
-                        info!(
-                            "[perf] shortcut handler completed in {:.1}ms ({:?})",
-                            started.elapsed().as_secs_f64() * 1000.0,
-                            result
-                        );
+                        if let Err(err) = window::activate_overlay(app, &state_for_hotkey) {
+                            log::warn!("Screenshot activation failed: {err}");
+                        }
                     }
                 })
                 .build(),
@@ -44,17 +53,27 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_display_info,
             commands::get_current_frame,
-            commands::copy_crop,
-            commands::save_crop,
+            commands::copy_crop_image,
+            commands::save_crop_image,
             commands::hide_overlay,
             commands::present_overlay,
             commands::extract_ocr,
             commands::get_shortcut,
             commands::set_shortcut,
-            commands::frontend_log,
+            commands::get_autostart,
+            commands::set_autostart,
         ])
         .setup(move |app| {
             info!("Running application setup...");
+
+            // Tray-only background application on macOS: no Dock icon and no
+            // app menu, matching the Windows/Linux tray lifecycle.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Keep the OS startup registration in sync with the persisted
+            // preference, enabling it by default on first run.
+            autostart::ensure_preference(app.handle());
 
             // Initialize System Tray
             if let Err(e) = tray::setup_tray(app.handle(), state_for_setup.clone()) {

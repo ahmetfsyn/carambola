@@ -8,6 +8,9 @@ export type ToolType =
   | "text"
   | "mosaic";
 
+/** Shape drawn by the single cycling shape tool. */
+export type ShapeMode = "rect" | "triangle" | "circle";
+
 export interface ArrowElement {
   id: string;
   type: "arrow";
@@ -24,6 +27,25 @@ export interface RectElement {
   color: string;
   strokeWidth: number;
 }
+
+export interface TriangleElement {
+  id: string;
+  type: "triangle";
+  bounds: Rect;
+  color: string;
+  strokeWidth: number;
+}
+
+export interface CircleElement {
+  id: string;
+  type: "circle";
+  bounds: Rect;
+  color: string;
+  strokeWidth: number;
+}
+
+/** Elements drawn by the cycling shape tool. */
+export type ShapeElement = RectElement | TriangleElement | CircleElement;
 
 export interface PenElement {
   id: string;
@@ -52,6 +74,8 @@ export interface MosaicElement {
 export type AnnotationElement =
   | ArrowElement
   | RectElement
+  | TriangleElement
+  | CircleElement
   | PenElement
   | TextElement
   | MosaicElement;

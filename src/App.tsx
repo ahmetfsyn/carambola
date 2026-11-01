@@ -6,7 +6,7 @@ import {
   getDisplayInfo,
   getCurrentFrameBytes,
   presentOverlay,
-  logDiagnostics,
+  hideOverlay,
 } from "./lib/ipc/commands";
 import { DisplayInfo } from "./types/display";
 
@@ -45,29 +45,17 @@ async function decodeFrame(bytes: ArrayBuffer): Promise<FrameImage> {
   }
 }
 
-interface FrameLoadTiming {
-  ipcMs?: number;
-  decodeMs?: number;
-}
-
 /**
  * Fetches the latest frozen frame. Returns `null` when no trustworthy frame is
  * available; callers must not present the overlay in that case.
  */
-async function loadFrameImage(timing?: FrameLoadTiming): Promise<FrameImage | null> {
+async function loadFrameImage(): Promise<FrameImage | null> {
   try {
-    const ipcStarted = performance.now();
     const bytes = await getCurrentFrameBytes();
-    if (timing) timing.ipcMs = performance.now() - ipcStarted;
     if (bytes && bytes.byteLength > 0) {
-      const decodeStarted = performance.now();
-      const image = await decodeFrame(bytes);
-      if (timing) timing.decodeMs = performance.now() - decodeStarted;
-      return image;
+      return await decodeFrame(bytes);
     }
-    logDiagnostics("frame_load", { stage: "empty_payload" });
   } catch (ipcErr) {
-    logDiagnostics("frame_load", { stage: "ipc_failed", error: String(ipcErr) });
     console.warn("Direct IPC frame fetch not available, trying custom protocol:", ipcErr);
   }
 
@@ -79,10 +67,8 @@ async function loadFrameImage(timing?: FrameLoadTiming): Promise<FrameImage | nu
       const img = new Image();
       img.src = src;
       await img.decode();
-      logDiagnostics("frame_load", { stage: "protocol_ok", src });
       return img;
     } catch (err) {
-      logDiagnostics("frame_load", { stage: "protocol_failed", src, error: String(err) });
       console.warn(`Frame protocol failed (${src}):`, err);
     }
   }
@@ -105,31 +91,24 @@ export const App: React.FC = () => {
       if (img) setBackgroundImage(img);
     });
 
-    // Listen for new screenshot capture events from Rust backend.
+    // Listen for new screenshot capture events from Rust backend. The cleanup
+    // below handles the case where the async registration resolves after an
+    // effect teardown (React StrictMode / fast reload), preventing a duplicate
+    // listener from surviving into the next mount.
+    let disposed = false;
+    let unlistenCapture: (() => void) | null = null;
     const unlistenPromise = listen<CaptureReadyPayload>("capture_triggered", async (event) => {
       const seq = ++activationSeq.current;
       const payload = event.payload;
-      const receivedAt = Date.now();
-      const timelineStart = performance.now();
 
-      logDiagnostics("perf", {
-        stage: "event_received",
-        receivedAfterTriggerMs: receivedAt - payload.triggeredAt,
-        captureMs: payload.captureMs,
-        encodeMs: payload.encodeMs,
-        pngBytes: payload.pngBytes,
-        display: payload.display.name,
-      });
-
-      const frameTiming: FrameLoadTiming = {};
-      const image = await loadFrameImage(frameTiming);
-      const fetchDecodeMs = performance.now() - timelineStart;
+      const image = await loadFrameImage();
 
       // A newer activation superseded this one while the frame was loading.
       if (seq !== activationSeq.current) return;
       if (!image) {
         console.error("No fresh screenshot available; keeping the overlay hidden");
-        logDiagnostics("perf", { stage: "aborted", reason: "no_frame", fetchDecodeMs });
+        // Release the backend session lock so a later activation can retry.
+        void hideOverlay();
         return;
       }
 
@@ -141,7 +120,6 @@ export const App: React.FC = () => {
         setBackgroundImage(image);
         setCaptureToken((token) => token + 1);
       });
-      const commitMs = performance.now() - timelineStart;
 
       if (seq !== activationSeq.current) return;
 
@@ -149,36 +127,25 @@ export const App: React.FC = () => {
         await presentOverlay();
       } catch (err) {
         console.error("Failed to present overlay:", err);
-        logDiagnostics("perf", { stage: "aborted", reason: "present_failed" });
-        return;
+        // Release the backend session lock so the app is not stuck.
+        void hideOverlay();
       }
-
-      const presentedMs = performance.now() - timelineStart;
-      logDiagnostics("perf", {
-        stage: "presented",
-        ipcMs: frameTiming.ipcMs,
-        decodeMs: frameTiming.decodeMs,
-        fetchDecodeMs,
-        commitMs,
-        presentedMs,
-        totalAfterTriggerMs: Date.now() - payload.triggeredAt,
-      });
-
-      requestAnimationFrame(() => {
-        logDiagnostics("perf", {
-          stage: "first_frame",
-          firstFrameMs: performance.now() - timelineStart,
-          totalAfterTriggerMs: Date.now() - payload.triggeredAt,
-        });
-      });
     });
 
-    unlistenPromise.catch((err) =>
-      logDiagnostics("listener", { stage: "error", error: String(err) })
-    );
+    unlistenPromise
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenCapture = unlisten;
+        }
+      })
+      .catch((err) => console.error("Failed to register capture listener:", err));
 
     return () => {
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+      disposed = true;
+      unlistenCapture?.();
+      unlistenCapture = null;
     };
   }, []);
 
@@ -189,27 +156,8 @@ export const App: React.FC = () => {
   // reports a different DPI scale.
   const scaleFactor = window.devicePixelRatio || displayInfo?.scaleFactor || 1;
 
-  // Temporary pipeline diagnostics (frontend view of the display).
-  useEffect(() => {
-    if (!displayInfo) return;
-    logDiagnostics("display", {
-      innerWidth: window.innerWidth,
-      innerHeight: window.innerHeight,
-      devicePixelRatio: window.devicePixelRatio,
-      screenWidth: window.screen.width,
-      screenHeight: window.screen.height,
-      availWidth: window.screen.availWidth,
-      availHeight: window.screen.availHeight,
-      physicalWidth: displayInfo.physicalWidth,
-      physicalHeight: displayInfo.physicalHeight,
-      reportedScaleFactor: displayInfo.scaleFactor,
-      bounds: displayInfo.bounds,
-      isPrimary: displayInfo.isPrimary,
-    });
-  }, [displayInfo]);
-
   return (
-    <div className="w-screen h-screen bg-black overflow-hidden select-none">
+    <div className="w-screen h-screen overflow-hidden select-none">
       <OverlayContainer
         backgroundImage={backgroundImage}
         scaleFactor={scaleFactor}
