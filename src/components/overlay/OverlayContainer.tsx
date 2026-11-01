@@ -640,6 +640,11 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
           onChange={(e) => setEditingText({ ...editingText, text: e.target.value })}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
+              // React flushes this state update before the native window
+              // keydown listener runs. Stop the same Enter event reaching the
+              // global Copy shortcut after the editor closes.
+              e.preventDefault();
+              e.stopPropagation();
               if (editingText.text.trim()) {
                 pushElement({
                   id: `text-${Date.now()}`,
@@ -652,6 +657,8 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
               }
               setEditingText(null);
             } else if (e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
               setEditingText(null);
             }
           }}
