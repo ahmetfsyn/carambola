@@ -29,7 +29,9 @@ pub fn setup_tray(
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "capture" => {
                 info!("Tray menu 'Capture' clicked");
-                let _ = activate_overlay(app, &state_clone);
+                if let Err(err) = activate_overlay(app, &state_clone) {
+                    crate::window::report_activation_error(app, &err);
+                }
             }
             "settings" => {
                 info!("Tray menu 'Settings' clicked");
@@ -44,7 +46,9 @@ pub fn setup_tray(
                     // request once that session is on screen.
                     state_clone.request_settings_on_present();
                     if !state_clone.is_session_active() {
-                        let _ = activate_overlay(app, &state_clone);
+                        if let Err(err) = activate_overlay(app, &state_clone) {
+                            crate::window::report_activation_error(app, &err);
+                        }
                     }
                     if !state_clone.is_session_active() {
                         // Activation failed or was ignored: do not leave a

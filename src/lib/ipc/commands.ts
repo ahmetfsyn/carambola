@@ -97,3 +97,24 @@ export async function setAutostartEnabled(enabled: boolean): Promise<AutostartSt
   return await invoke<AutostartStatus>("set_autostart", { enabled });
 }
 
+export interface ScreenshotNotificationSettings {
+  enabled: boolean;
+  permission_prompted: boolean;
+}
+
+export async function getScreenshotNotificationSettings(): Promise<ScreenshotNotificationSettings> {
+  return await invoke<ScreenshotNotificationSettings>("get_screenshot_notification_settings");
+}
+
+export async function setScreenshotNotifications(
+  enabled: boolean
+): Promise<ScreenshotNotificationSettings> {
+  return await invoke<ScreenshotNotificationSettings>("set_screenshot_notifications", {
+    enabled,
+  });
+}
+
+export async function claimNotificationPermissionPrompt(): Promise<boolean> {
+  return await invoke<boolean>("claim_notification_permission_prompt");
+}
+

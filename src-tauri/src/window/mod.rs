@@ -3,7 +3,9 @@ use crate::capture::capture_screen;
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::time::Instant;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+#[cfg(not(target_os = "macos"))]
+use tauri::{PhysicalPosition, PhysicalSize};
 
 /// Label of the single, pre-created screenshot overlay window.
 pub const OVERLAY_LABEL: &str = "overlay-main";
@@ -44,60 +46,98 @@ fn configure_overlay(window: &WebviewWindow) -> Result<(), String> {
     window
         .set_always_on_top(true)
         .map_err(|e| format!("Failed to raise overlay: {e}"))?;
+    #[cfg(target_os = "macos")]
+    configure_macos_overlay(window)?;
     Ok(())
+}
+
+/// Configure the native window so transparent pixels still receive input and
+/// the overlay remains above the active app, including its full-screen Space.
+#[cfg(target_os = "macos")]
+fn configure_macos_overlay(window: &WebviewWindow) -> Result<(), String> {
+    use objc2_app_kit::{
+        NSScreenSaverWindowLevel, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    };
+
+    window
+        .set_visible_on_all_workspaces(true)
+        .map_err(|e| format!("Failed to show overlay on all Spaces: {e}"))?;
+    window
+        .with_webview(|webview| unsafe {
+            let native_window = &*(webview.ns_window().cast::<NSWindow>());
+            let behavior = native_window.collectionBehavior()
+                | NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::Stationary;
+            native_window.setCollectionBehavior(behavior);
+            native_window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+            native_window.setIgnoresMouseEvents(false);
+            native_window.setLevel(NSScreenSaverWindowLevel);
+
+            debug!(
+                "[macOS overlay] collection={behavior:?} ignores_mouse_events={} level={}",
+                native_window.ignoresMouseEvents(),
+                native_window.level()
+            );
+        })
+        .map_err(|e| format!("Failed to configure native macOS overlay: {e}"))
 }
 
 /// Applies the frameless, always-on-top, full-monitor geometry required for a
 /// Lightshot-style overlay.
 ///
-/// The position/size are applied in **physical** pixels straight from the
-/// captured monitor rectangle, so the overlay exactly covers the target display
-/// regardless of Windows DPI scaling and no matter what its native resolution is.
+/// The position and size use the native display-coordinate units: logical
+/// points on macOS, physical pixels on Windows and Linux.
 pub fn apply_overlay_geometry(
     window: &WebviewWindow,
     bounds: &DisplayBounds,
 ) -> Result<(), String> {
-    let x = bounds.x.round() as i32;
-    let y = bounds.y.round() as i32;
-    let width = bounds.width.round().max(1.0) as u32;
-    let height = bounds.height.round().max(1.0) as u32;
-
-    window
-        .set_position(PhysicalPosition::new(x, y))
-        .map_err(|e| format!("Failed to position overlay: {e}"))?;
-    window
-        .set_size(PhysicalSize::new(width, height))
-        .map_err(|e| format!("Failed to resize overlay: {e}"))?;
-
-    info!("Overlay geometry set to {width}x{height} at ({x}, {y})");
-    Ok(())
-}
-
-/// On macOS a borderless top-most window still sits below the menu bar and
-/// Dock. Native "simple fullscreen" covers the whole screen without switching
-/// Spaces, which is the macOS equivalent of the Windows full-monitor overlay.
-/// It is best-effort: if it fails we keep the explicit physical geometry.
-#[cfg(target_os = "macos")]
-fn enter_native_fullscreen(window: &WebviewWindow) {
-    if let Err(e) = window.set_simple_fullscreen(true) {
-        warn!("Failed to enter native fullscreen: {e}");
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn enter_native_fullscreen(_window: &WebviewWindow) {}
-
-/// Counterpart to [`enter_native_fullscreen`], called when the overlay hides so
-/// later geometry changes take effect on the next activation.
-pub fn leave_native_fullscreen(window: &WebviewWindow) {
     #[cfg(target_os = "macos")]
     {
-        let _ = window.set_simple_fullscreen(false);
+        use core_graphics::display::CGDisplay;
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        // CoreGraphics uses a top-left origin in display points; AppKit uses a
+        // bottom-left origin. Tao's position conversion uses the main display's
+        // physical pixel height, which shifts a window on Retina displays.
+        let main_height = CGDisplay::main().bounds().size.height;
+        let x = bounds.x;
+        let y = main_height - bounds.y - bounds.height;
+        let width = bounds.width.max(1.0);
+        let height = bounds.height.max(1.0);
+        window
+            .with_webview(move |webview| unsafe {
+                use objc2_app_kit::NSWindow;
+                let native_window = &*(webview.ns_window().cast::<NSWindow>());
+                native_window.setFrame_display(
+                    NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)),
+                    true,
+                );
+                let actual = native_window.frame();
+                info!(
+                    "[macOS overlay] frame_points=({}, {}, {}, {})",
+                    actual.origin.x, actual.origin.y, actual.size.width, actual.size.height
+                );
+            })
+            .map_err(|e| format!("Failed to position and resize overlay: {e}"))?;
     }
+
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = window;
+        let x = bounds.x.round() as i32;
+        let y = bounds.y.round() as i32;
+        let width = bounds.width.round().max(1.0) as u32;
+        let height = bounds.height.round().max(1.0) as u32;
+
+        window
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|e| format!("Failed to position overlay: {e}"))?;
+        window
+            .set_size(PhysicalSize::new(width, height))
+            .map_err(|e| format!("Failed to resize overlay: {e}"))?;
+        info!("Overlay geometry set to {width}x{height} at ({x}, {y})");
     }
+    Ok(())
 }
 
 /// Called once during application setup. Sizes the hidden overlay to the
@@ -225,10 +265,42 @@ pub fn present_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), S
         return Err("No captured frame is ready".to_string());
     }
 
-    enter_native_fullscreen(&window);
     window
         .show()
         .map_err(|e| format!("Failed to show overlay: {e}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = window.set_focus() {
+            let _ = window.hide();
+            return Err(format!("Failed to focus screenshot overlay: {e}"));
+        }
+        if let Err(e) = window.with_webview(|webview| unsafe {
+            use objc2::MainThreadMarker;
+            use objc2_app_kit::{NSApplication, NSWindow, NSScreenSaverWindowLevel};
+            let native_window = &*(webview.ns_window().cast::<NSWindow>());
+            // Tauri's always-on-top configuration can subsequently replace the
+            // setup-time level with NSFloatingWindowLevel. Restore the capture
+            // level only when presenting the overlay, after that configuration.
+            native_window.setLevel(NSScreenSaverWindowLevel);
+            native_window.setIgnoresMouseEvents(false);
+            if let Some(main_thread) = MainThreadMarker::new() {
+                #[allow(deprecated)]
+                NSApplication::sharedApplication(main_thread).activateIgnoringOtherApps(true);
+            }
+            native_window.makeKeyAndOrderFront(None);
+            info!(
+                "[macOS overlay] visible={} key={} can_become_key={} ignores_mouse_events={} level={}",
+                native_window.isVisible(),
+                native_window.isKeyWindow(),
+                native_window.canBecomeKeyWindow(),
+                native_window.ignoresMouseEvents(),
+                native_window.level()
+            );
+        }) {
+            warn!("Could not inspect macOS overlay focus: {e}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     let _ = window.set_focus();
     state.set_overlay_visible(true);
 
@@ -242,4 +314,85 @@ pub fn present_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), S
 
     debug!("[perf] overlay presented (window visible and focused)");
     Ok(())
+}
+
+/// Reports a failed capture through the system log and gives macOS users an
+/// actionable Screen Recording permission prompt when that is the cause.
+pub fn report_activation_error(app_handle: &AppHandle, error: &str) {
+    error!("Screenshot activation failed: {error}");
+
+    #[cfg(target_os = "macos")]
+    {
+        let permission_denied = error.starts_with("Screen Recording access is not available");
+        let detail = error.to_string();
+        let app_handle = app_handle.clone();
+        if let Err(dispatch_error) = app_handle.clone().run_on_main_thread(move || {
+            use objc2::MainThreadMarker;
+            use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSWorkspace};
+            use objc2_foundation::{NSString, NSURL};
+
+            let Some(main_thread) = MainThreadMarker::new() else {
+                warn!("Cannot show Screen Recording guidance outside the macOS main thread");
+                return;
+            };
+            let alert = NSAlert::new(main_thread);
+            alert.setMessageText(&NSString::from_str(if permission_denied {
+                "Screen Recording access needed"
+            } else {
+                "Screen capture failed"
+            }));
+            alert.setInformativeText(&NSString::from_str(&detail));
+            if permission_denied {
+                alert.addButtonWithTitle(&NSString::from_str("Open Screen Recording Settings"));
+                alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            } else {
+                alert.addButtonWithTitle(&NSString::from_str("OK"));
+            }
+
+            if alert.runModal() == NSAlertFirstButtonReturn && permission_denied {
+                let settings_url = NSString::from_str(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                );
+                if let Some(url) = NSURL::URLWithString(&settings_url) {
+                    if !NSWorkspace::sharedWorkspace().openURL(&url) {
+                        warn!("macOS refused to open Screen Recording settings");
+                    }
+                }
+            }
+        }) {
+            warn!("Could not schedule Screen Recording guidance: {dispatch_error}");
+        }
+    }
+}
+
+/// Explains when a previously saved shortcut cannot be restored at startup.
+/// The fallback remains available for this run while the saved value is left
+/// untouched so the user can resolve the conflict in Settings.
+pub fn report_hotkey_fallback(app_handle: &AppHandle, shortcut: &str, error: &str) {
+    warn!("Saved shortcut {shortcut:?} could not be restored: {error}");
+
+    #[cfg(target_os = "macos")]
+    {
+        let message = format!(
+            "Carambola could not restore the saved shortcut {shortcut:?}. The fallback Alt+A is active for this session. Right-click the Carambola menu bar icon and open Settings to choose another shortcut."
+        );
+        let app_handle = app_handle.clone();
+        if let Err(dispatch_error) = app_handle.clone().run_on_main_thread(move || {
+            use objc2::MainThreadMarker;
+            use objc2_app_kit::NSAlert;
+            use objc2_foundation::NSString;
+
+            let Some(main_thread) = MainThreadMarker::new() else {
+                warn!("Cannot show shortcut registration guidance outside the macOS main thread");
+                return;
+            };
+            let alert = NSAlert::new(main_thread);
+            alert.setMessageText(&NSString::from_str("Saved shortcut is unavailable"));
+            alert.setInformativeText(&NSString::from_str(&message));
+            alert.addButtonWithTitle(&NSString::from_str("OK"));
+            alert.runModal();
+        }) {
+            warn!("Could not schedule shortcut registration guidance: {dispatch_error}");
+        }
+    }
 }

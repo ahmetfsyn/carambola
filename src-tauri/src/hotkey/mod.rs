@@ -22,6 +22,7 @@ pub fn setup_hotkey(
     }
 
     let shortcut_str = load_or_create_config();
+    info!("[hotkey] Attempting to register configured shortcut: {shortcut_str}");
 
     let shortcut: Shortcut = match shortcut_str.parse() {
         Ok(s) => s,
@@ -38,7 +39,11 @@ pub fn setup_hotkey(
     // Register shortcut
     match app_handle.global_shortcut().register(shortcut) {
         Ok(_) => {
-            info!("Registered global shortcut: {:?}", shortcut);
+            let registered = app_handle.global_shortcut().is_registered(shortcut);
+            info!(
+                "[hotkey] Registration succeeded for {:?}; active={registered}",
+                shortcut
+            );
             #[cfg(target_os = "windows")]
             if shortcut_str.eq_ignore_ascii_case("PrintScreen") {
                 // Windows 11 routes PrintScreen to Snipping Tool with a
@@ -56,11 +61,27 @@ pub fn setup_hotkey(
         }
         Err(err) => {
             warn!(
-                "Failed to register {:?}: {err:?}. Trying fallback 'Alt+A'...",
+                "[hotkey] Failed to register configured shortcut {:?}: {err:?}. Trying fallback 'Alt+A'...",
                 shortcut
             );
-            if let Ok(fallback) = "Alt+A".parse::<Shortcut>() {
-                let _ = app_handle.global_shortcut().register(fallback);
+            let fallback = "Alt+A".parse::<Shortcut>()?;
+            match app_handle.global_shortcut().register(fallback) {
+                Ok(()) => {
+                    info!(
+                        "[hotkey] Fallback shortcut Alt+A registered; configured shortcut remains saved"
+                    );
+                    crate::window::report_hotkey_fallback(
+                        app_handle,
+                        &shortcut_str,
+                        &err.to_string(),
+                    );
+                }
+                Err(fallback_err) => {
+                    return Err(format!(
+                        "Configured shortcut {shortcut_str:?} failed ({err:?}); fallback Alt+A failed ({fallback_err:?})"
+                    )
+                    .into());
+                }
             }
         }
     }
@@ -82,10 +103,14 @@ pub fn update_global_shortcut(
     // Register the new shortcut first. If another application owns it, the
     // registration fails and the currently working shortcut stays bound, so the
     // user never loses capture access while editing Settings.
+    info!("[hotkey] Attempting to rebind shortcut to {new_shortcut_str}");
     app_handle
         .global_shortcut()
         .register(shortcut)
-        .map_err(|e| format!("Could not register shortcut '{new_shortcut_str}': {e:?}"))?;
+        .map_err(|e| {
+            warn!("[hotkey] Failed to register {new_shortcut_str}: {e:?}");
+            format!("Could not register shortcut '{new_shortcut_str}': {e:?}")
+        })?;
 
     // Only drop the old binding once the new one is confirmed. Registering the
     // same combination twice is a no-op for the plugin, so skip it explicitly.
@@ -107,10 +132,32 @@ pub fn update_global_shortcut(
         return Err(err);
     }
 
-    info!(
-        "Successfully re-bound global shortcut to: {}",
-        new_shortcut_str
-    );
+    info!("[hotkey] Successfully re-bound global shortcut to: {new_shortcut_str}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tauri_plugin_global_shortcut::Shortcut;
+
+    #[test]
+    fn native_parser_preserves_command_control_and_combined_modifiers() {
+        let command_a: Shortcut = "Command+KeyA".parse().unwrap();
+        let control_a: Shortcut = "Control+KeyA".parse().unwrap();
+        let command_control_a: Shortcut = "Command+Control+KeyA".parse().unwrap();
+        assert_ne!(command_a, control_a);
+        assert_ne!(command_a, command_control_a);
+        assert_ne!(control_a, command_control_a);
+    }
+
+    #[test]
+    fn modifier_order_is_canonical_in_hotkey_identity_and_physical_punctuation_parses() {
+        let first: Shortcut = "Control+Alt+Shift+KeyA".parse().unwrap();
+        let reordered: Shortcut = "Shift+Alt+Control+KeyA".parse().unwrap();
+        assert_eq!(first, reordered);
+
+        assert!("Command+Quote".parse::<Shortcut>().is_ok());
+        assert!("Command+Backquote".parse::<Shortcut>().is_ok());
+    }
 }

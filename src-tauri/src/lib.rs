@@ -17,6 +17,14 @@ use tauri_plugin_global_shortcut::ShortcutState;
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Starting Carambola application...");
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn carambola_install_notification_delegate();
+        }
+        unsafe { carambola_install_notification_delegate() };
+        capture::log_macos_startup_diagnostics();
+    }
 
     let app_state = AppState::new();
     let state_for_hotkey = app_state.clone();
@@ -34,14 +42,19 @@ pub fn run() {
             // shown until the user presses the capture shortcut.
             Some(vec!["--background"]),
         ))
+        .plugin(tauri_plugin_notification::init())
         .manage(app_state.clone())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |app, _shortcut, event| {
+                .with_handler(move |app, shortcut, event| {
+                    log::debug!(
+                        "[hotkey] Event shortcut={shortcut:?} state={:?}",
+                        event.state()
+                    );
                     if event.state() == ShortcutState::Pressed {
-                        info!("Global shortcut triggered");
+                        info!("[hotkey] Global shortcut activated");
                         if let Err(err) = window::activate_overlay(app, &state_for_hotkey) {
-                            log::warn!("Screenshot activation failed: {err}");
+                            window::report_activation_error(app, &err);
                         }
                     }
                 })
@@ -62,6 +75,10 @@ pub fn run() {
             commands::set_shortcut,
             commands::get_autostart,
             commands::set_autostart,
+            commands::get_screenshot_notification_settings,
+            commands::notify_macos_screenshot,
+            commands::set_screenshot_notifications,
+            commands::claim_notification_permission_prompt,
         ])
         .setup(move |app| {
             info!("Running application setup...");
@@ -85,14 +102,8 @@ pub fn run() {
                 log::error!("Failed to register global hotkey: {e}");
             }
 
-            // Prime background capture
-            if let Ok(initial_frame) = capture::capture_screen() {
-                state_for_setup.set_frame(initial_frame);
-                info!("Initial screen frame primed in background");
-            }
-
-            // Size the hidden overlay to the target monitor up front so it is
-            // never shown at the default window size.
+            // Configure the hidden overlay now; capture and geometry are only
+            // acquired after the user explicitly starts a screenshot.
             window::prime_overlay(app.handle(), &state_for_setup);
 
             Ok(())

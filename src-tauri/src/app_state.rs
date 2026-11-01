@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DisplayBounds {
+    /// Display origin and dimensions in the coordinate units expected by the
+    /// native window backend: macOS points; physical pixels elsewhere.
     pub x: f64,
     pub y: f64,
     pub width: f64,
@@ -172,7 +174,10 @@ mod tests {
         let state = AppState::new();
         assert!(!state.is_session_active());
 
-        assert!(state.try_begin_session(), "first activation must claim the lock");
+        assert!(
+            state.try_begin_session(),
+            "first activation must claim the lock"
+        );
         assert!(
             !state.try_begin_session(),
             "second activation while active must be ignored"

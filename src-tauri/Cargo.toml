@@ -7,6 +7,7 @@ default-run = "carambola"
 
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
+cc = "1"
 
 [dependencies]
 tauri = { version = "2.1", features = ["tray-icon"] }
@@ -23,6 +24,7 @@ chrono = "0.4"
 dirs = "5.0"
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-notification = "2.8.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
@@ -74,4 +76,8 @@ opt-level = 2
 opt-level = 2
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 core-graphics = "0.24"
+objc2 = { version = "0.6.2", default-features = false }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWindow", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSResponder", "NSView", "NSWorkspace"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString", "NSURL"] }

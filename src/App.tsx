@@ -3,7 +3,6 @@ import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { OverlayContainer } from "./components/overlay/OverlayContainer";
 import {
-  getDisplayInfo,
   getCurrentFrameBytes,
   presentOverlay,
   hideOverlay,
@@ -20,6 +19,12 @@ interface CaptureReadyPayload {
 }
 
 type FrameImage = ImageBitmap | HTMLImageElement;
+
+function releaseFrameImage(image: FrameImage | null) {
+  if (image && "close" in image && typeof image.close === "function") {
+    image.close();
+  }
+}
 
 /**
  * Turns the raw PNG payload into a decoded image. `createImageBitmap` decodes
@@ -82,15 +87,12 @@ export const App: React.FC = () => {
   // Incremented together with each new frame so the overlay resets its session
   // in the very same React commit that installs the fresh screenshot.
   const [captureToken, setCaptureToken] = useState<number>(0);
+  const [presentationReady, setPresentationReady] = useState(false);
   // Guards against overlapping activations (e.g. a double shortcut press).
   const activationSeq = useRef<number>(0);
+  const backgroundImageRef = useRef<FrameImage | null>(null);
 
   useEffect(() => {
-    getDisplayInfo().then(setDisplayInfo);
-    loadFrameImage().then((img) => {
-      if (img) setBackgroundImage(img);
-    });
-
     // Listen for new screenshot capture events from Rust backend. The cleanup
     // below handles the case where the async registration resolves after an
     // effect teardown (React StrictMode / fast reload), preventing a duplicate
@@ -100,11 +102,17 @@ export const App: React.FC = () => {
     const unlistenPromise = listen<CaptureReadyPayload>("capture_triggered", async (event) => {
       const seq = ++activationSeq.current;
       const payload = event.payload;
+      const eventReceivedAt = performance.now();
 
+      const decodeStartedAt = performance.now();
       const image = await loadFrameImage();
+      const decodeFinishedAt = performance.now();
 
       // A newer activation superseded this one while the frame was loading.
-      if (seq !== activationSeq.current) return;
+      if (seq !== activationSeq.current) {
+        releaseFrameImage(image);
+        return;
+      }
       if (!image) {
         console.error("No fresh screenshot available; keeping the overlay hidden");
         // Release the backend session lock so a later activation can retry.
@@ -115,16 +123,34 @@ export const App: React.FC = () => {
       // Reset the previous session and install the new frame in one synchronous
       // commit. All reset/redraw effects are layout effects, so the canvas is
       // already clean when the window becomes visible.
+      const previous = backgroundImageRef.current;
+      backgroundImageRef.current = image;
       flushSync(() => {
         setDisplayInfo(payload.display);
         setBackgroundImage(image);
+        setPresentationReady(false);
         setCaptureToken((token) => token + 1);
       });
+      if (previous !== image) releaseFrameImage(previous);
 
       if (seq !== activationSeq.current) return;
 
       try {
         await presentOverlay();
+        // Begin the entry transition only after native presentation has been
+        // requested and the fresh frame has been installed in the canvas.
+        requestAnimationFrame(() => {
+          if (seq === activationSeq.current) setPresentationReady(true);
+        });
+        if (import.meta.env.DEV) {
+          console.info(
+            `[perf] ${seq === 1 ? "first" : "subsequent"} activation: ` +
+              `event-to-present=${(performance.now() - eventReceivedAt).toFixed(1)}ms ` +
+              `decode=${(decodeFinishedAt - decodeStartedAt).toFixed(1)}ms ` +
+              `trigger-to-present=${(Date.now() - payload.triggeredAt).toFixed(1)}ms ` +
+              `display=${payload.display.physicalWidth}x${payload.display.physicalHeight}`
+          );
+        }
       } catch (err) {
         console.error("Failed to present overlay:", err);
         // Release the backend session lock so the app is not stuck.
@@ -162,6 +188,7 @@ export const App: React.FC = () => {
         backgroundImage={backgroundImage}
         scaleFactor={scaleFactor}
         captureToken={captureToken}
+        presentationReady={presentationReady}
       />
     </div>
   );

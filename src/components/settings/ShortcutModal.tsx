@@ -1,12 +1,17 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Keyboard, Check, X, AlertCircle, Power } from "lucide-react";
+import { Keyboard, Check, X, AlertCircle, Power, Bell } from "lucide-react";
+import { isPermissionGranted } from "@tauri-apps/plugin-notification";
 import {
   AutostartStatus,
   getAutostartStatus,
   getGlobalShortcut,
+  getScreenshotNotificationSettings,
   setAutostartEnabled,
+  setScreenshotNotifications,
   setGlobalShortcut,
+  ScreenshotNotificationSettings,
 } from "../../lib/ipc/commands";
+import { isModifierKey, parseKeyboardEventToShortcut } from "../../lib/shortcutRecording";
 
 interface ShortcutModalProps {
   isOpen: boolean;
@@ -23,125 +28,7 @@ const PRESETS = [
   { label: "Ctrl + Alt + S", value: "Control+Alt+S" },
 ];
 
-/**
- * Mapping of physical keyboard `code` and symbolic `key` values
- * to Tauri `global-hotkey` compatible key identifiers.
- */
-const CODE_TO_TAURI_KEY: Record<string, string> = {
-  Quote: "Quote",
-  Backquote: "Backquote",
-  Slash: "Slash",
-  Backslash: "Backslash",
-  Semicolon: "Semicolon",
-  Equal: "Equal",
-  Minus: "Minus",
-  Comma: "Comma",
-  Period: "Period",
-  BracketLeft: "BracketLeft",
-  BracketRight: "BracketRight",
-  PrintScreen: "PrintScreen",
-  Space: "Space",
-  Enter: "Enter",
-  Tab: "Tab",
-  Backspace: "Backspace",
-  Delete: "Delete",
-  Insert: "Insert",
-  Home: "Home",
-  End: "End",
-  PageUp: "PageUp",
-  PageDown: "PageDown",
-  ArrowUp: "ArrowUp",
-  ArrowDown: "ArrowDown",
-  ArrowLeft: "ArrowLeft",
-  ArrowRight: "ArrowRight",
-  Escape: "Escape",
-};
-
-/**
- * Fallback mapping for typed characters if code mapping needs alias
- */
-const CHAR_TO_TAURI_KEY: Record<string, string> = {
-  '"': "Quote",
-  "'": "Quote",
-  "`": "Backquote",
-  "~": "Backquote",
-  ";": "Semicolon",
-  ":": "Semicolon",
-  "=": "Equal",
-  "+": "Equal",
-  "-": "Minus",
-  "_": "Minus",
-  "/": "Slash",
-  "?": "Slash",
-  "\\": "Backslash",
-  "|": "Backslash",
-  ",": "Comma",
-  "<": "Comma",
-  ".": "Period",
-  ">": "Period",
-  "[": "BracketLeft",
-  "{": "BracketLeft",
-  "]": "BracketRight",
-  "}": "BracketRight",
-};
-
-/**
- * Maps a KeyboardEvent into a Tauri-compatible shortcut string
- * (e.g. CommandOrControl, Control, Alt, Shift, Key, Function keys)
- */
-function parseKeyboardEventToShortcut(e: React.KeyboardEvent): string | null {
-  // Ignore lonely modifier presses
-  if (["Control", "Shift", "Alt", "Meta", "AltGraph"].includes(e.key)) {
-    return null;
-  }
-
-  const parts: string[] = [];
-
-  // Modifiers in standard order
-  if (e.metaKey || e.ctrlKey) {
-    parts.push("CommandOrControl");
-  }
-  if (e.altKey) {
-    parts.push("Alt");
-  }
-  if (e.shiftKey) {
-    parts.push("Shift");
-  }
-
-  let key: string | undefined;
-
-  // 1. Check known physical codes (e.g., Code 'Quote' for ' or ", 'Backquote' for `)
-  if (CODE_TO_TAURI_KEY[e.code]) {
-    key = CODE_TO_TAURI_KEY[e.code];
-  } else if (e.code.startsWith("F") && /^F\d{1,2}$/.test(e.code)) {
-    key = e.code;
-  } else if (e.code.startsWith("Key") && e.code.length === 4) {
-    key = e.code.slice(3).toUpperCase();
-  } else if (e.code.startsWith("Digit") && e.code.length === 6) {
-    key = e.code.slice(5);
-  } else if (e.code.startsWith("Numpad") && /^Numpad\d$/.test(e.code)) {
-    key = `Numpad${e.code.slice(6)}`;
-  } else if (CHAR_TO_TAURI_KEY[e.key]) {
-    key = CHAR_TO_TAURI_KEY[e.key];
-  } else if (e.key.length === 1) {
-    key = e.key.toUpperCase();
-  }
-
-  if (!key) {
-    return null;
-  }
-
-  // If only a standalone key without modifiers is pressed, only allow certain keys
-  if (parts.length === 0) {
-    if (key === "PrintScreen" || /^F\d{1,2}$/.test(key)) {
-      return key;
-    }
-    return null;
-  }
-
-  parts.push(key);
-  return parts.join("+");
-}
+const IS_MACOS = /Mac|iPhone|iPad/.test(navigator.platform);
 
 export const ShortcutModal: React.FC<ShortcutModalProps> = ({
   isOpen,
@@ -156,6 +43,10 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [autostart, setAutostart] = useState<AutostartStatus | null>(null);
   const [autostartSaving, setAutostartSaving] = useState<boolean>(false);
+  const [notifications, setNotifications] = useState<ScreenshotNotificationSettings | null>(null);
+  const [notificationPermissionGranted, setNotificationPermissionGranted] = useState<boolean | null>(null);
+  const [notificationSaving, setNotificationSaving] = useState<boolean>(false);
+  const [notificationError, setNotificationError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -176,6 +67,14 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
             reason: `Could not read Start on Boot: ${String(err)}`,
           })
         );
+      getScreenshotNotificationSettings()
+        .then(setNotifications)
+        .catch((err) => {
+          setNotificationError(`Could not read notification preference: ${String(err)}`);
+        });
+      isPermissionGranted()
+        .then(setNotificationPermissionGranted)
+        .catch(() => setNotificationPermissionGranted(false));
     }
   }, [isOpen]);
 
@@ -198,6 +97,22 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
     }
   };
 
+  const handleToggleNotifications = async () => {
+    if (!notifications || notificationSaving) return;
+    setNotificationSaving(true);
+    setNotificationError(null);
+    try {
+      const next = await setScreenshotNotifications(!notifications.enabled);
+      setNotifications(next);
+    } catch (err) {
+      setNotificationError(
+        typeof err === "string" ? err : "Failed to save screenshot notification preference"
+      );
+    } finally {
+      setNotificationSaving(false);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     e.preventDefault();
     e.stopPropagation();
@@ -208,11 +123,19 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
       return;
     }
 
-    const shortcut = parseKeyboardEventToShortcut(e);
+    const shortcut = parseKeyboardEventToShortcut(e, IS_MACOS);
     if (shortcut) {
       setCustomInput(shortcut);
       setSelectedShortcut(shortcut);
       setErrorMessage(null);
+      setIsRecording(false);
+      inputRef.current?.blur();
+    } else if (!isModifierKey(e.key)) {
+      setErrorMessage(
+        e.code.startsWith("Intl")
+          ? "This physical key is not supported by the global shortcut API. Choose another key."
+          : "Use a modifier with this key. Function keys and Print Screen can be used alone."
+      );
       setIsRecording(false);
       inputRef.current?.blur();
     }
@@ -248,6 +171,7 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
     return shortcut
       .replace("CommandOrControl", "⌘ / Ctrl")
       .replace("Command", "⌘")
+      .replace("Super", IS_MACOS ? "⌘" : "⊞")
       .replace("Control", "Ctrl")
       .replace("Shift", "⇧")
       .replace("Alt", "⌥ / Alt")
@@ -332,6 +256,59 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
           {autostart && !autostart.supported && !autostart.reason && (
             <p className="mt-2 text-[11px] text-amber-400/90">
               Start on Boot is not supported on this platform.
+            </p>
+          )}
+        </div>
+
+        {/* Screenshot Notifications */}
+        <div className="mt-3 p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="p-2 bg-slate-800 text-slate-300 rounded-xl border border-slate-700/60">
+                <Bell size={16} />
+              </div>
+              <div>
+                <div className="text-xs font-semibold text-slate-200">Screenshot Notifications</div>
+                <div className="text-[11px] text-slate-400">
+                  Show a system notification after successfully capturing a screenshot.
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={notifications?.enabled ?? true}
+              aria-label="Screenshot Notifications"
+              disabled={!notifications || notificationSaving}
+              onClick={handleToggleNotifications}
+              className={`relative w-11 h-6 rounded-full border transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${
+                notifications?.enabled
+                  ? "bg-carambola-cyan border-carambola-cyan"
+                  : "bg-slate-700 border-slate-600"
+              }`}
+            >
+              <span
+                className={`absolute top-0.5 rounded-full bg-white shadow-sm transition-all ${
+                  notifications?.enabled ? "left-[22px]" : "left-0.5"
+                }`}
+                style={{ width: 18, height: 18 }}
+              />
+            </button>
+          </div>
+          {notifications?.enabled &&
+            notifications.permission_prompted &&
+            notificationPermissionGranted === false && (
+              <p className="mt-2 text-[11px] text-amber-400/90 flex items-start gap-1.5">
+                <AlertCircle size={13} className="shrink-0 mt-0.5" />
+                <span>
+                  System notification permission is off. Allow Carambola in your system notification settings; it will not ask again automatically.
+                </span>
+              </p>
+            )}
+          {notificationError && (
+            <p className="mt-2 text-[11px] text-amber-400/90 flex items-start gap-1.5">
+              <AlertCircle size={13} className="shrink-0 mt-0.5" />
+              <span>{notificationError}</span>
             </p>
           )}
         </div>

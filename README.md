@@ -16,6 +16,7 @@ Carambola runs in the background with no main window. A system-tray menu and a c
 - Save the annotated selection as a PNG under the user's Pictures folder.
 - OCR on Windows (Windows.Media.Ocr); extracted text is copied to the clipboard.
 - Settings screen for the capture shortcut and Start on Boot.
+- Optional native screenshot notifications, enabled by default, after a screenshot is successfully copied or saved.
 - Single-instance behaviour: launching Carambola again while it is running only brings up the existing instance (it does not create a second tray icon).
 - Tray-only background operation on Windows, macOS, and Linux.
 
@@ -36,11 +37,11 @@ Real screenshots are not checked into this repository yet. The placeholders belo
 
 | Platform | Architecture | Status |
 | --- | --- | --- |
-| Windows 10/11 | x86_64 | Built and runtime-tested on Windows 11 x64 in this repository's QA pass. Single 1920×1080 monitor at 100% display scaling. A production NSIS installer is produced. |
-| macOS | Apple Silicon / Intel | Code paths are present, but macOS has **not** been runtime-tested in this QA pass. No signing or notarization is configured. Screen Recording permission is required. |
-| Linux | x86_64 | Code paths are present, but Linux has **not** been runtime-tested in this QA pass. Screen capture uses X11 APIs; native Wayland capture is not verified. See the Linux section below. |
+| Windows 10/11 | x86_64 | Target platform. Windows runtime QA, production build, and installer generation have **not** been verified in this checkout. |
+| macOS | Apple Silicon | Release app and DMG built. Screen Recording authorization and interactive capture require further packaged-app QA. An older grant did not match the installed app's ad hoc code signature. No Developer ID signing or notarization is configured. Intel was not tested. |
+| Linux | x86_64 | Code paths are present, but runtime behavior and packaging have **not** been verified. Screen capture uses X11 APIs; native Wayland capture is not verified. See the Linux section below. |
 
-Do not assume a platform is supported merely because it appears in this table. Only the Windows x86_64 row was exercised at runtime for this release.
+The platform rows report the checks completed in this stabilization pass; they do not establish full runtime certification. Windows and Linux were not built or tested here.
 
 ## Installation
 
@@ -48,31 +49,33 @@ Do not assume a platform is supported merely because it appears in this table. O
 
 The Windows build uses the Tauri NSIS bundler and installs for the current user by default, so administrator rights are normally not required.
 
-1. Obtain `Carambola_<version>_x64-setup.exe` from the repository's Releases page when a release is published, or build it locally (see [Build instructions](#build-instructions)).
+1. Obtain `Carambola_<version>_x64-setup.exe` from the repository's Releases page after a release is published, or build it locally (see [Build instructions](#build-instructions)). No installer is currently verified or published by this repository.
 2. Run the installer and follow the wizard.
 3. Launch **Carambola** from the Start Menu. The app starts in the background and adds a tray icon; there is no main window.
 4. Right-click the tray icon for **Capture Screen**, **Settings...**, and **Quit Carambola**.
 
-The installer is not code-signed. Windows SmartScreen may show a warning the first time it is run; use **More info → Run anyway** only if you obtained the file from a source you trust.
+The Windows installer has not been generated or tested in this checkout. If distributed unsigned, Windows SmartScreen may show a warning.
 
-**WebView2 requirement:** Carambola uses the Microsoft Edge WebView2 runtime. Windows 11 and most up-to-date Windows 10 systems already have it. If it is missing, the Tauri installer's bootstrapper downloads and installs it, which requires an internet connection during installation. On an offline machine, install the Evergreen WebView2 Runtime from Microsoft first, then run the Carambola installer.
+**WebView2 requirement:** Carambola uses the Microsoft Edge WebView2 runtime. The installed Tauri CLI 2.12.4 configuration schema defaults the NSIS install mode to `downloadBootstrapper` with silent installation. A Windows installer built with this configuration downloads the bootstrapper and needs internet access if WebView2 is missing. WebView2 is already present on many Windows 11 systems; offline installation requires the runtime to be installed separately first.
 
 **Portable executable:** after a local release build, `src-tauri/target/release/carambola.exe` can be run directly without installation. It still requires WebView2. It is not a replacement for the installer: it has no Start Menu entry or uninstaller, and moving the executable changes the path used by Start on Boot.
 
 ### macOS
 
-A `.app`/`.dmg` can be produced by running the Tauri build on macOS, but no macOS package is included or verified here.
+A `.app` and Apple Silicon `.dmg` were built from this checkout. The DMG was mounted and its checksum verified; the packaged process was confirmed running. Interactive capture, settings, and notification delivery still need runtime QA.
 
-1. Open the `.dmg` and drag **Carambola** to **Applications**.
-2. The app is not signed or notarized. On first launch, macOS may block it; open it with **Control-click → Open**, or allow it in **System Settings → Privacy & Security**.
-3. Grant **Screen Recording** permission when prompted, or add Carambola manually under **System Settings → Privacy & Security → Screen Recording**. macOS requires the app to be restarted after this permission is granted.
+1. Open the `.dmg` and drag **Carambola** to **Applications**. The QA artifact is `src-tauri/target/release/bundle/dmg/Carambola_0.1.0_aarch64.dmg`.
+2. The app has an ad hoc signature, not a Developer ID signature, and is not notarized. Gatekeeper may block it; use the macOS privacy/security controls only after obtaining the build from a trusted source.
+3. Grant **Screen Recording** permission when prompted during a capture, or add Carambola manually under **System Settings → Privacy & Security → Screen & System Audio Recording**. Restart after changing this permission.
 4. Launch Carambola; it runs as a menu-bar/tray application without a Dock icon.
 
-Screen capture will produce blank or failed frames until Screen Recording permission is granted.
+Carambola does not capture the desktop at launch. Screen Recording permission is used only after you start a capture. The current global shortcut does not request Accessibility permission. After a successful Copy or Save, macOS requests notification permission if its status has not been decided. If permission was denied, enable Carambola under **System Settings → Notifications**; macOS does not repeatedly show the authorization prompt.
+
+Screen capture may produce blank or failed frames until Screen Recording permission is granted.
 
 ### Linux
 
-A Linux build can produce `.deb`, `.rpm`, and AppImage packages with the Tauri bundler, but none of these packages was built or installed during this QA pass.
+A Linux build may produce `.deb`, `.rpm`, and AppImage packages with the Tauri bundler, but none of these packages has been built or installed in this checkout.
 
 Build on the target Linux machine, then use `install.sh` at the repository root:
 
@@ -91,7 +94,9 @@ Runtime requirements for the Linux build:
 - A working X11 display for screen capture. On Wayland, run under XWayland or use an X11 session; native Wayland capture is not verified and may fail or return a black frame.
 - A global-shortcut backend. The app uses X11 global shortcuts; on Wayland through XWayland this may work, otherwise bind the shortcut in the desktop environment's keyboard settings or use an X11 session.
 
-Linux installation and runtime behaviour are **NOT TESTED** in this repository's QA pass.
+Linux installation and runtime behaviour are **NOT TESTED**.
+
+Native notifications require a working desktop notification service. Linux behavior varies by desktop environment and is **NOT TESTED**.
 
 ## Using Carambola
 
@@ -104,7 +109,9 @@ Carambola starts hidden. Trigger a capture with:
 
 Each activation freezes a fresh screenshot before showing the overlay. While a capture session is active, further activations are ignored, so you cannot accidentally open two sessions.
 
-On Windows, the monitor under the mouse pointer is captured. On other platforms the primary monitor is used.
+On Windows, the monitor under the mouse pointer is captured. On macOS, Carambola chooses the display containing the frontmost ordinary application window, then falls back to the pointer display and primary display. Other platforms use the primary monitor.
+
+On macOS, xcap reports display bounds in logical points while the captured screenshot uses Retina pixels. Carambola positions and sizes its overlay in points and keeps crop dimensions in captured pixels. The native overlay joins all Spaces, joins full-screen Spaces, stays above ordinary windows, and explicitly receives mouse events through transparent regions. These settings address the Retina geometry and click-through causes found in source inspection; full input-isolation behavior still requires interactive runtime verification.
 
 ### Select an area
 
@@ -144,6 +151,12 @@ The **Mosaic** tool pixelates the exported pixels; it does not merely draw a tra
   - macOS/Linux: the system Pictures directory, in a `Carambola` subfolder.
 - **Cancel:** press **Escape** or click Close. Nothing is copied or saved.
 
+### Screenshot Notifications
+
+**Screenshot Notifications** is enabled by default, including for existing configuration files. Change it in Settings; the preference takes effect immediately and persists alongside the shortcut and Start on Boot choices. A native notification appears after Copy or Save succeeds, at most once per capture session. Opening the overlay, cancelling it, or a failed export does not send a notification.
+
+The operating system may ask once for notification permission after the first successful export. If permission is declined, enable Carambola in the system notification settings. On Windows, the Tauri notification plugin works only for installed apps; development uses a different notification identity.
+
 If the clipboard is unavailable or the Pictures folder cannot be written, the error is logged and no success feedback is shown; the overlay remains usable so the operation can be retried.
 
 ### Start on Boot
@@ -176,11 +189,11 @@ Choose **Quit Carambola** from the tray menu. This removes the tray icon and sto
 - turn off **Settings → Accessibility → Keyboard → Use the Print Screen key to open Snipping Tool**, or
 - choose a different shortcut in Carambola Settings (for example `F10`, `Ctrl+Alt+S`, or `Alt+F10`).
 
-This was reproduced on Windows 11 during QA. `Alt+F10` was verified to open the overlay through the real global shortcut.
+This Windows-specific interaction has not been re-tested in this stabilization pass.
 
-The capture shortcut can be changed in **Settings**. Presets are `PrintScreen`, `Cmd/Ctrl+Shift+X`, `Alt+A`, `Cmd/Ctrl+Shift+S`, `F10`, and `Ctrl+Alt+S`; custom combinations can also be recorded. The choice is persisted in the config file (see below).
+The capture shortcut can be changed in **Settings**. Presets are `PrintScreen`, `Cmd/Ctrl+Shift+X`, `Alt+A`, `Cmd/Ctrl+Shift+S`, `F10`, and `Ctrl+Alt+S`; custom combinations can also be recorded. The recorder uses physical `KeyboardEvent.code` values for letters and punctuation so Turkish Q/F layouts do not turn a key into a different shortcut based on its printed character. Command and Control are distinct on macOS. The choice is persisted in the config file (see below).
 
-If the configured capture shortcut is already registered by another application, Carambola falls back to `Alt+A` at startup and only writes a warning to its log; the Settings screen does not currently surface that fallback. Choose a different combination in that case.
+If the configured capture shortcut is already registered by another application, Carambola keeps `Alt+A` active for that run and shows a macOS alert explaining the fallback. The saved shortcut is left unchanged so it can be replaced in Settings. On all platforms the registration failure is logged.
 
 When changing the shortcut in Settings, Carambola tries to register the new combination before releasing the old one. If the new combination is unavailable, an error is shown and the previous shortcut keeps working.
 
@@ -203,15 +216,16 @@ Edit the file only while Carambola is not running. Invalid JSON is ignored and d
 
 ## Known limitations
 
-- **First-activation opacity effect (unfixed):** in development mode, the very first capture after launching shows the overlay fading in over roughly 200 ms instead of appearing instantly. Subsequent captures are immediate. Root cause was isolated to the Windows DWM window-open animation on the overlay's first show; no fix has been applied yet. See the QA investigation notes for the proposed fix.
+- **First-activation opacity effect (unverified):** the first-versus-subsequent capture comparison was not completed on a permission-enabled macOS session, so the reported effect remains unresolved.
 - **Windows 11 PrintScreen interception:** the default `PrintScreen` shortcut can be consumed by the Snipping Tool. See the [Windows 11 note](#keyboard-shortcuts) for workarounds.
-- **Shortcut conflicts:** a persisted shortcut that another app owns is not registered; the app falls back to `Alt+A` and does not warn in the UI.
+- **Shortcut conflicts:** a persisted shortcut that another app owns cannot be registered; startup uses `Alt+A` for that run and macOS explains the fallback. Choose a different combination in Settings.
 - **Mosaic strength is fixed:** redaction always uses 32 CSS px blocks; there is no strength slider.
 - **OCR is Windows-only.** On macOS and Linux the OCR action reports that OCR is unavailable.
 - **No code signing or notarization.** Windows SmartScreen and macOS Gatekeeper warnings are expected.
-- **macOS and Linux are not runtime-verified** for this release. Do not treat them as tested.
-- **Multi-monitor behaviour is untested.** Windows selects the monitor under the cursor; other platforms use the primary monitor.
-- **Display scaling:** only 100% scaling was exercised in this QA pass. 125%/150% scaling and mixed-DPI multi-monitor setups were not re-tested.
+- **macOS runtime QA is partial.** In DMG builds launched directly from a terminal, the user confirmed foreground content, input isolation, Escape, the updated transition, and a visible system notification after Copy. macOS attributed capture permission for that launch to VS Code; independent app authorization and PNG export remain unverified. Linux is not runtime-verified.
+- **macOS shortcut QA is incomplete.** Unit checks cover separate modifiers, ordering, and physical punctuation mapping. Packaged runtime activation while another app is active and shortcut persistence across restarts remain unverified.
+- **Multi-monitor behaviour is untested.** Capture targets the monitor under the cursor on Windows. macOS selects the display containing the frontmost ordinary app window, with pointer and primary display fallbacks; display selection and coordinate behavior still need runtime validation.
+- **Display scaling:** 100%, 125%, and 150% scaling were not runtime-tested in this stabilization pass.
 - **No auto-update, history, gallery, or cloud sync.**
 - **No license has been selected.** See [License](#license).
 
@@ -232,13 +246,15 @@ macOS blocks screen capture until the app is authorised:
 2. Enable **Carambola**.
 3. Quit and relaunch Carambola.
 
-Without this permission, capture returns no usable frame; Carambola keeps the overlay hidden rather than showing an empty one. The macOS build is unsigned and unnotarized, so Gatekeeper may also block the first launch. These macOS behaviours were not runtime-tested in this QA pass.
+Carambola checks the running process's permission before capture and offers to open the relevant settings when access is unavailable. Other capture errors are reported separately. A switch in System Settings alone does not establish that the current binary is authorized: the QA machine's TCC log showed that a saved grant's code requirement did not match the installed ad hoc build. Quit and relaunch after changing permission; if a rebuilt ad hoc app is not recognized, grant access to that build through System Settings without resetting TCC automatically.
+
+The bundle defaults to an ad hoc signature so its code-signing identifier matches its bundle identifier. Ad hoc builds have a designated requirement tied to their code hash, so a rebuild can invalidate an earlier grant. For consistent development testing, use one installed app location and sign builds with the same suitable development identity; distribution builds require a consistent Developer ID Application identity and notarization. Set `APPLE_SIGNING_IDENTITY` to override the local ad hoc setting. No certificate identity is configured on the QA machine. The current macOS capture uses xcap's CoreGraphics `CGWindowListCreateImage`, which Apple marks obsolete on macOS 15 and later. A user confirmed foreground content in the overlay when the DMG app was launched directly from a terminal; independent app authorization and exported image contents remain unverified.
 
 ## Development setup
 
 Prerequisites:
 
-- Node.js 18 or newer (Vite 5 requirement) and npm.
+- Node.js 18 or newer and npm.
 - Rust stable with Cargo.
 - The Tauri v2 system prerequisites for your platform: <https://v2.tauri.app/start/prerequisites/>
 - On Windows: Microsoft Edge WebView2 Runtime (normally present on Windows 11) and the MSVC build tools.
@@ -247,14 +263,14 @@ Install dependencies and start the development app:
 
 ```sh
 npm install
-npm run tauri dev
+npm run tauri -- dev
 ```
 
 The dev command starts Vite on `http://localhost:1420` and launches the Rust backend with a debug build. The overlay window is hidden until a capture is triggered. Developer tools are available in development builds only.
 
 > **Note:** the `tauri` npm script in `package.json` prepends `%USERPROFILE%\.cargo\bin` to `PATH` using Windows `cmd` syntax, so `npm run tauri ...` only works on Windows. On macOS and Linux use `npx tauri dev` / `npx tauri build` instead, with `cargo` already on your `PATH`.
 
-Run the checks used for this QA pass:
+Run the project checks:
 
 ```sh
 npm run build
@@ -271,7 +287,7 @@ There is no separate ESLint or frontend unit-test configuration in this reposito
 From the repository root, with the Rust toolchain and npm dependencies installed:
 
 ```sh
-npm run tauri build -- --bundles nsis
+npm run tauri -- build --bundles nsis
 ```
 
 Outputs:
@@ -296,6 +312,18 @@ Tauri's platform bundler decides which package formats are available:
 
 Cross-compiling a production bundle is not supported by this project's instructions; build on the target OS.
 
+### macOS DMG
+
+On an Apple Silicon Mac, build a drag-to-Applications installer with:
+
+```sh
+npx tauri build --bundles dmg
+```
+
+The DMG is written under `src-tauri/target/release/bundle/dmg/`. The verified artifact is `Carambola_0.1.0_aarch64.dmg` (5,223,425 bytes; SHA-256 `846a0cc107f75ceaf8e9a761d7e55b53af20499ac34589a3df9d53ac978f1df0`); its `.app` uses `src-tauri/icons/icon.icns` and bundle identifier `io.carambola.desktop`. The DMG checksum was verified and the app was launched from the mounted image. This build is ad hoc signed, not Developer ID signed or notarized, so Gatekeeper may block it. A public release should be signed and notarized before distribution.
+
+Capture-to-overlay latency and memory behavior were not measured. The native overlay input, selection, annotation, export, and notification flows remain unverified.
+
 ### Release artifacts and Git
 
 Build outputs live under `src-tauri/target/`, `dist/`, and `node_modules/` and are ignored by Git. Do not commit installers or compiled binaries unless the repository explicitly starts tracking release artifacts.
@@ -305,9 +333,9 @@ Build outputs live under `src-tauri/target/`, `dist/`, and `node_modules/` and a
 - **Tauri v2** (`tauri` 2.x) with the tray-icon feature.
 - **Rust** (edition 2021) backend.
 - **React 18** and **TypeScript 5.6** frontend.
-- **Vite 5** and **Tailwind CSS 3** for the UI build.
+- **Vite 6** and **Tailwind CSS 3** for the UI build.
 - **xcap** for screen capture, **image** for PNG encoding, **arboard** for the clipboard.
-- **tauri-plugin-global-shortcut**, **tauri-plugin-autostart**, and **tauri-plugin-single-instance**.
+- **tauri-plugin-global-shortcut**, **tauri-plugin-autostart**, **tauri-plugin-single-instance**, and **tauri-plugin-notification**.
 - **Windows.Media.Ocr** (via the `windows` crate) for Windows OCR only.
 
 ## License

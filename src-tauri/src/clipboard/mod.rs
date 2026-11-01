@@ -34,4 +34,3 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to set clipboard text: {e}"))?;
     Ok(())
 }
-

@@ -1,7 +1,9 @@
 use crate::app_state::{CapturedFrame, DisplayBounds, DisplayInfo};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
-use log::{debug, info, warn};
+#[cfg(target_os = "windows")]
+use log::warn;
+use log::{debug, info};
 use std::io::Cursor;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use xcap::Monitor;
@@ -26,10 +28,173 @@ fn cursor_position() -> Option<(i32, i32)> {
     Some((point.x, point.y))
 }
 
+/// Returns the center of the frontmost ordinary application window. This keeps
+/// capture on the display containing the app the user can currently see, even
+/// when the pointer is resting on another monitor.
+#[cfg(target_os = "macos")]
+fn frontmost_application_window_center() -> Option<(i32, i32)> {
+    use core_foundation::{
+        base::TCFType,
+        dictionary::{CFDictionaryGetValue, CFDictionaryRef},
+        number::{kCFNumberIntType, CFNumberGetValue, CFNumberRef},
+        string::CFString,
+    };
+    use core_graphics::{
+        geometry::CGRect,
+        window::{copy_window_info, kCGNullWindowID, kCGWindowListOptionOnScreenOnly},
+    };
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect)
+            -> bool;
+    }
+
+    unsafe fn number_value(dictionary: CFDictionaryRef, key: &str) -> Option<i32> {
+        let key = CFString::new(key);
+        let value = CFDictionaryGetValue(dictionary, key.as_CFTypeRef());
+        if value.is_null() {
+            return None;
+        }
+        let mut result = 0i32;
+        let valid = CFNumberGetValue(
+            value as CFNumberRef,
+            kCFNumberIntType,
+            (&mut result as *mut i32).cast(),
+        );
+        valid.then_some(result)
+    }
+
+    let windows = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)?;
+    for window in windows.get_all_values() {
+        let dictionary = window as CFDictionaryRef;
+        if unsafe { number_value(dictionary, "kCGWindowLayer") } != Some(0)
+            || unsafe { number_value(dictionary, "kCGWindowOwnerPID") }
+                == Some(std::process::id() as i32)
+        {
+            continue;
+        }
+
+        let bounds_key = CFString::new("kCGWindowBounds");
+        let bounds = unsafe { CFDictionaryGetValue(dictionary, bounds_key.as_CFTypeRef()) };
+        if bounds.is_null() {
+            continue;
+        }
+        let mut rect = CGRect::default();
+        if !unsafe { CGRectMakeWithDictionaryRepresentation(bounds as CFDictionaryRef, &mut rect) }
+            || rect.size.width <= 0.0
+            || rect.size.height <= 0.0
+        {
+            continue;
+        }
+
+        let center_x = (rect.origin.x + rect.size.width / 2.0).round() as i32;
+        let center_y = (rect.origin.y + rect.size.height / 2.0).round() as i32;
+        return Some((center_x, center_y));
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_permission() -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    let granted = unsafe { CGPreflightScreenCaptureAccess() };
+    info!("[capture] screen_recording_preflight={granted}");
+    if granted {
+        return Ok(());
+    }
+
+    if !REQUESTED.swap(true, Ordering::SeqCst) {
+        let requested = unsafe { CGRequestScreenCaptureAccess() };
+        info!("[capture] screen_recording_request_result={requested}");
+        if requested && unsafe { CGPreflightScreenCaptureAccess() } {
+            return Ok(());
+        }
+    }
+
+    Err("Screen Recording access is not available to this running Carambola app. Enable Carambola in System Settings > Privacy & Security > Screen & System Audio Recording, then quit and restart Carambola.".to_string())
+}
+
+/// Log the running bundle and non-prompting authorization state at startup.
+#[cfg(target_os = "macos")]
+pub fn log_macos_startup_diagnostics() {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    log_macos_identity();
+    info!("[capture] startup_screen_recording_preflight={}", unsafe {
+        CGPreflightScreenCaptureAccess()
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn log_macos_identity() {
+    use core_foundation::{
+        base::TCFType,
+        string::{CFString, CFStringRef},
+    };
+    use std::ffi::c_void;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFBundleGetMainBundle() -> *const c_void;
+        fn CFBundleGetIdentifier(bundle: *const c_void) -> CFStringRef;
+    }
+    let bundle_id = unsafe {
+        let bundle = CFBundleGetMainBundle();
+        let identifier = if bundle.is_null() {
+            std::ptr::null()
+        } else {
+            CFBundleGetIdentifier(bundle)
+        };
+        if identifier.is_null() {
+            "<none>".to_string()
+        } else {
+            CFString::wrap_under_get_rule(identifier).to_string()
+        }
+    };
+    info!("[capture] timestamp_ms={} bundle_id={bundle_id:?} executable={:?} api=CGWindowListCreateImage", now_epoch_ms(), std::env::current_exe());
+}
+
+/// Core Graphics and xcap use the same global display-point coordinate space
+/// on macOS. This is only a fallback if the frontmost app has no ordinary
+/// visible window (for example, when the desktop itself is active).
+#[cfg(target_os = "macos")]
+fn cursor_position() -> Option<(i32, i32)> {
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    let point = CGEvent::new(source).ok()?.location();
+    Some((point.x as i32, point.y as i32))
+}
+
 /// Picks the monitor to capture. The monitor under the cursor is preferred so a
 /// multi-monitor setup captures the screen the user is actually working on;
 /// otherwise the primary monitor is used, and finally the first available one.
 fn select_monitor(monitors: &[Monitor]) -> Monitor {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some((x, y)) = frontmost_application_window_center() {
+            if let Ok(monitor) = Monitor::from_point(x, y) {
+                return monitor;
+            }
+        }
+        if let Some((x, y)) = cursor_position() {
+            if let Ok(monitor) = Monitor::from_point(x, y) {
+                return monitor;
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         if let Some((x, y)) = cursor_position() {
@@ -169,11 +334,7 @@ fn capture_monitor_rgba(monitor: &Monitor) -> Result<(Vec<u8>, u32, u32), String
     let image = monitor.capture_image().map_err(|e| {
         #[cfg(target_os = "macos")]
         {
-            format!(
-                "Failed to capture display image: {e}. Grant Carambola Screen Recording \
-                 permission in System Settings > Privacy & Security > Screen Recording, then \
-                 restart the app."
-            )
+            format!("macOS CoreGraphics display capture failed: {e}")
         }
         #[cfg(target_os = "linux")]
         {
@@ -188,6 +349,9 @@ fn capture_monitor_rgba(monitor: &Monitor) -> Result<(Vec<u8>, u32, u32), String
         }
     })?;
     let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err("Display capture returned an empty image".to_string());
+    }
     let mut rgba = image.into_raw();
     for px in rgba.chunks_exact_mut(4) {
         px[3] = 255;
@@ -214,6 +378,12 @@ pub fn capture_screen() -> Result<CapturedFrame, String> {
     let triggered_at_ms = now_epoch_ms();
     let started = Instant::now();
 
+    #[cfg(target_os = "macos")]
+    {
+        log_macos_identity();
+        macos_capture_permission()?;
+    }
+
     let monitors = Monitor::all().map_err(|e| format!("Failed to enumerate monitors: {e}"))?;
     if monitors.is_empty() {
         return Err("No active displays found".to_string());
@@ -223,24 +393,45 @@ pub fn capture_screen() -> Result<CapturedFrame, String> {
     let monitor = select_monitor(&monitors);
 
     info!(
-        "Capturing monitor: {} ({}x{} @ {}x)",
+        "Capturing monitor: id={} {} ({}x{} @ {}x, origin={},{} )",
+        monitor.id(),
         monitor.name(),
         monitor.width(),
         monitor.height(),
-        monitor.scale_factor()
+        monitor.scale_factor(),
+        monitor.x(),
+        monitor.y()
     );
 
     let capture_started = Instant::now();
     let (rgba, width, height) = capture_monitor_rgba(&monitor)?;
+    #[cfg(target_os = "macos")]
+    {
+        let mut min = [u8::MAX; 3];
+        let mut max = [u8::MIN; 3];
+        for pixel in rgba.chunks_exact(4).step_by(256) {
+            for channel in 0..3 {
+                min[channel] = min[channel].min(pixel[channel]);
+                max[channel] = max[channel].max(pixel[channel]);
+            }
+        }
+        let uniform = (0..3).all(|channel| max[channel].saturating_sub(min[channel]) <= 2);
+        info!("[capture] sampled_nearly_uniform={uniform}");
+    }
+    info!("[capture] image_width={width} image_height={height} bytes={} foreground_content=not_checked", rgba.len());
     let capture_ms = capture_started.elapsed().as_secs_f64() * 1000.0;
 
     let encode_started = Instant::now();
     let png_bytes = encode_png(&rgba, width, height)?;
     let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
 
-    // The overlay window must cover the *entire* physical monitor rectangle.
-    let physical_w = monitor.width() as f64;
-    let physical_h = monitor.height() as f64;
+    // xcap reports macOS monitor bounds in points, while capture_image returns
+    // Retina pixels. Keep native bounds in points and report the actual image
+    // dimensions separately for crop/export scaling.
+    let native_w = monitor.width() as f64;
+    let native_h = monitor.height() as f64;
+    let physical_w = width as f64;
+    let physical_h = height as f64;
     let x = monitor.x() as f64;
     let y = monitor.y() as f64;
     // Real DPI scale for this monitor. Used by the frontend to convert the
@@ -255,8 +446,8 @@ pub fn capture_screen() -> Result<CapturedFrame, String> {
         bounds: DisplayBounds {
             x,
             y,
-            width: physical_w,
-            height: physical_h,
+            width: native_w,
+            height: native_h,
         },
         physical_width: physical_w,
         physical_height: physical_h,

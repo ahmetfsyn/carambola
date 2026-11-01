@@ -18,10 +18,13 @@ import {
   saveCropImage,
   hideOverlay,
   extractOcrText,
+  getScreenshotNotificationSettings,
 } from "../../lib/ipc/commands";
+import { notifyScreenshotExported } from "../../lib/notifications";
 
 /** Duration of the close (fade-out) transition, matching the CSS transition. */
 const CLOSE_FADE_MS = 180;
+const isMac = /Mac/i.test(navigator.platform);
 
 function prefersReducedMotion(): boolean {
   return (
@@ -34,12 +37,14 @@ interface OverlayContainerProps {
   backgroundImage: ImageBitmap | HTMLImageElement | null;
   scaleFactor: number;
   captureToken: number;
+  presentationReady: boolean;
 }
 
 export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   backgroundImage,
   scaleFactor,
   captureToken,
+  presentationReady,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -82,6 +87,8 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   const [closing, setClosing] = useState<boolean>(false);
   const closingRef = useRef<boolean>(false);
   const closeTimer = useRef<number | null>(null);
+  const notifyAfterClose = useRef<(() => void) | null>(null);
+  const notifiedCaptureToken = useRef<number | null>(null);
   // Fixed origin of the shape/mosaic currently being drawn. Bounds must always
   // be normalized against this point; normalizing against the previous (already
   // normalized) bounds made reverse drags collapse the shape on every move.
@@ -161,13 +168,13 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     // Screenshot sessions must never restore a previous Settings view. Settings
     // is reopened explicitly through the tray/toolbar only, after presentation.
     setIsSettingsOpen(false);
-    // Cancel any in-flight fade from the previous session and restore full
-    // opacity instantly (no fade-in animation) before the window is shown.
+    // Cancel any in-flight fade from the previous session before presenting.
     if (closeTimer.current !== null) {
       window.clearTimeout(closeTimer.current);
       closeTimer.current = null;
     }
     closingRef.current = false;
+    notifyAfterClose.current = null;
     setClosing(false);
     drawingOrigin.current = null;
   }, [captureToken]);
@@ -187,7 +194,11 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     const duration = prefersReducedMotion() ? 0 : CLOSE_FADE_MS;
     closeTimer.current = window.setTimeout(() => {
       closeTimer.current = null;
-      void hideOverlay();
+      const notify = notifyAfterClose.current;
+      notifyAfterClose.current = null;
+      void hideOverlay()
+        .catch((err) => console.error("Failed to hide overlay:", err))
+        .finally(() => notify?.());
     }, duration);
   }, []);
 
@@ -237,6 +248,18 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     setElements(previous);
   }, [elements, undoStack]);
 
+  const notifySuccessfulExport = useCallback(async () => {
+    if (notifiedCaptureToken.current === captureToken) return;
+    try {
+      const settings = await getScreenshotNotificationSettings();
+      if (!settings.enabled || notifiedCaptureToken.current === captureToken) return;
+      notifiedCaptureToken.current = captureToken;
+      await notifyScreenshotExported(settings);
+    } catch (err) {
+      console.warn("Could not read screenshot notification settings:", err);
+    }
+  }, [captureToken]);
+
   const handleRedo = useCallback(() => {
     if (redoStack.length === 0) return;
     const next = redoStack[redoStack.length - 1];
@@ -252,6 +275,11 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       const imageScale = getImageScale(backgroundImage, windowSize.width);
       const bytes = composeCropRgba(crop, elements, backgroundImage, imageScale);
       await copyCropImage(bytes);
+      if (isMac) {
+        notifyAfterClose.current = () => void notifySuccessfulExport();
+      } else {
+        void notifySuccessfulExport();
+      }
       setCopiedFeedback(true);
       setTimeout(() => {
         setCopiedFeedback(false);
@@ -260,7 +288,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     } catch (err) {
       console.error("Failed to copy crop:", err);
     }
-  }, [crop, elements, backgroundImage, windowSize.width, requestClose]);
+  }, [crop, elements, backgroundImage, windowSize.width, requestClose, notifySuccessfulExport]);
 
   const handleSave = useCallback(async () => {
     if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage) return;
@@ -268,6 +296,11 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       const imageScale = getImageScale(backgroundImage, windowSize.width);
       const bytes = composeCropRgba(crop, elements, backgroundImage, imageScale);
       const savedPath = await saveCropImage(bytes);
+      if (isMac) {
+        notifyAfterClose.current = () => void notifySuccessfulExport();
+      } else {
+        void notifySuccessfulExport();
+      }
       setToastMessage(`Saved to ${savedPath}`);
       setTimeout(() => {
         setToastMessage(null);
@@ -276,7 +309,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     } catch (err) {
       console.error("Failed to save crop:", err);
     }
-  }, [crop, elements, backgroundImage, windowSize.width, requestClose]);
+  }, [crop, elements, backgroundImage, windowSize.width, requestClose, notifySuccessfulExport]);
 
   const handleOcr = useCallback(async () => {
     if (!crop || crop.width <= 0 || crop.height <= 0) return;
@@ -545,10 +578,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     <div
       className="relative w-screen h-screen overflow-hidden select-none"
       style={{
-        opacity: closing ? 0 : 1,
-        // Only animate opacity while closing; a new session snaps back to full
-        // opacity instantly (no fade-in) because the window is still hidden.
-        transition: closing ? `opacity ${CLOSE_FADE_MS}ms ease-out` : "none",
+        opacity: closing || (isMac && !presentationReady) ? 0 : 1,
+        transition: !prefersReducedMotion() && (isMac || closing)
+          ? `opacity ${CLOSE_FADE_MS}ms ease-out`
+          : "none",
         pointerEvents: closing ? "none" : "auto",
       }}
     >

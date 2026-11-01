@@ -12,6 +12,14 @@ pub struct UserConfig {
     pub shortcut: String,
     #[serde(default)]
     pub autostart: Option<bool>,
+    #[serde(default = "default_screenshot_notifications")]
+    pub screenshot_notifications: bool,
+    #[serde(default)]
+    pub notification_permission_prompted: bool,
+}
+
+fn default_screenshot_notifications() -> bool {
+    true
 }
 
 pub fn default_shortcut() -> &'static str {
@@ -43,6 +51,8 @@ pub fn load_or_create() -> UserConfig {
             let cfg = UserConfig {
                 shortcut: default_shortcut().to_string(),
                 autostart: None,
+                screenshot_notifications: default_screenshot_notifications(),
+                notification_permission_prompted: false,
             };
             if let Ok(json) = serde_json::to_string_pretty(&cfg) {
                 let _ = fs::write(&path, json);
@@ -54,6 +64,8 @@ pub fn load_or_create() -> UserConfig {
     UserConfig {
         shortcut: default_shortcut().to_string(),
         autostart: None,
+        screenshot_notifications: default_screenshot_notifications(),
+        notification_permission_prompted: false,
     }
 }
 
@@ -77,6 +89,8 @@ mod tests {
         let cfg: UserConfig = serde_json::from_str(r#"{"shortcut":"Alt+A"}"#).unwrap();
         assert_eq!(cfg.shortcut, "Alt+A");
         assert_eq!(cfg.autostart, None);
+        assert!(cfg.screenshot_notifications);
+        assert!(!cfg.notification_permission_prompted);
     }
 
     #[test]
@@ -84,5 +98,24 @@ mod tests {
         let cfg: UserConfig =
             serde_json::from_str(r#"{"shortcut":"Alt+A","autostart":false}"#).unwrap();
         assert_eq!(cfg.autostart, Some(false));
+        assert!(cfg.screenshot_notifications);
+    }
+
+    #[test]
+    fn notification_preference_round_trips_without_resetting_other_settings() {
+        let mut cfg: UserConfig = serde_json::from_str(
+            r#"{"shortcut":"Alt+A","autostart":false,"screenshot_notifications":false,"notification_permission_prompted":true}"#,
+        )
+        .unwrap();
+        assert!(!cfg.screenshot_notifications);
+        assert!(cfg.notification_permission_prompted);
+
+        cfg.screenshot_notifications = true;
+        let saved = serde_json::to_string(&cfg).unwrap();
+        let restored: UserConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.shortcut, "Alt+A");
+        assert_eq!(restored.autostart, Some(false));
+        assert!(restored.screenshot_notifications);
+        assert!(restored.notification_permission_prompted);
     }
 }

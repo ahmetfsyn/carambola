@@ -47,10 +47,9 @@ fi
 
 install_deb() {
     command -v apt-get >/dev/null 2>&1 || fail "A .deb package was found, but apt-get is not available. Install it manually with your distribution's package manager: $DEB"
-    command -v sudo >/dev/null 2>&1 || fail "sudo is required to install the .deb package. Run as root or install manually: $DEB"
     info "Installing Debian package (apt-get will resolve runtime dependencies):"
     info "  $DEB"
-    sudo apt-get install -y "$DEB"
+    run_privileged apt-get install -y "$DEB"
     info "Carambola installed. Launch it from your application menu; it runs in the background with a tray icon."
 }
 
@@ -58,19 +57,28 @@ install_rpm() {
     if command -v dnf >/dev/null 2>&1; then
         info "Installing RPM package with dnf:"
         info "  $RPM"
-        sudo dnf install -y "$RPM"
+        run_privileged dnf install -y "$RPM"
     elif command -v zypper >/dev/null 2>&1; then
         info "Installing RPM package with zypper:"
         info "  $RPM"
-        sudo zypper --non-interactive install "$RPM"
+        run_privileged zypper --non-interactive install "$RPM"
     elif command -v rpm >/dev/null 2>&1; then
         info "Installing RPM package with rpm (dependencies must already be installed):"
         info "  $RPM"
-        sudo rpm -Uvh "$RPM"
+        run_privileged rpm -Uvh "$RPM"
     else
         fail "An .rpm package was found, but no RPM package manager is available. Install it manually: $RPM"
     fi
     info "Carambola installed. Launch it from your application menu; it runs in the background with a tray icon."
+}
+
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        command -v sudo >/dev/null 2>&1 || fail "sudo is required to install this package. Run as root or install it manually."
+        sudo "$@"
+    fi
 }
 
 check_appimage_runtime() {
@@ -97,10 +105,16 @@ install_appimage() {
     info "This script does not create a desktop entry or Start on Boot registration for the AppImage."
 }
 
-if [ -n "$DEB" ]; then
+if [ -n "$DEB" ] && command -v apt-get >/dev/null 2>&1; then
     install_deb
-elif [ -n "$RPM" ]; then
+elif [ -n "$RPM" ] && { command -v dnf >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1 || command -v rpm >/dev/null 2>&1; }; then
     install_rpm
-else
+elif [ -n "$APPIMAGE" ]; then
     install_appimage
+elif [ -n "$DEB" ]; then
+    fail "A .deb was found, but apt-get is unavailable. Install it manually with a compatible package manager: $DEB"
+elif [ -n "$RPM" ]; then
+    fail "An .rpm was found, but no compatible RPM package manager is available. Install it manually: $RPM"
+else
+    fail "No package format matches this environment. Generate a compatible .deb/.rpm or use the AppImage under $BUNDLE_DIR."
 fi

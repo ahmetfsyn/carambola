@@ -145,7 +145,6 @@ fn extract_cropped_rgba(
 pub fn hide_overlay(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.set_overlay_visible(false);
     if let Some(window) = app_handle.get_webview_window(crate::window::OVERLAY_LABEL) {
-        crate::window::leave_native_fullscreen(&window);
         let _ = window.hide();
     }
     // The overlay has fully closed: release the single-session lock so the next
@@ -200,6 +199,70 @@ pub fn set_autostart(
     enabled: bool,
 ) -> Result<crate::autostart::AutostartStatus, String> {
     crate::autostart::set_enabled(&app_handle, enabled)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ScreenshotNotificationSettings {
+    pub enabled: bool,
+    pub permission_prompted: bool,
+}
+
+fn notification_settings(config: &crate::config::UserConfig) -> ScreenshotNotificationSettings {
+    ScreenshotNotificationSettings {
+        enabled: config.screenshot_notifications,
+        permission_prompted: config.notification_permission_prompted,
+    }
+}
+
+#[tauri::command]
+pub fn get_screenshot_notification_settings() -> ScreenshotNotificationSettings {
+    notification_settings(&crate::config::load_or_create())
+}
+
+/// Start the native macOS notification flow after a successful export.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn notify_macos_screenshot() -> Result<(), String> {
+    unsafe extern "C" {
+        fn carambola_notify_screenshot() -> i32;
+    }
+    if !crate::config::load_or_create().screenshot_notifications {
+        return Ok(());
+    }
+    if unsafe { carambola_notify_screenshot() } == 1 {
+        Ok(())
+    } else {
+        Err("macOS notifications are unavailable for this app".to_string())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub fn notify_macos_screenshot() -> Result<(), String> {
+    Err("macOS notifications are unavailable on this platform".to_string())
+}
+
+#[tauri::command]
+pub fn set_screenshot_notifications(
+    enabled: bool,
+) -> Result<ScreenshotNotificationSettings, String> {
+    let mut config = crate::config::load_or_create();
+    config.screenshot_notifications = enabled;
+    crate::config::save(&config)?;
+    Ok(notification_settings(&config))
+}
+
+/// Persists the one-time permission prompt claim so a user who denies system
+/// notifications is not asked again on every successful screenshot export.
+#[tauri::command]
+pub fn claim_notification_permission_prompt() -> Result<bool, String> {
+    let mut config = crate::config::load_or_create();
+    if config.notification_permission_prompted {
+        return Ok(false);
+    }
+    config.notification_permission_prompted = true;
+    crate::config::save(&config)?;
+    Ok(true)
 }
 
 #[cfg(test)]
