@@ -37,12 +37,12 @@ Real screenshots are not checked into this repository yet. The placeholders belo
 
 | Platform | Architecture | Status |
 | --- | --- | --- |
-| Windows 10/11 | x86_64 | Version 0.1.1 installer generated and installed. Startup, global shortcut, crop, clipboard, and local save smoke tests passed. Annotation-tool and multi-monitor QA remain incomplete. Installer is unsigned. |
+| Windows 10/11 | x86_64 | Version 0.1.2 installer generated and installed per-user. Tray startup, shortcut capture, first and repeated overlay activation, crop geometry, clipboard copy, and local PNG save were verified. No activation zoom was observed. Annotation-tool and multi-monitor QA remain incomplete. Installer is unsigned. |
 | macOS | Apple Silicon | Release app and DMG built. Screen Recording authorization and interactive capture require further packaged-app QA. An older grant did not match the installed app's ad hoc code signature. No Developer ID signing or notarization is configured. Intel was not tested. |
 | macOS | Intel | Not available; not tested. |
 | Linux | x86_64 | No package is published; runtime behavior and packaging have **not** been verified. Screen capture uses X11 APIs; native Wayland capture is not verified. See the Linux section below. |
 
-The Windows 0.1.1 checks cover the production build and installation, plus runtime smoke tests for launch, shortcut capture, crop selection, clipboard copy, and local save. Pen, vector, text, and mosaic annotation tools and multi-monitor behavior still need interactive QA. Linux has not been built or tested here.
+The Windows 0.1.2 checks cover the production build and installation, plus runtime tests for launch, tray startup, shortcut capture, overlay geometry, crop selection, clipboard copy, and local save. Pen, vector, text, and mosaic annotation tools and multi-monitor behavior still need interactive QA. Linux has not been built or tested here.
 
 ## Installation
 
@@ -50,12 +50,12 @@ The Windows 0.1.1 checks cover the production build and installation, plus runti
 
 The Windows x64 installer uses the Tauri NSIS bundler and installs for the current user by default, so administrator rights are normally not required.
 
-1. Download [Carambola 0.1.1 for Windows x64](https://github.com/ahmetfsyn/carambola/releases/download/v0.1.1/Carambola_0.1.1_x64-setup.exe) from GitHub Releases.
+1. Download [Carambola 0.1.2 for Windows x64](https://github.com/ahmetfsyn/carambola/releases/download/v0.1.2/Carambola_0.1.2_x64-setup.exe) from GitHub Releases.
 2. Run the installer and follow the wizard.
 3. Launch **Carambola** from the Start Menu. The app starts in the background and adds a tray icon; there is no main window.
 4. Right-click the tray icon for **Capture Screen**, **Settings...**, and **Quit Carambola**.
 
-The 0.1.1 installer was installed per-user on Windows x64. Runtime smoke tests verified launch, shortcut capture, crop selection, clipboard copy, and a local PNG save. Pen, vector, text, and mosaic annotation tools still need interactive testing. The installer is unsigned; Windows SmartScreen may show an unrecognized-publisher warning.
+The 0.1.2 installer was installed per-user on Windows x64. Runtime tests verified launch, shortcut capture, crop geometry, clipboard copy, and a local PNG save. The zoom regression was not reproduced. Pen, vector, text, and mosaic annotation tools still need interactive testing. The installer is unsigned; Windows SmartScreen may show an unrecognized-publisher warning.
 
 **WebView2 requirement:** Carambola uses the Microsoft Edge WebView2 runtime. The installer downloads its bootstrapper if the runtime is missing, so internet access is needed in that case. Offline installation requires WebView2 to be installed separately first.
 
