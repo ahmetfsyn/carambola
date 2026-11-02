@@ -37,28 +37,29 @@ Real screenshots are not checked into this repository yet. The placeholders belo
 
 | Platform | Architecture | Status |
 | --- | --- | --- |
-| Windows 10/11 | x86_64 | Target platform. Windows runtime QA, production build, and installer generation have **not** been verified in this checkout. |
+| Windows 10/11 | x86_64 | Production installer generated and installed; executable startup verified. Interactive feature QA is pending. Installer is unsigned. |
 | macOS | Apple Silicon | Release app and DMG built. Screen Recording authorization and interactive capture require further packaged-app QA. An older grant did not match the installed app's ad hoc code signature. No Developer ID signing or notarization is configured. Intel was not tested. |
-| Linux | x86_64 | Code paths are present, but runtime behavior and packaging have **not** been verified. Screen capture uses X11 APIs; native Wayland capture is not verified. See the Linux section below. |
+| macOS | Intel | Not available; not tested. |
+| Linux | x86_64 | No package is published; runtime behavior and packaging have **not** been verified. Screen capture uses X11 APIs; native Wayland capture is not verified. See the Linux section below. |
 
-The platform rows report the checks completed in this stabilization pass; they do not establish full runtime certification. Windows and Linux were not built or tested here.
+The Windows checks cover the production build, installer, installation registration, and process startup only; they do not establish functional runtime QA. Linux has not been built or tested here.
 
 ## Installation
 
 ### Windows
 
-The Windows build uses the Tauri NSIS bundler and installs for the current user by default, so administrator rights are normally not required.
+The Windows x64 installer uses the Tauri NSIS bundler and installs for the current user by default, so administrator rights are normally not required.
 
-1. Obtain `Carambola_<version>_x64-setup.exe` from the repository's Releases page after a release is published, or build it locally (see [Build instructions](#build-instructions)). No installer is currently verified or published by this repository.
+1. Download [Carambola 0.1.0 for Windows x64](https://github.com/ahmetfsyn/carambola/releases/download/v0.1.0/Carambola_0.1.0_x64-setup.exe) from GitHub Releases.
 2. Run the installer and follow the wizard.
 3. Launch **Carambola** from the Start Menu. The app starts in the background and adds a tray icon; there is no main window.
 4. Right-click the tray icon for **Capture Screen**, **Settings...**, and **Quit Carambola**.
 
-The Windows installer has not been generated or tested in this checkout. If distributed unsigned, Windows SmartScreen may show a warning.
+The installer was generated and installed on Windows x64, and the installed executable was confirmed to start. Interactive feature testing is pending. The installer is unsigned; Windows SmartScreen may show an unrecognized-publisher warning.
 
-**WebView2 requirement:** Carambola uses the Microsoft Edge WebView2 runtime. The installed Tauri CLI 2.12.4 configuration schema defaults the NSIS install mode to `downloadBootstrapper` with silent installation. A Windows installer built with this configuration downloads the bootstrapper and needs internet access if WebView2 is missing. WebView2 is already present on many Windows 11 systems; offline installation requires the runtime to be installed separately first.
+**WebView2 requirement:** Carambola uses the Microsoft Edge WebView2 runtime. The installer downloads its bootstrapper if the runtime is missing, so internet access is needed in that case. Offline installation requires WebView2 to be installed separately first.
 
-**Portable executable:** after a local release build, `src-tauri/target/release/carambola.exe` can be run directly without installation. It still requires WebView2. It is not a replacement for the installer: it has no Start Menu entry or uninstaller, and moving the executable changes the path used by Start on Boot.
+**Portable executable:** after a local x64 release build, `src-tauri/target/x86_64-pc-windows-msvc/release/carambola.exe` can be run directly without installation. It still requires WebView2. It is not a replacement for the installer: it has no Start Menu entry or uninstaller, and moving the executable changes the path used by Start on Boot.
 
 ### macOS
 
