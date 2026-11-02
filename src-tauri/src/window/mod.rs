@@ -46,9 +46,43 @@ fn configure_overlay(window: &WebviewWindow) -> Result<(), String> {
     window
         .set_always_on_top(true)
         .map_err(|e| format!("Failed to raise overlay: {e}"))?;
+    #[cfg(target_os = "windows")]
+    if let Err(e) = configure_windows_overlay(window) {
+        // Keep the screenshot workflow available if DWM rejects the hint on a
+        // particular Windows build; the frontend fade remains the fallback.
+        warn!("Could not disable native DWM transitions for overlay: {e}");
+    }
     #[cfg(target_os = "macos")]
     configure_macos_overlay(window)?;
     Ok(())
+}
+
+/// Prevent Windows from applying its own first-show/hide animation to the
+/// transparent overlay HWND. The frontend's existing opacity transition is
+/// still responsible for the intended fade-in and fade-out.
+#[cfg(target_os = "windows")]
+fn configure_windows_overlay(window: &WebviewWindow) -> Result<(), String> {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+
+    // Tauri's HWND comes from its newer `windows` crate version; rebuild the
+    // transparent pointer wrapper expected by Carambola's Win32 bindings.
+    let hwnd = windows::Win32::Foundation::HWND(
+        window
+            .hwnd()
+            .map_err(|e| format!("Failed to get overlay HWND: {e}"))?
+            .0,
+    );
+    let disable_transitions = BOOL(1);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            (&disable_transitions as *const BOOL).cast(),
+            std::mem::size_of::<BOOL>() as u32,
+        )
+    }
+    .map_err(|e| format!("Failed to disable DWM transitions: {e}"))
 }
 
 /// Configure the native window so transparent pixels still receive input and
@@ -152,11 +186,28 @@ pub fn prime_overlay(app_handle: &AppHandle, state: &AppState) {
         warn!("Failed to configure overlay window: {e}");
     }
 
-    if let Some(frame) = state.get_frame() {
-        if let Err(e) = apply_overlay_geometry(&window, &frame.display_info.bounds) {
+    let mut bounds = state
+        .get_frame()
+        .map(|frame| frame.display_info.bounds.clone());
+
+    // The app starts without a captured frame, so the configured 200x200
+    // default would otherwise remain the hidden WebView's size until the first
+    // shortcut press. Prime only the geometry here; never capture pixels at
+    // startup. The first presentation then reuses the already-sized HWND and
+    // WebView surface instead of resizing them immediately before ShowWindow.
+    #[cfg(target_os = "windows")]
+    if bounds.is_none() {
+        match crate::capture::selected_display_bounds() {
+            Ok(selected_bounds) => bounds = Some(selected_bounds),
+            Err(e) => warn!("Failed to discover display bounds while priming overlay: {e}"),
+        }
+    }
+
+    if let Some(bounds) = bounds {
+        if let Err(e) = apply_overlay_geometry(&window, &bounds) {
             warn!("Failed to prime overlay geometry: {e}");
         } else {
-            state.set_last_overlay_bounds(frame.display_info.bounds.clone());
+            state.set_last_overlay_bounds(bounds);
         }
     }
 
@@ -208,14 +259,8 @@ fn prepare_overlay(
     })?;
 
     let bounds = frame.display_info.bounds.clone();
-    let payload = CaptureReadyPayload {
-        triggered_at_ms: frame.triggered_at_ms,
-        display: frame.display_info.clone(),
-        capture_ms: frame.capture_ms,
-        encode_ms: frame.encode_ms,
-        png_bytes: frame.png_bytes.len(),
-    };
-    state.set_frame(frame);
+    let frame = state.set_frame(frame);
+    let payload = payload_for_frame(&frame);
 
     // Geometry is applied while the window is still hidden, so the webview has
     // already laid out at the target size by the time it becomes visible.
@@ -230,12 +275,51 @@ fn prepare_overlay(
         activation_started.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Phase 2 is driven by the frontend: it resets the session, decodes this
-    // frame, then invokes `present_overlay`.
+    // Tauri does not retain events for listeners that have not subscribed yet.
+    // The global shortcut is available during startup, before React's async
+    // listen() registration necessarily completes, so queue that first frame.
+    if state.defer_capture_event_until_frontend_ready() {
+        info!("Overlay frontend is not ready; deferring capture delivery until its listener is registered");
+    } else {
+        emit_capture_ready(&window, payload)?;
+    }
+
+    Ok(())
+}
+
+fn payload_for_frame(frame: &crate::app_state::CapturedFrame) -> CaptureReadyPayload {
+    CaptureReadyPayload {
+        triggered_at_ms: frame.triggered_at_ms,
+        display: frame.display_info.clone(),
+        capture_ms: frame.capture_ms,
+        encode_ms: frame.encode_ms,
+        png_bytes: frame.png_bytes.len(),
+    }
+}
+
+fn emit_capture_ready(window: &WebviewWindow, payload: CaptureReadyPayload) -> Result<(), String> {
     window
         .emit("capture_triggered", payload)
-        .map_err(|e| format!("Failed to notify overlay frontend: {e}"))?;
+        .map_err(|e| format!("Failed to notify overlay frontend: {e}"))
+}
 
+/// Completes the startup handshake after the frontend's capture listener is
+/// registered. If the user triggered capture during that registration window,
+/// deliver its already-captured frame now without showing an intermediate UI.
+pub fn overlay_frontend_ready(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
+    if !state.mark_overlay_frontend_ready() {
+        info!("Overlay frontend listener is ready");
+        return Ok(());
+    }
+
+    let window = app_handle
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "Overlay window not found".to_string())?;
+    let frame = state
+        .get_frame()
+        .ok_or_else(|| "Pending capture event has no captured frame".to_string())?;
+    emit_capture_ready(&window, payload_for_frame(&frame))?;
+    info!("Delivered the first queued capture after overlay listener registration");
     Ok(())
 }
 

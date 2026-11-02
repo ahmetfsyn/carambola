@@ -65,6 +65,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_display_info,
+            commands::overlay_frontend_ready,
             commands::get_current_frame,
             commands::copy_crop_image,
             commands::save_crop_image,
@@ -92,6 +93,10 @@ pub fn run() {
             // preference, enabling it by default on first run.
             autostart::ensure_preference(app.handle());
 
+            // Configure and hide the existing overlay before making capture
+            // activations available through the tray or global shortcut.
+            window::prime_overlay(app.handle(), &state_for_setup);
+
             // Initialize System Tray
             if let Err(e) = tray::setup_tray(app.handle(), state_for_setup.clone()) {
                 log::error!("Failed to initialize tray: {e}");
@@ -101,10 +106,6 @@ pub fn run() {
             if let Err(e) = hotkey::setup_hotkey(app.handle(), state_for_setup.clone()) {
                 log::error!("Failed to register global hotkey: {e}");
             }
-
-            // Configure the hidden overlay now; capture and geometry are only
-            // acquired after the user explicitly starts a screenshot.
-            window::prime_overlay(app.handle(), &state_for_setup);
 
             Ok(())
         })

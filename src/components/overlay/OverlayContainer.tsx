@@ -72,6 +72,12 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   const [undoStack, setUndoStack] = useState<AnnotationElement[][]>([]);
   const [redoStack, setRedoStack] = useState<AnnotationElement[][]>([]);
   const [currentDrawing, setCurrentDrawing] = useState<AnnotationElement | null>(null);
+  // Pen input can arrive faster than the canvas can paint. Keep every point,
+  // but append and redraw at most once per animation frame instead of copying
+  // the growing point array for every mouse event.
+  const activePenPoints = useRef<Point[] | null>(null);
+  const pendingPenPoints = useRef<Point[]>([]);
+  const penFrame = useRef<number | null>(null);
 
   // In-place text editing
   const [editingText, setEditingText] = useState<{ position: Point; text: string } | null>(null);
@@ -153,6 +159,12 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     setUndoStack([]);
     setRedoStack([]);
     setCurrentDrawing(null);
+    activePenPoints.current = null;
+    pendingPenPoints.current = [];
+    if (penFrame.current !== null) {
+      window.cancelAnimationFrame(penFrame.current);
+      penFrame.current = null;
+    }
     setEditingText(null);
     setDragState({
       mode: "none",
@@ -208,6 +220,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       if (closeTimer.current !== null) {
         window.clearTimeout(closeTimer.current);
         closeTimer.current = null;
+      }
+      if (penFrame.current !== null) {
+        window.cancelAnimationFrame(penFrame.current);
+        penFrame.current = null;
       }
     };
   }, []);
@@ -435,10 +451,13 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
             strokeWidth: activeStrokeWidth,
           });
         } else if (activeTool === "pen") {
+          const points = [pt];
+          activePenPoints.current = points;
+          pendingPenPoints.current = [];
           setCurrentDrawing({
             id,
             type: "pen",
-            points: [pt],
+            points,
             color: activeColor,
             strokeWidth: activeStrokeWidth,
           });
@@ -513,10 +532,20 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
           bounds: normalizeRect(drawingOrigin.current ?? pt, pt),
         });
       } else if (currentDrawing.type === "pen") {
-        setCurrentDrawing({
-          ...currentDrawing,
-          points: [...currentDrawing.points, pt],
-        });
+        pendingPenPoints.current.push(pt);
+        if (penFrame.current === null) {
+          penFrame.current = window.requestAnimationFrame(() => {
+            penFrame.current = null;
+            const points = activePenPoints.current;
+            if (points) points.push(...pendingPenPoints.current);
+            pendingPenPoints.current = [];
+            setCurrentDrawing((drawing) =>
+              drawing?.type === "pen" && points
+                ? { ...drawing, points }
+                : drawing
+            );
+          });
+        }
       } else if (currentDrawing.type === "mosaic") {
         setCurrentDrawing({
           ...currentDrawing,
@@ -561,7 +590,19 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
   const handleMouseUp = () => {
     if (currentDrawing) {
-      pushElement(currentDrawing);
+      if (currentDrawing.type === "pen") {
+        if (penFrame.current !== null) {
+          window.cancelAnimationFrame(penFrame.current);
+          penFrame.current = null;
+        }
+        const points = activePenPoints.current ?? currentDrawing.points;
+        points.push(...pendingPenPoints.current);
+        pendingPenPoints.current = [];
+        pushElement({ ...currentDrawing, points });
+        activePenPoints.current = null;
+      } else {
+        pushElement(currentDrawing);
+      }
       setCurrentDrawing(null);
     }
     drawingOrigin.current = null;
@@ -578,8 +619,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     <div
       className="relative w-screen h-screen overflow-hidden select-none"
       style={{
-        opacity: closing || (isMac && !presentationReady) ? 0 : 1,
-        transition: !prefersReducedMotion() && (isMac || closing)
+        // Keep the whole visual layer transparent until the fresh screenshot
+        // has been painted and the native window is ready to be revealed.
+        opacity: closing || !presentationReady ? 0 : 1,
+        transition: !prefersReducedMotion()
           ? `opacity ${CLOSE_FADE_MS}ms ease-out`
           : "none",
         pointerEvents: closing ? "none" : "auto",

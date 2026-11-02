@@ -27,6 +27,16 @@ pub fn get_display_info(state: State<'_, AppState>) -> Result<DisplayInfo, Strin
     }
 }
 
+/// Called after React has subscribed to capture events so an early first
+/// activation cannot be lost during asynchronous listener registration.
+#[tauri::command]
+pub fn overlay_frontend_ready(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::window::overlay_frontend_ready(&app_handle, &state)
+}
+
 /// Returns the freshly captured PNG as a raw binary IPC body. Returning
 /// `Vec<u8>` directly would serialize every byte as a JSON number, which costs
 /// several megabytes of string parsing inside the webview on every activation.

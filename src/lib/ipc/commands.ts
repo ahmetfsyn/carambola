@@ -45,6 +45,11 @@ export async function presentOverlay(): Promise<void> {
   await invoke("present_overlay");
 }
 
+/** Signals that the hidden overlay has subscribed to capture events. */
+export async function markOverlayFrontendReady(): Promise<void> {
+  await invoke("overlay_frontend_ready");
+}
+
 /**
  * Sends the composited crop (raw RGBA with an 8-byte dimension header) to the
  * backend as a raw binary IPC body. The backend copies it straight to the

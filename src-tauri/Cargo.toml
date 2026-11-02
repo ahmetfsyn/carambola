@@ -1,6 +1,6 @@
 [package]
 name = "carambola"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lightweight cross-platform screenshot and annotation application"
 edition = "2021"
 default-run = "carambola"
@@ -30,6 +30,7 @@ tauri-plugin-notification = "2.8.0"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Media_Ocr",
     "Graphics_Imaging",
     "Foundation",

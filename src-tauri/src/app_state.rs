@@ -66,6 +66,11 @@ pub struct InnerState {
     /// Bounds of the last geometry applied to the overlay window. Used to skip
     /// redundant native move/resize calls when the target monitor is unchanged.
     pub last_overlay_bounds: Option<DisplayBounds>,
+    /// Set only after the frontend has registered its capture event listener.
+    pub overlay_frontend_ready: bool,
+    /// A frame captured before the listener was ready must be delivered once it
+    /// subscribes; Tauri events are not retained for later listeners.
+    pub pending_capture_event: bool,
 }
 
 #[derive(Clone)]
@@ -82,6 +87,8 @@ impl AppState {
                 session_active: false,
                 open_settings_on_present: false,
                 last_overlay_bounds: None,
+                overlay_frontend_ready: false,
+                pending_capture_event: false,
             })),
         }
     }
@@ -126,7 +133,28 @@ impl AppState {
     /// Releases the session slot. Called only once the overlay has fully closed
     /// and the application is ready for the next capture.
     pub fn end_session(&self) {
-        self.inner.write().session_active = false;
+        let mut state = self.inner.write();
+        state.session_active = false;
+        state.pending_capture_event = false;
+    }
+
+    /// Returns true when a capture event must wait for the frontend listener.
+    pub fn defer_capture_event_until_frontend_ready(&self) -> bool {
+        let mut state = self.inner.write();
+        if state.overlay_frontend_ready {
+            false
+        } else {
+            state.pending_capture_event = true;
+            true
+        }
+    }
+
+    /// Marks the listener ready and atomically claims any capture event queued
+    /// before the subscription completed.
+    pub fn mark_overlay_frontend_ready(&self) -> bool {
+        let mut state = self.inner.write();
+        state.overlay_frontend_ready = true;
+        std::mem::take(&mut state.pending_capture_event)
     }
 
     pub fn is_session_active(&self) -> bool {

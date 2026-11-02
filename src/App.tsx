@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { OverlayContainer } from "./components/overlay/OverlayContainer";
 import {
   getCurrentFrameBytes,
+  markOverlayFrontendReady,
   presentOverlay,
   hideOverlay,
 } from "./lib/ipc/commands";
@@ -24,6 +25,18 @@ function releaseFrameImage(image: FrameImage | null) {
   if (image && "close" in image && typeof image.close === "function") {
     image.close();
   }
+}
+
+function nextAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
+}
+
+/** Allow the hidden WebView2 surface to composite the new canvas before HWND show. */
+async function waitForWebViewPaint(): Promise<void> {
+  // rAF runs before paint. Waiting for a second frame guarantees a paint
+  // opportunity between callbacks without relying on an arbitrary timeout.
+  await nextAnimationFrame();
+  await nextAnimationFrame();
 }
 
 /**
@@ -136,12 +149,18 @@ export const App: React.FC = () => {
       if (seq !== activationSeq.current) return;
 
       try {
+        // flushSync commits React and its layout effects, but it does not mean
+        // WebView2 has presented the canvas to its native composition surface.
+        // Keep the HWND hidden for one compositor frame so the first show
+        // cannot expose the initial empty, dimmed canvas.
+        await waitForWebViewPaint();
+        if (seq !== activationSeq.current) return;
+
         await presentOverlay();
-        // Begin the entry transition only after native presentation has been
-        // requested and the fresh frame has been installed in the canvas.
-        requestAnimationFrame(() => {
-          if (seq === activationSeq.current) setPresentationReady(true);
-        });
+        // Start the entry transition only after the native window is present
+        // and the WebView has had a frame to render while its content is hidden.
+        await nextAnimationFrame();
+        if (seq === activationSeq.current) setPresentationReady(true);
         if (import.meta.env.DEV) {
           console.info(
             `[perf] ${seq === 1 ? "first" : "subsequent"} activation: ` +
@@ -164,6 +183,9 @@ export const App: React.FC = () => {
           unlisten();
         } else {
           unlistenCapture = unlisten;
+          void markOverlayFrontendReady().catch((err) => {
+            console.error("Failed to mark overlay frontend ready:", err);
+          });
         }
       })
       .catch((err) => console.error("Failed to register capture listener:", err));
