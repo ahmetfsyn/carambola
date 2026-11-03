@@ -170,9 +170,14 @@ jobs:
 
           function Download-ReleaseAsset([object]$Asset, [string]$Destination) {
             $assetUri = "https://api.github.com/repos/$repo/releases/assets/$($Asset.id)"
-            $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/octet-stream' }
-            $response = Invoke-WebRequest -Uri $assetUri -Headers $headers -OutFile $Destination -SkipHttpErrorCheck -TimeoutSec 90
-            if ($response.StatusCode -ne 200) { throw "Could not download uploaded release asset '$($Asset.name)' (HTTP $($response.StatusCode))." }
+            $downloadStatus = & /usr/bin/curl --location --silent --show-error --fail `
+              --header "Authorization: Bearer $env:GH_TOKEN" `
+              --header 'Accept: application/octet-stream' `
+              --output $Destination --write-out '%{http_code}' --max-time 90 $assetUri
+            $curlExitCode = $LASTEXITCODE
+            if ($curlExitCode -ne 0 -or $downloadStatus -ne '200') {
+              throw "Could not download uploaded release asset '$($Asset.name)' (curl exit $curlExitCode, HTTP $downloadStatus)."
+            }
           }
 
           function Upload-ReleaseAsset([string]$Path, [string]$Name) {
