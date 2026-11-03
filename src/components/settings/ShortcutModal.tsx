@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Keyboard, Check, X, AlertCircle, Power, Bell } from "lucide-react";
+import {
+  Keyboard,
+  Check,
+  CheckCircle2,
+  X,
+  AlertCircle,
+  ArrowUpCircle,
+  Download,
+  Power,
+  Bell,
+  RefreshCw,
+} from "lucide-react";
 import { isPermissionGranted } from "@tauri-apps/plugin-notification";
 import {
   AutostartStatus,
@@ -12,6 +23,14 @@ import {
   ScreenshotNotificationSettings,
 } from "../../lib/ipc/commands";
 import { isModifierKey, parseKeyboardEventToShortcut } from "../../lib/shortcutRecording";
+import {
+  checkForUpdates,
+  clearUpdateFeedback,
+  getRecentUpdateFeedback,
+  UPDATE_FEEDBACK_EVENT,
+  UpdateLifecycleStatus,
+} from "../../lib/updater";
+import { AboutSection } from "./AboutSection";
 
 interface ShortcutModalProps {
   isOpen: boolean;
@@ -27,6 +46,16 @@ const PRESETS = [
   { label: "F10 Function Key", value: "F10" },
   { label: "Ctrl + Alt + S", value: "Control+Alt+S" },
 ];
+
+const UPDATE_PHASE_LABELS: Record<UpdateLifecycleStatus["phase"], string> = {
+  checking: "Checking for updates",
+  available: "Update available",
+  downloading: "Downloading",
+  installing: "Installing",
+  success: "Successfully updated",
+  failure: "Update failed",
+  "up-to-date": "No update available",
+};
 
 const IS_MACOS = /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -47,6 +76,8 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
   const [notificationPermissionGranted, setNotificationPermissionGranted] = useState<boolean | null>(null);
   const [notificationSaving, setNotificationSaving] = useState<boolean>(false);
   const [notificationError, setNotificationError] = useState<string | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<UpdateLifecycleStatus | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -76,6 +107,17 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
         .then(setNotificationPermissionGranted)
         .catch(() => setNotificationPermissionGranted(false));
     }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const refreshFeedback = () => {
+      const feedback = getRecentUpdateFeedback();
+      setUpdateStatus(feedback ? { phase: feedback.phase, message: feedback.message } : null);
+    };
+    refreshFeedback();
+    window.addEventListener(UPDATE_FEEDBACK_EVENT, refreshFeedback);
+    return () => window.removeEventListener(UPDATE_FEEDBACK_EVENT, refreshFeedback);
   }, [isOpen]);
 
   if (!isOpen) return null;
@@ -110,6 +152,24 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
       );
     } finally {
       setNotificationSaving(false);
+    }
+  };
+
+  const handleCheckForUpdates = async () => {
+    if (updateBusy) return;
+    setUpdateBusy(true);
+    clearUpdateFeedback();
+    setUpdateStatus({ phase: "checking", message: "Checking for updates…" });
+    try {
+      await checkForUpdates(true, setUpdateStatus);
+    } catch (err) {
+      console.error("Manual update check failed:", err);
+      setUpdateStatus({
+        phase: "failure",
+        message: "The update check failed. Check your connection and try again.",
+      });
+    } finally {
+      setUpdateBusy(false);
     }
   };
 
@@ -180,6 +240,26 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
       .replace(/\+/g, " + ");
   };
 
+  const statusPhase = updateStatus?.phase;
+  const UpdateStatusIcon =
+    statusPhase === "failure"
+      ? AlertCircle
+      : statusPhase === "success" || statusPhase === "up-to-date"
+        ? CheckCircle2
+        : statusPhase === "available"
+          ? ArrowUpCircle
+          : statusPhase === "downloading"
+            ? Download
+            : RefreshCw;
+  const updateStatusTone =
+    statusPhase === "failure"
+      ? "border-rose-900/50 bg-rose-950/25 text-rose-300"
+      : statusPhase === "success"
+        ? "border-emerald-900/50 bg-emerald-950/20 text-emerald-300"
+        : statusPhase === "available"
+          ? "border-cyan-900/50 bg-cyan-950/20 text-carambola-cyan"
+          : "border-slate-800 bg-slate-900/60 text-slate-400";
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
@@ -188,7 +268,7 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
       }}
     >
       <div
-        className="w-full max-w-md bg-slate-900 border border-slate-700/80 rounded-2xl shadow-2xl p-6 text-slate-200 toolbar-fade-in"
+        className="settings-scrollbar w-full max-w-md max-h-[90vh] overflow-y-auto overscroll-contain bg-slate-900 border border-slate-700/80 rounded-2xl shadow-2xl p-6 text-slate-200 toolbar-fade-in"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Modal Header */}
@@ -323,42 +403,8 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
           </span>
         </div>
 
-        {/* Presets List */}
-        <div className="space-y-2 mb-4">
-          <label className="text-xs font-semibold text-slate-300 block">
-            Popular Presets:
-          </label>
-          <div className="grid grid-cols-1 gap-1.5 max-h-40 overflow-y-auto pr-1">
-            {PRESETS.map((p) => {
-              const isSelected = selectedShortcut === p.value;
-              return (
-                <button
-                  key={p.value}
-                  type="button"
-                  onClick={() => {
-                    setSelectedShortcut(p.value);
-                    setCustomInput(p.value);
-                    setIsRecording(false);
-                    setErrorMessage(null);
-                  }}
-                  className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left text-xs transition-colors border ${
-                    isSelected
-                      ? "bg-carambola-cyan/15 border-carambola-cyan text-white font-medium"
-                      : "bg-slate-800/40 border-slate-700/50 hover:bg-slate-800 hover:border-slate-600 text-slate-300"
-                  }`}
-                >
-                  <span>{p.label}</span>
-                  <span className="font-mono text-[11px] text-slate-400">
-                    {formatBadge(p.value)}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
         {/* Custom Shortcut Input with Keyboard Listener */}
-        <div className="space-y-1.5 mb-5">
+        <div className="space-y-1.5 mb-4">
           <div className="flex items-center justify-between">
             <label className="text-xs font-semibold text-slate-300 block">
               Custom Shortcut Definition:
@@ -410,6 +456,40 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
           </p>
         </div>
 
+        {/* Presets List */}
+        <div className="space-y-2 mb-4">
+          <label className="text-xs font-semibold text-slate-300 block">
+            Popular Presets:
+          </label>
+          <div className="grid grid-cols-1 gap-1.5">
+            {PRESETS.map((p) => {
+              const isSelected = selectedShortcut === p.value;
+              return (
+                <button
+                  key={p.value}
+                  type="button"
+                  onClick={() => {
+                    setSelectedShortcut(p.value);
+                    setCustomInput(p.value);
+                    setIsRecording(false);
+                    setErrorMessage(null);
+                  }}
+                  className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left text-xs transition-colors border ${
+                    isSelected
+                      ? "bg-carambola-cyan/15 border-carambola-cyan text-white font-medium"
+                      : "bg-slate-800/40 border-slate-700/50 hover:bg-slate-800 hover:border-slate-600 text-slate-300"
+                  }`}
+                >
+                  <span>{p.label}</span>
+                  <span className="font-mono text-[11px] text-slate-400">
+                    {formatBadge(p.value)}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
         {/* Error Notification */}
         {errorMessage && (
           <div className="mb-4 p-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs flex items-center gap-2">
@@ -437,6 +517,69 @@ export const ShortcutModal: React.FC<ShortcutModalProps> = ({
             <span>{isSaving ? "Saving..." : "Save Shortcut"}</span>
           </button>
         </div>
+
+        {/* Update lifecycle */}
+        <div className="mt-3 p-3 rounded-xl bg-slate-950/70 border border-slate-800">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-semibold text-slate-200">Updates</div>
+            <button
+              type="button"
+              onClick={handleCheckForUpdates}
+              disabled={updateBusy}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-700 bg-slate-800/70 text-[11px] font-semibold text-slate-200 hover:border-carambola-cyan/50 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              <RefreshCw size={12} className={updateBusy ? "animate-spin" : ""} />
+              {updateBusy
+                ? updateStatus?.phase === "downloading"
+                  ? "Downloading…"
+                  : updateStatus?.phase === "installing"
+                    ? "Installing…"
+                    : "Checking…"
+                : updateStatus?.phase === "failure"
+                  ? "Retry"
+                  : "Check for Updates"}
+            </button>
+          </div>
+          {updateStatus && (
+            <div
+              role="status"
+              aria-live="polite"
+              className={`mt-2 flex items-start gap-2 rounded-lg border px-2.5 py-2 ${updateStatusTone}`}
+            >
+              <UpdateStatusIcon
+                size={14}
+                className={`mt-0.5 shrink-0 ${
+                  updateBusy && (statusPhase === "checking" || statusPhase === "installing")
+                    ? "animate-spin"
+                    : ""
+                }`}
+              />
+              <div className="min-w-0">
+                <div className="text-[11px] font-semibold">{UPDATE_PHASE_LABELS[updateStatus.phase]}</div>
+                <p className="mt-0.5 break-words text-[11px] leading-relaxed text-slate-300">
+                  {updateStatus.message}
+                </p>
+                {typeof updateStatus.progress === "number" && (
+                  <div
+                    className="mt-1.5 h-1 overflow-hidden rounded-full bg-slate-800"
+                    role="progressbar"
+                    aria-label="Update download progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={updateStatus.progress}
+                  >
+                    <div
+                      className="h-full rounded-full bg-carambola-cyan transition-[width]"
+                      style={{ width: `${updateStatus.progress}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <AboutSection />
       </div>
     </div>
   );

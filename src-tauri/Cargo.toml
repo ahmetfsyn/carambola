@@ -1,6 +1,6 @@
 [package]
 name = "carambola"
-version = "0.1.2"
+version = "0.1.3"
 description = "Lightweight cross-platform screenshot and annotation application"
 edition = "2021"
 default-run = "carambola"
@@ -25,8 +25,12 @@ dirs = "5.0"
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-single-instance = "2.5.5"
 tauri-plugin-notification = "2.8.0"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-process = "2.4.0"
+tauri-plugin-updater = "2.14.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+notify-rust = "4.18"
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
@@ -36,6 +40,7 @@ windows = { version = "0.58", features = [
     "Foundation",
     "Foundation_Collections",
     "Storage_Streams",
+    "UI_Notifications",
 ] }
 
 # Wayland clipboard image support. Under X11/XWayland the default backend is

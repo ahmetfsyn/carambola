@@ -75,6 +75,13 @@ pub fn setup_tray(
             }
         });
 
+    // Windows has no application-name fallback tooltip for tray icons.
+    // Keep the macOS status item presentation unchanged.
+    #[cfg(target_os = "windows")]
+    {
+        tray_builder = tray_builder.tooltip("Carambola");
+    }
+
     // Use the bundled application icon when available. Building the tray
     // without an icon is not useful, but it must not panic on platforms or
     // bundles where the default window icon is unavailable.

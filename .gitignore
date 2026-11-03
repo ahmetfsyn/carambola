@@ -3,6 +3,12 @@ node_modules/
 
 # Rust build artifacts
 src-tauri/target/
+src-tauri/target-ab/
+src-tauri/target-updater-test/
+src-tauri/target-updater-test-host/
+src-tauri/target-updater-ux-test/
+src-tauri/target-updater-ux-test-host/
+src-tauri/target-updater-versionfix-test/
 
 # Web production bundle
 dist/
