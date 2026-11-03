@@ -12,11 +12,65 @@ pub mod window;
 
 use app_state::AppState;
 use log::info;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use tauri_plugin_global_shortcut::ShortcutState;
 
+struct DiagnosticWriter {
+    file: File,
+}
+
+impl Write for DiagnosticWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let _ = io::stderr().write_all(bytes);
+        self.file.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = io::stderr().flush();
+        self.file.flush()
+    }
+}
+
+fn initialize_logging() -> Option<PathBuf> {
+    let log_path = dirs::data_local_dir()?
+        .join("Carambola")
+        .join("logs")
+        .join("carambola.log");
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok()?;
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        // Notification stages are needed to diagnose installed GUI builds even
+        // when the launching shell sets RUST_LOG=warn.
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp_millis()
+        .target(env_logger::Target::Pipe(Box::new(DiagnosticWriter {
+            file,
+        })))
+        .init();
+    Some(log_path)
+}
+
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let log_path = initialize_logging();
+    if log_path.is_none() {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format_timestamp_millis()
+            .init();
+        eprintln!("Could not open the Carambola diagnostic log file");
+    }
     info!("Starting Carambola application...");
+    if let Some(path) = log_path {
+        info!("[diagnostics] log_file={}", path.display());
+    }
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
@@ -43,6 +97,9 @@ pub fn run() {
             Some(vec!["--background"]),
         ))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .manage(app_state.clone())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -78,6 +135,9 @@ pub fn run() {
             commands::set_autostart,
             commands::get_screenshot_notification_settings,
             commands::notify_macos_screenshot,
+            commands::notify_windows_screenshot,
+            commands::notify_windows_update,
+            commands::log_notification_diagnostic,
             commands::set_screenshot_notifications,
             commands::claim_notification_permission_prompt,
         ])

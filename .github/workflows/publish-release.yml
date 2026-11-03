@@ -1,0 +1,61 @@
+name: Publish verified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft version tag to publish, for example v0.1.3
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release view "$RELEASE_TAG" --json isDraft,assets --jq 'select(.isDraft) | .assets[].name' > assets.txt
+          grep -q '^latest.json$' assets.txt
+          gh release download "$RELEASE_TAG" --pattern latest.json --dir .
+          VERSION="${RELEASE_TAG#v}"
+          jq -e --arg version "$VERSION" '
+            .version == $version and
+            .platforms["windows-x86_64"].url and .platforms["windows-x86_64"].signature and
+            .platforms["darwin-aarch64"].url and .platforms["darwin-aarch64"].signature and
+            .platforms["darwin-x86_64"].url and .platforms["darwin-x86_64"].signature and
+            .platforms["linux-x86_64"].url and .platforms["linux-x86_64"].signature
+          ' latest.json > /dev/null
+          mkdir -p release-verification
+          for platform in windows-x86_64 darwin-aarch64 darwin-x86_64 linux-x86_64; do
+            asset_url=$(jq -r --arg platform "$platform" '.platforms[$platform].url' latest.json)
+            case "$asset_url" in
+              https://api.github.com/repos/ahmetfsyn/carambola/releases/assets/*)
+                asset_endpoint="${asset_url#https://api.github.com/}"
+                asset_name=$(gh api "$asset_endpoint" --jq .name)
+                ;;
+              https://github.com/ahmetfsyn/carambola/releases/download/*/*)
+                asset_name="${asset_url##*/}"
+                ;;
+              *)
+                echo "Unsupported updater artifact URL for $platform: $asset_url" >&2
+                exit 1
+                ;;
+            esac
+            signature_name="$asset_name.sig"
+            grep -Fxq "$asset_name" assets.txt
+            grep -Fxq "$signature_name" assets.txt
+            gh release download "$RELEASE_TAG" --pattern "$asset_name" --pattern "$signature_name" --dir release-verification
+            manifest_signature=$(jq -r --arg platform "$platform" '.platforms[$platform].signature' latest.json | tr -d '\r\n')
+            asset_signature=$(tr -d '\r\n' < "release-verification/$signature_name")
+            test "$manifest_signature" = "$asset_signature"
+            sha256sum "release-verification/$asset_name" "release-verification/$signature_name"
+          done
+          gh release edit "$RELEASE_TAG" --draft=false

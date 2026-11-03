@@ -9,6 +9,7 @@ import {
   hideOverlay,
 } from "./lib/ipc/commands";
 import { DisplayInfo } from "./types/display";
+import { startAutomaticUpdateCheck } from "./lib/updater";
 
 /** Payload emitted by the backend once a fresh frame is frozen in memory. */
 interface CaptureReadyPayload {
@@ -106,6 +107,7 @@ export const App: React.FC = () => {
   const backgroundImageRef = useRef<FrameImage | null>(null);
 
   useEffect(() => {
+    const stopAutomaticUpdateCheck = startAutomaticUpdateCheck();
     // Listen for new screenshot capture events from Rust backend. The cleanup
     // below handles the case where the async registration resolves after an
     // effect teardown (React StrictMode / fast reload), preventing a duplicate
@@ -192,6 +194,7 @@ export const App: React.FC = () => {
 
     return () => {
       disposed = true;
+      stopAutomaticUpdateCheck();
       unlistenCapture?.();
       unlistenCapture = null;
     };

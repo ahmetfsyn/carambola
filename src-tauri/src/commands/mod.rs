@@ -10,6 +10,13 @@ use std::io::BufWriter;
 use tauri::ipc::InvokeBody;
 use tauri::{AppHandle, Manager, State};
 
+#[tauri::command]
+pub fn log_notification_diagnostic(stage: String, detail: String) {
+    let stage = stage.replace(['\r', '\n'], " ");
+    let detail = detail.replace(['\r', '\n'], " ");
+    info!("[notification] stage=frontend_{stage} detail={detail}");
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CropRect {
     pub x: f64,
@@ -250,6 +257,155 @@ pub fn notify_macos_screenshot() -> Result<(), String> {
 #[tauri::command]
 pub fn notify_macos_screenshot() -> Result<(), String> {
     Err("macOS notifications are unavailable on this platform".to_string())
+}
+
+/// Delivers Windows screenshot notifications through Tauri's native backend.
+#[cfg(target_os = "windows")]
+fn submit_windows_notification(
+    app_handle: &AppHandle,
+    category: &str,
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
+    use std::path::MAIN_SEPARATOR as SEP;
+    use windows::core::HSTRING;
+    use windows::UI::Notifications::{NotificationSetting, ToastNotificationManager};
+
+    let stage_prefix = if category == "screenshot" {
+        ""
+    } else {
+        "update_"
+    };
+    let app_id = app_handle.config().identifier.clone();
+    let executable = tauri::utils::platform::current_exe()
+        .map_err(|err| format!("Could not resolve Carambola executable for notification: {err}"))?;
+    let executable_dir = executable
+        .parent()
+        .ok_or_else(|| "Could not resolve Carambola executable directory".to_string())?;
+    let executable_dir = executable_dir.to_string_lossy();
+    let is_development_executable = executable_dir
+        .ends_with(format!("{SEP}target{SEP}debug").as_str())
+        || executable_dir.ends_with(format!("{SEP}target{SEP}release").as_str());
+    let executable_mode = if is_development_executable {
+        "development"
+    } else {
+        "installed_or_packaged"
+    };
+    info!(
+        "[notification] stage={stage_prefix}identity app_id={} mode={} executable={}",
+        app_id,
+        executable_mode,
+        executable.display()
+    );
+
+    // Desktop toasts must always use the AUMID registered on the app's Start
+    // Menu shortcut. The parameterless overload binds to a generic shell host
+    // identity instead of Carambola's registered identity.
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id.as_str()))
+    .map_err(|err| {
+        log::error!("[notification] stage={stage_prefix}notifier_create_failed error={err:?}");
+        let detail = if is_development_executable {
+            format!(
+                "Windows could not create the notifier for Carambola AUMID '{app_id}': {err:?}. Development builds require the installed Start Menu shortcut to register this AUMID; install the NSIS package to test development notifications."
+            )
+        } else {
+            format!(
+                "Windows could not create the notifier for Carambola AUMID '{app_id}': {err:?}. Verify the installed Start Menu shortcut is registered with this same AUMID."
+            )
+        };
+        log::error!("[notification] stage={stage_prefix}registration_guidance detail={detail}");
+        detail
+    })?;
+    info!("[notification] stage={stage_prefix}notifier_create result=success app_id={app_id}");
+
+    let setting = notifier.Setting().map_err(|err| {
+        log::error!("[notification] stage={stage_prefix}os_setting_query_failed error={err:?}");
+        format!("Could not read the Windows notification setting for Carambola: {err:?}")
+    })?;
+    let setting_name = match setting {
+        NotificationSetting::Enabled => "Enabled",
+        NotificationSetting::DisabledForApplication => "DisabledForApplication",
+        NotificationSetting::DisabledForUser => "DisabledForUser",
+        NotificationSetting::DisabledByGroupPolicy => "DisabledByGroupPolicy",
+        NotificationSetting::DisabledByManifest => "DisabledByManifest",
+        _ => "Unknown",
+    };
+    info!("[notification] stage={stage_prefix}os_setting setting={setting_name}");
+    if setting != NotificationSetting::Enabled {
+        let err = format!(
+            "Windows notifications for Carambola are {setting_name}. Enable Carambola under Settings > System > Notifications."
+        );
+        log::error!("[notification] stage={stage_prefix}suppressed reason=os_setting detail={err}");
+        return Err(err);
+    }
+
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .summary(title)
+        .body(body)
+        .auto_icon()
+        .app_id(&app_id);
+
+    match notification.show() {
+        Ok(_handle) => {
+            info!("[notification] stage={stage_prefix}windows_api_result result=accepted_by_windows_api");
+            Ok(())
+        }
+        Err(err) => {
+            log::error!(
+                "[notification] stage={stage_prefix}windows_api_result result=failed error={err:?}"
+            );
+            Err(format!(
+                "Windows failed to submit the Carambola toast: {err:?}"
+            ))
+        }
+    }
+}
+
+/// Delivers Windows screenshot notifications through Carambola's registered identity.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn notify_windows_screenshot(app_handle: AppHandle) -> Result<(), String> {
+    info!("[notification] stage=rust_command_enter platform=windows");
+    let config = crate::config::load_or_create();
+    info!(
+        "[notification] stage=settings_read screenshot_notifications={} permission_prompted={}",
+        config.screenshot_notifications, config.notification_permission_prompted
+    );
+    if !config.screenshot_notifications {
+        info!("[notification] stage=suppressed reason=screenshot_preference_disabled");
+        return Ok(());
+    }
+
+    submit_windows_notification(
+        &app_handle,
+        "screenshot",
+        "Carambola",
+        "Screenshot captured successfully.",
+    )
+}
+
+/// Delivers updater feedback without consulting the screenshot notification preference.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn notify_windows_update(
+    app_handle: AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    submit_windows_notification(&app_handle, "update", &title, &body)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn notify_windows_screenshot() -> Result<(), String> {
+    Err("Windows notifications are unavailable on this platform".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn notify_windows_update(_title: String, _body: String) -> Result<(), String> {
+    Err("Windows notifications are unavailable on this platform".to_string())
 }
 
 #[tauri::command]
