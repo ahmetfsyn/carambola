@@ -144,30 +144,91 @@ jobs:
           Verify-TauriSignature $builtInstaller $builtSignature 'Locally built'
           $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $builtInstaller).Hash
 
-          $releaseEndpoint = "repos/$repo/releases/tags/$tag"
-          $releaseResponse = gh api $releaseEndpoint 2>&1
-          $releaseQueryExit = $LASTEXITCODE
-          if ($releaseQueryExit -eq 0) {
-            $release = ($releaseResponse -join "`n") | ConvertFrom-Json
-            if (!$release.draft) {
-              gh release edit $tag --draft --repo $repo
-              if ($LASTEXITCODE -ne 0) { throw "Could not move existing release '$tag' to draft before validating replacement assets." }
+          $tagCommit = (git rev-parse "$($tag)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0) { throw "Could not resolve commit for tag '$tag'." }
+
+          function Get-ReleasesForTag {
+            $matchingReleases = [System.Collections.Generic.List[object]]::new()
+            $page = 1
+            do {
+              $pageResponse = gh api "repos/$repo/releases?per_page=100&page=$page" 2>&1
+              if ($LASTEXITCODE -ne 0) { throw "Could not list GitHub Releases while looking for '$tag': $($pageResponse -join ' ')" }
+              $pageReleases = @(($pageResponse -join "`n") | ConvertFrom-Json)
+              foreach ($candidate in $pageReleases) {
+                if ($candidate.tag_name -eq $tag) { $matchingReleases.Add($candidate) }
+              }
+              $page++
+            } while ($pageReleases.Count -eq 100)
+            return $matchingReleases.ToArray()
+          }
+
+          function Get-ReleaseById([long]$ReleaseId) {
+            $response = gh api "repos/$repo/releases/$ReleaseId" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Could not query GitHub Release ID ${ReleaseId}: $($response -join ' ')" }
+            return ($response -join "`n") | ConvertFrom-Json
+          }
+
+          function Download-ReleaseAsset([object]$Asset, [string]$Destination) {
+            $assetUri = "https://api.github.com/repos/$repo/releases/assets/$($Asset.id)"
+            $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/octet-stream' }
+            $response = Invoke-WebRequest -Uri $assetUri -Headers $headers -OutFile $Destination -SkipHttpErrorCheck -TimeoutSec 90
+            if ($response.StatusCode -ne 200) { throw "Could not download uploaded release asset '$($Asset.name)' (HTTP $($response.StatusCode))." }
+          }
+
+          function Upload-ReleaseAsset([string]$Path, [string]$Name) {
+            $currentRelease = Get-ReleaseById $releaseId
+            $oldAsset = $currentRelease.assets | Where-Object name -eq $Name | Select-Object -First 1
+            if ($oldAsset) {
+              gh api --method DELETE "repos/$repo/releases/assets/$($oldAsset.id)" *> $null
+              if ($LASTEXITCODE -ne 0) { throw "Could not replace existing release asset '$Name'." }
             }
-          } elseif (($releaseResponse -join "`n") -match '(?i)not found|HTTP 404') {
-            gh release create $tag --draft --verify-tag --title "Carambola $tag" --notes-file RELEASE_NOTES.md --repo $repo
+
+            $uploadBase = $currentRelease.upload_url -replace '\{\?name,label\}$', ''
+            $uploadUri = "$uploadBase`?name=$([Uri]::EscapeDataString($Name))"
+            $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+            try {
+              $uploaded = Invoke-RestMethod -Uri $uploadUri -Method Post -Headers $headers -ContentType 'application/octet-stream' -InFile $Path -TimeoutSec 180
+            } catch {
+              throw "Asset upload step failed for '$Name'."
+            }
+            if (!$uploaded -or $uploaded.state -ne 'uploaded') { throw "Asset upload step did not confirm '$Name'." }
+          }
+
+          $releaseCandidates = @(Get-ReleasesForTag)
+          $exactTargetCandidates = @($releaseCandidates | Where-Object target_commitish -eq $tagCommit)
+          if ($exactTargetCandidates.Count -gt 0) { $releaseCandidates = $exactTargetCandidates }
+          if ($releaseCandidates.Count -gt 1) {
+            $withInstallerPair = @($releaseCandidates | Where-Object {
+              $assetNames = @($_.assets | ForEach-Object name)
+              ($assetNames -contains $installer) -and ($assetNames -contains "$installer.sig")
+            })
+            if ($withInstallerPair.Count -gt 0) { $releaseCandidates = $withInstallerPair }
+          }
+          if ($releaseCandidates.Count -gt 1) {
+            throw "Multiple GitHub Releases match '$tag' and the tagged commit; refusing to create or modify an ambiguous release."
+          }
+          if ($releaseCandidates.Count -eq 0) {
+            gh release create $tag --draft --verify-tag --target $tagCommit --title "Carambola $tag" --notes-file RELEASE_NOTES.md --repo $repo
             if ($LASTEXITCODE -ne 0) { throw "Could not create draft GitHub Release '$tag'." }
-          } else {
-            throw "Could not query GitHub Release '$tag': $($releaseResponse -join ' ')"
+            $releaseCandidates = @(Get-ReleasesForTag)
+            $exactTargetCandidates = @($releaseCandidates | Where-Object target_commitish -eq $tagCommit)
+            if ($exactTargetCandidates.Count -gt 0) { $releaseCandidates = $exactTargetCandidates }
+            if ($releaseCandidates.Count -ne 1) { throw "Draft release '$tag' was not uniquely discoverable after creation; refusing to upload assets." }
           }
 
-          gh release upload $tag $builtInstaller $builtSignature --clobber --repo $repo
-          if ($LASTEXITCODE -ne 0) {
-            throw "Asset upload step failed for '$installer' and '$installer.sig'."
+          $release = $releaseCandidates[0]
+          $releaseId = [long]$release.id
+          $releaseEndpoint = "repos/$repo/releases/$releaseId"
+          if (!$release.draft) {
+            gh api --method PATCH $releaseEndpoint -F draft=true *> $null
+            if ($LASTEXITCODE -ne 0) { throw "Could not move existing release '$tag' to draft before validating replacement assets." }
           }
+          $release = Get-ReleaseById $releaseId
 
-          $releaseResponse = gh api $releaseEndpoint 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "Could not query GitHub Release '$tag' after installer upload: $($releaseResponse -join ' ')" }
-          $release = ($releaseResponse -join "`n") | ConvertFrom-Json
+          Upload-ReleaseAsset $builtInstaller $installer
+          Upload-ReleaseAsset $builtSignature "$installer.sig"
+
+          $release = Get-ReleaseById $releaseId
           $installerAsset = $release.assets | Where-Object name -eq $installer | Select-Object -First 1
           $signatureAsset = $release.assets | Where-Object name -eq "$installer.sig" | Select-Object -First 1
           if (!$installerAsset -or $installerAsset.state -ne 'uploaded') {
@@ -179,10 +240,10 @@ jobs:
 
           $remotePairDir = 'release-check/remote-pair'
           New-Item -ItemType Directory -Force -Path $remotePairDir | Out-Null
-          gh release download $tag --repo $repo --pattern $installer --pattern "$installer.sig" --dir $remotePairDir --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Could not download '$installer' and '$installer.sig' after upload for verification." }
           $remoteInstaller = Join-Path $remotePairDir $installer
           $remoteSignature = Join-Path $remotePairDir "$installer.sig"
+          Download-ReleaseAsset $installerAsset $remoteInstaller
+          Download-ReleaseAsset $signatureAsset $remoteSignature
           $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $remoteInstaller).Hash
           if ($remoteHash -ne $localHash) { throw "Uploaded asset '$installer' does not match the signed build (SHA-256 mismatch)." }
           if ((Get-Content -Raw $remoteSignature).Trim() -ne (Get-Content -Raw $builtSignature).Trim()) {
@@ -197,7 +258,7 @@ jobs:
             platforms = [ordered]@{
               'windows-x86_64' = [ordered]@{
                 signature = (Get-Content -Raw $remoteSignature).Trim()
-                url = $installerAsset.browser_download_url
+                url = "https://github.com/$repo/releases/download/$tag/$installer"
               }
             }
           }
@@ -212,12 +273,9 @@ jobs:
             throw 'Generated latest.json is missing the Windows installer URL or signature.'
           }
 
-          gh release upload $tag $manifestPath --clobber --repo $repo
-          if ($LASTEXITCODE -ne 0) { throw "Manifest upload step failed for 'latest.json'." }
+          Upload-ReleaseAsset $manifestPath 'latest.json'
 
-          $finalResponse = gh api $releaseEndpoint 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "Could not query GitHub Release '$tag' after manifest upload: $($finalResponse -join ' ')" }
-          $release = ($finalResponse -join "`n") | ConvertFrom-Json
+          $release = Get-ReleaseById $releaseId
           foreach ($name in @($installer, "$installer.sig", 'latest.json')) {
             $asset = $release.assets | Where-Object name -eq $name | Select-Object -First 1
             if (!$asset -or $asset.state -ne 'uploaded') { throw "Final release asset '$name' is missing or not uploaded." }
@@ -225,11 +283,15 @@ jobs:
 
           $finalDir = 'release-check/final'
           New-Item -ItemType Directory -Force -Path $finalDir | Out-Null
-          gh release download $tag --repo $repo --pattern $installer --pattern "$installer.sig" --pattern latest.json --dir $finalDir --clobber
-          if ($LASTEXITCODE -ne 0) { throw 'Could not download the final installer, signature, and latest.json for verification.' }
           $finalInstaller = Join-Path $finalDir $installer
           $finalSignature = Join-Path $finalDir "$installer.sig"
           $finalManifestPath = Join-Path $finalDir 'latest.json'
+          $finalInstallerAsset = $release.assets | Where-Object name -eq $installer | Select-Object -First 1
+          $finalSignatureAsset = $release.assets | Where-Object name -eq "$installer.sig" | Select-Object -First 1
+          $finalManifestAsset = $release.assets | Where-Object name -eq 'latest.json' | Select-Object -First 1
+          Download-ReleaseAsset $finalInstallerAsset $finalInstaller
+          Download-ReleaseAsset $finalSignatureAsset $finalSignature
+          Download-ReleaseAsset $finalManifestAsset $finalManifestPath
           if ((Get-FileHash -Algorithm SHA256 -LiteralPath $finalInstaller).Hash -ne $localHash) {
             throw "Final release asset '$installer' failed the SHA-256 comparison."
           }
@@ -239,7 +301,8 @@ jobs:
           if ($finalManifest.version -ne $version -or $finalPlatforms.Count -ne 1 -or $finalPlatforms[0] -ne 'windows-x86_64') {
             throw 'Uploaded latest.json has an unexpected version or platform set.'
           }
-          if ($finalManifest.platforms.'windows-x86_64'.url -ne $installerAsset.browser_download_url -or
+          $expectedInstallerUrl = "https://github.com/$repo/releases/download/$tag/$installer"
+          if ($finalManifest.platforms.'windows-x86_64'.url -ne $expectedInstallerUrl -or
               $finalManifest.platforms.'windows-x86_64'.signature -ne (Get-Content -Raw $finalSignature).Trim()) {
             throw 'Uploaded latest.json does not match the uploaded Windows installer and signature.'
           }
@@ -251,17 +314,16 @@ jobs:
             $latest = ($latestResponse -join "`n") | ConvertFrom-Json
             try { $shouldBeLatest = ([version]$version -ge [version]$latest.tag_name.TrimStart('v')) } catch { $shouldBeLatest = $latest.tag_name -eq $tag }
           }
-          if ($shouldBeLatest) {
-            gh release edit $tag --draft=false --latest --repo $repo
-          } else {
-            gh release edit $tag --draft=false --repo $repo
-          }
+          $makeLatestValue = if ($shouldBeLatest) { 'true' } else { 'legacy' }
+          gh api --method PATCH $releaseEndpoint -F draft=false -f "make_latest=$makeLatestValue" *> $null
           if ($LASTEXITCODE -ne 0) { throw "All asset checks passed, but publishing draft release '$tag' failed." }
 
-          $publishedResponse = gh api $releaseEndpoint 2>&1
-          if ($LASTEXITCODE -ne 0) { throw "Could not confirm publication of release '$tag': $($publishedResponse -join ' ')" }
-          $publishedRelease = ($publishedResponse -join "`n") | ConvertFrom-Json
+          $publishedRelease = Get-ReleaseById $releaseId
           if ($publishedRelease.draft) { throw "Release '$tag' is still a draft after the publish step." }
+          $publishedInstallerAsset = $publishedRelease.assets | Where-Object name -eq $installer | Select-Object -First 1
+          if (!$publishedInstallerAsset -or $publishedInstallerAsset.browser_download_url -ne $expectedInstallerUrl) {
+            throw "Published asset '$installer' does not resolve to its tagged download URL."
+          }
           if ($shouldBeLatest) {
             $latestResponse = gh api "repos/$repo/releases/latest" 2>&1
             if ($LASTEXITCODE -ne 0) { throw 'Could not resolve GitHub latest release after publication.' }
@@ -277,5 +339,9 @@ jobs:
             $endpointPlatforms = @($endpointManifest.platforms.PSObject.Properties.Name)
             if ($endpointManifest.version -ne $version -or $endpointPlatforms.Count -ne 1 -or $endpointPlatforms[0] -ne 'windows-x86_64') {
               throw 'Production latest.json endpoint returned an unexpected version or platform set.'
+            }
+            if ($endpointManifest.platforms.'windows-x86_64'.url -ne $expectedInstallerUrl -or
+                $endpointManifest.platforms.'windows-x86_64'.signature -ne (Get-Content -Raw $finalSignature).Trim()) {
+              throw 'Production latest.json endpoint does not match the verified Windows release assets.'
             }
           }
