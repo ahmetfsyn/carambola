@@ -1,15 +1,22 @@
-# Carambola v0.1.3
+# Carambola v1.0.0
 
-## Changes
+The initial production release supports **Windows x86_64** only.
 
-- Route Windows screenshot notifications through Tauri's native notification backend and report delivery errors.
-- Add signed in-app update checks, an update prompt, manual Settings action, download progress, and restart support.
-- Preserve the existing macOS notification implementation; macOS notification runtime verification remains pending.
+## Included
+
+- Per-user Windows NSIS installer.
+- Signed in-app update artifact and Windows-only `latest.json` entry.
+- Screenshot capture, selection, annotation, clipboard export, PNG saving, tray controls, and configurable capture shortcut.
+- Optional screenshot notifications and update status in Settings.
 
 ## Upgrade
 
-Users of v0.1.2 must install v0.1.3 manually once. In-app signed updates are available starting with v0.1.3.
+Install v1.0.0 manually from the Windows installer. Signed in-app updates are available from this release onward for supported Windows x86_64 installations.
 
-## Distribution status
+## Platform status
 
-This note describes the intended release. Do not publish it until the Windows and macOS artifacts, updater signatures, and generated `latest.json` have passed the release checks.
+- Windows x86_64: production release target. See the release page for verified installer and updater assets.
+- macOS Apple Silicon and Intel: not included in this release; they will be added to this same GitHub Release after separate production-readiness testing.
+- Linux x86_64: not included in this release; it will be added to this same GitHub Release after separate production-readiness testing.
+
+The Windows installer is not Authenticode-signed. The updater artifact uses Carambola's existing Tauri updater key. macOS and Linux are not included and are not claimed as supported by this release.

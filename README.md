@@ -4,7 +4,7 @@ Carambola is a lightweight, tray-first screenshot and annotation application for
 
 Carambola runs in the background with no main window. A system-tray menu and a configurable global shortcut are the entry points, so the app stays out of the way until it is needed.
 
-This checkout is version **v0.1.3**. The last published release remains **v0.1.2** until the v0.1.3 Windows and macOS production builds have been verified and published. Existing v0.1.2 installations must manually install v0.1.3 once; signed in-app updates begin with v0.1.3.
+Carambola v1.0.0 is a staged production rollout. This release targets Windows x86_64 only. macOS and Linux artifacts will be added to the same GitHub Release only after separate production-readiness testing.
 
 ## Features
 
@@ -19,7 +19,7 @@ This checkout is version **v0.1.3**. The last published release remains **v0.1.2
 - OCR on Windows (Windows.Media.Ocr); extracted text is copied to the clipboard.
 - Settings screen for the capture shortcut and Start on Boot.
 - Optional native screenshot notifications, enabled by default, after a screenshot is successfully copied or saved.
-- Signed in-app updates for Windows and macOS, with a startup check and a manual **Check for Updates** action in Settings.
+- Signed in-app updates for Windows, with a startup check and a manual **Check for Updates** action in Settings.
 - Single-instance behaviour: launching Carambola again while it is running only brings up the existing instance (it does not create a second tray icon).
 - Tray-only background operation on Windows, macOS, and Linux.
 
@@ -40,31 +40,31 @@ Real screenshots are not checked into this repository yet. The placeholders belo
 
 | Platform | Architecture | Status |
 | --- | --- | --- |
-| Windows 10/11 | x86_64 | v0.1.2 feature QA was previously completed for launch, tray, shortcut capture, crop, clipboard, and PNG saving. The v0.1.3 NSIS installer was built, installed per-user, and launched; its updater signature validated locally. v0.1.3 notification, screenshot, and update-cycle runtime QA remain incomplete. Installer is not Authenticode-signed. |
-| macOS | Apple Silicon | An earlier `.app` and DMG were built. v0.1.3 build and runtime tests remain pending. No Developer ID signing or notarization is configured. |
-| macOS | Intel | The release workflow targets x86_64; no v0.1.3 artifact or runtime test is available yet. |
-| Linux | x86_64 | No package is published; runtime behavior and packaging have **not** been verified. Screen capture uses X11 APIs; native Wayland capture is not verified. See the Linux section below. |
+| Windows 10/11 | x86_64 | Initial v1.0.0 production release target. The per-user NSIS installer and signed updater artifact are verified during release. Installer is not Authenticode-signed. |
+| macOS | Apple Silicon | Not included in v1.0.0. An earlier `.app` and DMG exist, but production build/runtime verification, Developer ID signing, and notarization remain pending. |
+| macOS | Intel | Not included in v1.0.0. Build and runtime verification remain pending. |
+| Linux | x86_64 | Not included in v1.0.0. Packaging and runtime behavior have not been verified. Native Wayland capture is not verified. See the Linux section below. |
 
 The Windows 0.1.2 checks cover the production build and installation, plus runtime tests for launch, tray startup, shortcut capture, overlay geometry, crop selection, clipboard copy, and local save. Pen, vector, text, and mosaic annotation tools and multi-monitor behavior still need interactive QA. Linux has not been built or tested here.
 
 ## Installation
 
-### v0.1.3 update migration
+### v1.0.0 Windows release
 
-Install v0.1.3 manually from the Windows installer or macOS DMG on the [Releases page](https://github.com/ahmetfsyn/carambola/releases). v0.1.2 does not contain the updater or its verification key, so it cannot update itself. After installing v0.1.3, Carambola checks for signed updates at startup and offers them before installation. Use **Settings → Check for Updates** for a manual check. Download progress uses the native taskbar/Dock indicator where supported. An update installs only after choosing **Update now**.
+Install v1.0.0 manually from the Windows installer on the [Releases page](https://github.com/ahmetfsyn/carambola/releases). Older releases without the updater cannot update themselves. After installing v1.0.0, Carambola checks for signed Windows updates at startup and offers them before installation. Use **Settings → Check for Updates** for a manual check. An update installs only after choosing **Update now**.
 
-The release workflow builds Windows x64, macOS Apple Silicon, and macOS Intel. Windows installers are not Authenticode-signed. macOS builds use the existing ad hoc signing configuration and are not Developer ID signed or notarized, so Gatekeeper may require user action on first install. The updater signature is separate and is verified before an update is installed.
+The initial workflow builds and publishes only Windows x64. Windows installers are not Authenticode-signed. macOS is not included; its existing ad hoc configuration is not Developer ID signing or notarization. Platform expansion uses a separate workflow that updates this same release and merges its verified entry into `latest.json` while preserving the Windows entry.
 
 ### Windows
 
 The Windows x64 installer uses the Tauri NSIS bundler and installs for the current user by default, so administrator rights are normally not required.
 
-1. Download [Carambola 0.1.2 for Windows x64](https://github.com/ahmetfsyn/carambola/releases/download/v0.1.2/Carambola_0.1.2_x64-setup.exe) from GitHub Releases.
+1. Download the **Carambola v1.0.0 Windows x64** installer from GitHub Releases.
 2. Run the installer and follow the wizard.
 3. Launch **Carambola** from the Start Menu. The app starts in the background and adds a tray icon; there is no main window.
 4. Right-click the tray icon for **Capture Screen**, **Settings...**, and **Quit Carambola**.
 
-The 0.1.2 installer was installed per-user on Windows x64. Runtime tests verified launch, shortcut capture, crop geometry, clipboard copy, and a local PNG save. The zoom regression was not reproduced. Pen, vector, text, and mosaic annotation tools still need interactive testing. The installer is unsigned; Windows SmartScreen may show an unrecognized-publisher warning. v0.1.3 runtime and notification tests remain pending its production installer.
+The installer is unsigned; Windows SmartScreen may show an unrecognized-publisher warning. Release notes and QA claims must match the actual v1.0.0 verification results.
 
 **WebView2 requirement:** Carambola uses the Microsoft Edge WebView2 runtime. The installer downloads its bootstrapper if the runtime is missing, so internet access is needed in that case. Offline installation requires WebView2 to be installed separately first.
 
@@ -236,7 +236,7 @@ Edit the file only while Carambola is not running. Invalid JSON is ignored and d
 - **macOS shortcut QA is incomplete.** Unit checks cover separate modifiers, ordering, and physical punctuation mapping. Packaged runtime activation while another app is active and shortcut persistence across restarts remain unverified.
 - **Multi-monitor behaviour is untested.** Capture targets the monitor under the cursor on Windows. macOS selects the display containing the frontmost ordinary app window, with pointer and primary display fallbacks; display selection and coordinate behavior still need runtime validation.
 - **Display scaling:** 100%, 125%, and 150% scaling were not runtime-tested in this stabilization pass.
-- **No auto-update, history, gallery, or cloud sync.**
+- **No history, gallery, or cloud sync.**
 - **No license has been selected.** See [License](#license).
 
 ## Linux X11 / Wayland requirements
@@ -338,15 +338,14 @@ Capture-to-overlay latency and memory behavior were not measured. The native ove
 
 Build outputs live under `src-tauri/target/`, `dist/`, and `node_modules/` and are ignored by Git. Do not commit installers or compiled binaries unless the repository explicitly starts tracking release artifacts.
 
-### Publishing future updates
+### Publishing staged platform updates
 
-1. Update the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`/`Cargo.lock`; update `RELEASE_NOTES.md`.
-2. Build and verify Windows and macOS production installs. Keep the bundle identifier `io.carambola.desktop` and the updater key pair unchanged.
-3. Commit the release, create and push a matching tag, for example `git tag v0.1.4; git push origin HEAD; git push origin v0.1.4`.
-4. `.github/workflows/release.yml` builds Windows x64, macOS Apple Silicon, and macOS Intel sequentially and uploads signed updater bundles/installers plus the generated `latest.json` to a draft release.
-5. Install and test each platform artifact. After QA passes, run **Actions → Publish verified release** and enter the tag. It checks the platform URLs and signatures against the uploaded `.sig` assets, downloads the update artifacts, prints SHA-256 hashes, and then publishes the draft.
+1. For the initial v1.0.0 release, build and verify Windows x64 only. Tag `v1.0.0` once; do not replace or recreate this tag during platform expansion.
+2. After macOS Apple Silicon, macOS Intel, or Linux AppImage passes separate production-readiness testing, run **Actions → Expand v1.0.0 platforms** and select the existing `v1.0.0` tag and one platform.
+3. The expansion workflow uploads that platform's actual artifact and signature to the existing release, merges its entry into `latest.json`, confirms the existing Windows entry is unchanged, verifies the new signature, and records SHA-256 hashes.
+4. Keep the bundle identifier `io.carambola.desktop` and updater key pair unchanged. Never publish placeholder platform entries or recreate the v1.0.0 tag.
 
-The only required Actions secret is `TAURI_SIGNING_PRIVATE_KEY`; GitHub supplies `GITHUB_TOKEN` automatically. Keep the local private key at `%USERPROFILE%\.tauri\carambola-updater.key` and provision the repository secret from PowerShell with `Get-Content -Raw "$env:USERPROFILE\.tauri\carambola-updater.key" | gh secret set TAURI_SIGNING_PRIVATE_KEY`. Do not commit, replace, or delete the private key, change the configured public key, edit signatures by hand, overwrite prior version tags, or delete old release assets. The current macOS builds are ad hoc signed and not notarized; Developer ID signing and notarization are not configured.
+The only required Actions secret is `TAURI_SIGNING_PRIVATE_KEY`; GitHub supplies `GITHUB_TOKEN` automatically. Keep the local private key at `%USERPROFILE%\.tauri\carambola-updater.key`. Do not commit, replace, or delete the private key, change the configured public key, edit signatures by hand, overwrite prior version tags, or delete old release assets. macOS Developer ID signing and notarization are not configured.
 
 ## Technology stack
 
