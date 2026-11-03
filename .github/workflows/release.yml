@@ -4,17 +4,28 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build (v1.0.0 for the current Windows release)
+        required: true
+        type: string
+        default: v1.0.0
 
 permissions:
   contents: write
 
+concurrency:
+  group: windows-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  windows:
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -22,62 +33,162 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
-      - name: Verify release metadata
+      - name: Verify release metadata and exact tag checkout
+        id: metadata
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         shell: pwsh
         run: |
-          $expected = $env:GITHUB_REF_NAME.TrimStart('v')
+          $tag = $env:TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Invalid release tag: $tag" }
+          if ($env:EVENT_NAME -eq 'workflow_dispatch' -and $tag -ne 'v1.0.0') {
+            throw 'Manual dispatch is restricted to the existing v1.0.0 release.'
+          }
+
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine the checked-out commit.' }
+          $tagCommit = (git rev-parse "$($tag)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $tagCommit) {
+            throw "Checkout does not match the commit pointed to by $tag."
+          }
+          if ($tag -eq 'v1.0.0' -and $head -ne '43384cf3671206f10c444b785c47eb5b034db6d2') {
+            throw "Tag v1.0.0 must remain on release commit 43384cf; found $head."
+          }
+
+          $expected = $tag.TrimStart('v')
           $package = Get-Content package.json -Raw | ConvertFrom-Json
           $tauri = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           $cargo = Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
           $cargoVersion = [regex]::Match($cargo.Line, '"([^"]+)"').Groups[1].Value
           if ($package.version -ne $expected -or $tauri.version -ne $expected -or $cargoVersion -ne $expected) {
-            throw "Release tag $env:GITHUB_REF_NAME does not match package/Tauri/Cargo versions ($($package.version), $($tauri.version), $cargoVersion)."
+            throw "Release tag $tag does not match package/Tauri/Cargo versions ($($package.version), $($tauri.version), $cargoVersion)."
           }
           if ($tauri.identifier -ne 'io.carambola.desktop') { throw "Unexpected app identifier: $($tauri.identifier)" }
-      - id: notes
-        shell: pwsh
-        run: |
-          "body<<RELEASE_NOTES_EOF" >> $env:GITHUB_OUTPUT
-          Get-Content -Raw RELEASE_NOTES.md >> $env:GITHUB_OUTPUT
-          "RELEASE_NOTES_EOF" >> $env:GITHUB_OUTPUT
-      - uses: tauri-apps/tauri-action@action-v1.0.0
+
+          "version=$expected" >> $env:GITHUB_OUTPUT
+          "installer=Carambola_${expected}_x64-setup.exe" >> $env:GITHUB_OUTPUT
+      - name: Build and sign the Windows NSIS installer
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Carambola ${{ github.ref_name }}
-          releaseBody: ${{ steps.notes.outputs.body }}
-          releaseDraft: true
-          uploadUpdaterJson: false
-          updaterJsonPreferNsis: true
-          args: --target x86_64-pc-windows-msvc --bundles nsis
-      - name: Generate Windows-only updater manifest from uploaded assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
         shell: pwsh
         run: |
-          $version = $env:TAG.TrimStart('v')
-          $installer = 'Carambola_' + $version + '_x64-setup.exe'
+          npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri failed to build or sign the Windows NSIS installer.' }
+
+          $installer = '${{ steps.metadata.outputs.installer }}'
           $installerPath = Join-Path 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis' $installer
-          $signaturePath = "$installerPath.sig"
-          if (!(Test-Path $installerPath) -or !(Test-Path $signaturePath)) { throw 'The NSIS installer or its updater signature is missing.' }
+          if (!(Test-Path -LiteralPath $installerPath)) { throw "Build output is missing installer '$installer'." }
+          if (!(Test-Path -LiteralPath "$installerPath.sig")) { throw "Build output is missing updater signature '$installer.sig'." }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-${{ inputs.tag || github.ref_name }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/${{ steps.metadata.outputs.installer }}
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/${{ steps.metadata.outputs.installer }}.sig
 
-          $release = gh api "repos/ahmetfsyn/carambola/releases/tags/$env:TAG" | ConvertFrom-Json
-          $asset = $release.assets | Where-Object name -eq $installer | Select-Object -First 1
+  verify-upload-publish:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-${{ inputs.tag || github.ref_name }}
+          path: release-check/built
+      - name: Install Minisign verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+      - name: Verify, create or reuse draft, upload assets and manifest, then publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:TAG
+          $repo = $env:GITHUB_REPOSITORY
+          $version = $tag.TrimStart('v')
+          $installer = "Carambola_${version}_x64-setup.exe"
+          $builtInstaller = Join-Path 'release-check/built' $installer
+          $builtSignature = "$builtInstaller.sig"
+          if (!(Test-Path -LiteralPath $builtInstaller)) { throw "Build artifact missing '$installer' from step 'Build and sign the Windows NSIS installer'." }
+          if (!(Test-Path -LiteralPath $builtSignature)) { throw "Build artifact missing '$installer.sig' from step 'Build and sign the Windows NSIS installer'." }
+
+          $tauri = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $publicKeyText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($tauri.plugins.updater.pubkey))
+          $publicKeyPath = Join-Path $env:RUNNER_TEMP 'carambola-updater.pub'
+          [IO.File]::WriteAllText($publicKeyPath, $publicKeyText, [Text.UTF8Encoding]::new($false))
+
+          function Verify-TauriSignature([string]$InstallerPath, [string]$SignaturePath, [string]$Label) {
+            $encoded = (Get-Content -Raw -LiteralPath $SignaturePath).Trim()
+            try {
+              $minisignText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
+            } catch {
+              throw "$Label signature '$([IO.Path]::GetFileName($SignaturePath))' is not valid Tauri signature encoding."
+            }
+            $rawSignaturePath = Join-Path $env:RUNNER_TEMP (([IO.Path]::GetFileName($SignaturePath)) + '.minisign')
+            [IO.File]::WriteAllText($rawSignaturePath, $minisignText, [Text.UTF8Encoding]::new($false))
+            minisign -Vm $InstallerPath -x $rawSignaturePath -p $publicKeyPath
+            if ($LASTEXITCODE -ne 0) { throw "$Label signature verification failed for '$([IO.Path]::GetFileName($InstallerPath))'." }
+          }
+
+          # Verify before creating or modifying a GitHub Release.
+          Verify-TauriSignature $builtInstaller $builtSignature 'Locally built'
+          $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $builtInstaller).Hash
+
+          $releaseEndpoint = "repos/$repo/releases/tags/$tag"
+          $releaseResponse = gh api $releaseEndpoint 2>&1
+          $releaseQueryExit = $LASTEXITCODE
+          if ($releaseQueryExit -eq 0) {
+            $release = ($releaseResponse -join "`n") | ConvertFrom-Json
+            if (!$release.draft) {
+              gh release edit $tag --draft --repo $repo
+              if ($LASTEXITCODE -ne 0) { throw "Could not move existing release '$tag' to draft before validating replacement assets." }
+            }
+          } elseif (($releaseResponse -join "`n") -match '(?i)not found|HTTP 404') {
+            gh release create $tag --draft --verify-tag --title "Carambola $tag" --notes-file RELEASE_NOTES.md --repo $repo
+            if ($LASTEXITCODE -ne 0) { throw "Could not create draft GitHub Release '$tag'." }
+          } else {
+            throw "Could not query GitHub Release '$tag': $($releaseResponse -join ' ')"
+          }
+
+          gh release upload $tag $builtInstaller $builtSignature --clobber --repo $repo
+          if ($LASTEXITCODE -ne 0) {
+            throw "Asset upload step failed for '$installer' and '$installer.sig'."
+          }
+
+          $releaseResponse = gh api $releaseEndpoint 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "Could not query GitHub Release '$tag' after installer upload: $($releaseResponse -join ' ')" }
+          $release = ($releaseResponse -join "`n") | ConvertFrom-Json
+          $installerAsset = $release.assets | Where-Object name -eq $installer | Select-Object -First 1
           $signatureAsset = $release.assets | Where-Object name -eq "$installer.sig" | Select-Object -First 1
-          if (!$asset -or !$signatureAsset) { throw 'The installer and signature must both be uploaded before creating latest.json.' }
-          if ($asset.state -ne 'uploaded' -or $signatureAsset.state -ne 'uploaded') { throw 'GitHub has not completed both asset uploads.' }
+          if (!$installerAsset -or $installerAsset.state -ne 'uploaded') {
+            throw "Release asset '$installer' is missing or not uploaded after step 'Upload installer and signature'."
+          }
+          if (!$signatureAsset -or $signatureAsset.state -ne 'uploaded') {
+            throw "Release asset '$installer.sig' is missing or not uploaded after step 'Upload installer and signature'."
+          }
 
-          New-Item -ItemType Directory -Force -Path release-check | Out-Null
-          gh release download $env:TAG --pattern $installer --pattern "$installer.sig" --dir release-check
-          $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath).Hash
-          $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path 'release-check' $installer)).Hash
-          if ($localHash -ne $remoteHash) { throw 'The uploaded installer bytes do not match the locally signed build.' }
-          $localSignature = (Get-Content -Raw -LiteralPath $signaturePath).Trim()
-          $remoteSignature = (Get-Content -Raw -LiteralPath (Join-Path 'release-check' "$installer.sig")).Trim()
-          if ($localSignature -ne $remoteSignature) { throw 'The uploaded updater signature differs from the locally generated signature.' }
+          $remotePairDir = 'release-check/remote-pair'
+          New-Item -ItemType Directory -Force -Path $remotePairDir | Out-Null
+          gh release download $tag --repo $repo --pattern $installer --pattern "$installer.sig" --dir $remotePairDir --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not download '$installer' and '$installer.sig' after upload for verification." }
+          $remoteInstaller = Join-Path $remotePairDir $installer
+          $remoteSignature = Join-Path $remotePairDir "$installer.sig"
+          $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $remoteInstaller).Hash
+          if ($remoteHash -ne $localHash) { throw "Uploaded asset '$installer' does not match the signed build (SHA-256 mismatch)." }
+          if ((Get-Content -Raw $remoteSignature).Trim() -ne (Get-Content -Raw $builtSignature).Trim()) {
+            throw "Uploaded asset '$installer.sig' differs from the signed build."
+          }
+          Verify-TauriSignature $remoteInstaller $remoteSignature 'Uploaded'
 
           $manifest = [ordered]@{
             version = $version
@@ -85,72 +196,86 @@ jobs:
             pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
             platforms = [ordered]@{
               'windows-x86_64' = [ordered]@{
-                signature = $remoteSignature
-                url = $asset.browser_download_url
+                signature = (Get-Content -Raw $remoteSignature).Trim()
+                url = $installerAsset.browser_download_url
               }
             }
           }
-          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 latest.json
-          gh release upload $env:TAG latest.json --clobber
+          $manifestPath = 'latest.json'
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 -LiteralPath $manifestPath
+          $manifestCheck = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+          $platformNames = @($manifestCheck.platforms.PSObject.Properties.Name)
+          if ($manifestCheck.version -ne $version -or $platformNames.Count -ne 1 -or $platformNames[0] -ne 'windows-x86_64') {
+            throw 'Generated latest.json has an unexpected version or platform set.'
+          }
+          if (!$manifestCheck.platforms.'windows-x86_64'.url -or !$manifestCheck.platforms.'windows-x86_64'.signature) {
+            throw 'Generated latest.json is missing the Windows installer URL or signature.'
+          }
 
-  verify-and-publish:
-    needs: windows
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-      - name: Install minisign verifier
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y minisign
-      - name: Verify Windows manifest, updater signature, installer, and publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
-          EXPECTED_VERSION: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          VERSION="${EXPECTED_VERSION#v}"
-          gh release view "$TAG" --json isDraft --jq '.isDraft == true' | grep -qx true
-          mkdir -p release-check/assets
-          gh release download "$TAG" --pattern latest.json --dir release-check
+          gh release upload $tag $manifestPath --clobber --repo $repo
+          if ($LASTEXITCODE -ne 0) { throw "Manifest upload step failed for 'latest.json'." }
 
-          jq -e --arg version "$VERSION" '
-            .version == $version and
-            (.platforms | keys == ["windows-x86_64"]) and
-            (.platforms["windows-x86_64"].url | type == "string" and length > 0) and
-            (.platforms["windows-x86_64"].signature | type == "string" and length > 0)
-          ' release-check/latest.json >/dev/null
+          $finalResponse = gh api $releaseEndpoint 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "Could not query GitHub Release '$tag' after manifest upload: $($finalResponse -join ' ')" }
+          $release = ($finalResponse -join "`n") | ConvertFrom-Json
+          foreach ($name in @($installer, "$installer.sig", 'latest.json')) {
+            $asset = $release.assets | Where-Object name -eq $name | Select-Object -First 1
+            if (!$asset -or $asset.state -ne 'uploaded') { throw "Final release asset '$name' is missing or not uploaded." }
+          }
 
-          asset_url=$(jq -r '.platforms["windows-x86_64"].url' release-check/latest.json)
-          case "$asset_url" in
-            https://api.github.com/repos/ahmetfsyn/carambola/releases/assets/*)
-              asset_name=$(gh api "${asset_url#https://api.github.com/}" --jq .name)
-              ;;
-            https://github.com/ahmetfsyn/carambola/releases/download/*/*)
-              asset_name="${asset_url##*/}"
-              ;;
-            *) echo "Unexpected updater URL: $asset_url" >&2; exit 1 ;;
-          esac
-          case "$asset_name" in
-            *-setup.exe) ;;
-            *) echo "Manifest does not point to the NSIS installer: $asset_name" >&2; exit 1 ;;
-          esac
-          gh release download "$TAG" --pattern "$asset_name" --pattern "$asset_name.sig" --dir release-check/assets
-          test -s "release-check/assets/$asset_name"
-          test -s "release-check/assets/$asset_name.sig"
+          $finalDir = 'release-check/final'
+          New-Item -ItemType Directory -Force -Path $finalDir | Out-Null
+          gh release download $tag --repo $repo --pattern $installer --pattern "$installer.sig" --pattern latest.json --dir $finalDir --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the final installer, signature, and latest.json for verification.' }
+          $finalInstaller = Join-Path $finalDir $installer
+          $finalSignature = Join-Path $finalDir "$installer.sig"
+          $finalManifestPath = Join-Path $finalDir 'latest.json'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $finalInstaller).Hash -ne $localHash) {
+            throw "Final release asset '$installer' failed the SHA-256 comparison."
+          }
+          Verify-TauriSignature $finalInstaller $finalSignature 'Final release'
+          $finalManifest = Get-Content -Raw $finalManifestPath | ConvertFrom-Json
+          $finalPlatforms = @($finalManifest.platforms.PSObject.Properties.Name)
+          if ($finalManifest.version -ne $version -or $finalPlatforms.Count -ne 1 -or $finalPlatforms[0] -ne 'windows-x86_64') {
+            throw 'Uploaded latest.json has an unexpected version or platform set.'
+          }
+          if ($finalManifest.platforms.'windows-x86_64'.url -ne $installerAsset.browser_download_url -or
+              $finalManifest.platforms.'windows-x86_64'.signature -ne (Get-Content -Raw $finalSignature).Trim()) {
+            throw 'Uploaded latest.json does not match the uploaded Windows installer and signature.'
+          }
 
-          manifest_signature=$(jq -r '.platforms["windows-x86_64"].signature' release-check/latest.json | tr -d '\r\n')
-          asset_signature=$(tr -d '\r\n' < "release-check/assets/$asset_name.sig")
-          test "$manifest_signature" = "$asset_signature"
+          $latestResponse = gh api "repos/$repo/releases/latest" 2>&1
+          $latestQueryExit = $LASTEXITCODE
+          $shouldBeLatest = $true
+          if ($latestQueryExit -eq 0) {
+            $latest = ($latestResponse -join "`n") | ConvertFrom-Json
+            try { $shouldBeLatest = ([version]$version -ge [version]$latest.tag_name.TrimStart('v')) } catch { $shouldBeLatest = $latest.tag_name -eq $tag }
+          }
+          if ($shouldBeLatest) {
+            gh release edit $tag --draft=false --latest --repo $repo
+          } else {
+            gh release edit $tag --draft=false --repo $repo
+          }
+          if ($LASTEXITCODE -ne 0) { throw "All asset checks passed, but publishing draft release '$tag' failed." }
 
-          public_key=$(jq -r '.plugins.updater.pubkey' src-tauri/tauri.conf.json)
-          printf '%s' "$public_key" | base64 --decode > release-check/updater.pub
-          minisign -Vm "release-check/assets/$asset_name" -x "release-check/assets/$asset_name.sig" -p release-check/updater.pub
+          $publishedResponse = gh api $releaseEndpoint 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "Could not confirm publication of release '$tag': $($publishedResponse -join ' ')" }
+          $publishedRelease = ($publishedResponse -join "`n") | ConvertFrom-Json
+          if ($publishedRelease.draft) { throw "Release '$tag' is still a draft after the publish step." }
+          if ($shouldBeLatest) {
+            $latestResponse = gh api "repos/$repo/releases/latest" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw 'Could not resolve GitHub latest release after publication.' }
+            $latest = ($latestResponse -join "`n") | ConvertFrom-Json
+            if ($latest.tag_name -ne $tag) { throw "Latest release endpoint resolves to '$($latest.tag_name)', not '$tag'." }
 
-          file "release-check/assets/$asset_name"
-          sha256sum "release-check/assets/$asset_name" "release-check/assets/$asset_name.sig" release-check/latest.json
-          gh release edit "$TAG" --draft=false
+            $endpointManifestPath = Join-Path $env:RUNNER_TEMP 'production-latest.json'
+            $endpointStatus = & /usr/bin/curl --location --silent --show-error --output $endpointManifestPath --write-out '%{http_code}' "https://github.com/$repo/releases/latest/download/latest.json"
+            if ($LASTEXITCODE -ne 0 -or $endpointStatus -ne '200') {
+              throw "Production latest.json endpoint returned HTTP $endpointStatus."
+            }
+            $endpointManifest = Get-Content -Raw -LiteralPath $endpointManifestPath | ConvertFrom-Json
+            $endpointPlatforms = @($endpointManifest.platforms.PSObject.Properties.Name)
+            if ($endpointManifest.version -ne $version -or $endpointPlatforms.Count -ne 1 -or $endpointPlatforms[0] -ne 'windows-x86_64') {
+              throw 'Production latest.json endpoint returned an unexpected version or platform set.'
+            }
+          }
