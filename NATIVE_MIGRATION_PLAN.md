@@ -7,10 +7,11 @@ foundation and Phase 5's annotation completion are implemented. Phase 5 passed
 `cargo fmt --check`, `cargo check --offline`, all 35 `cargo test --offline`
 tests, `git diff --check`, and the Windows `cargo build --offline --release`.
 The user manually confirmed Text, Mosaic, Undo/Redo, existing annotation tools,
-and PNG export.
-The final review then corrected lowercase glyph rendering and mosaic painter
-ordering; those two output cases passed automated tests and the Release build
-but have not yet been manually retested.
+PNG export, lowercase text, painter ordering, and mosaic compositing in the
+Windows Release application. Phase 6 export/clipboard implementation passed
+`cargo fmt --check`, `cargo check --offline`, all 40 `cargo test --offline`
+tests, `git diff --check`, and the Windows Release build. The Release app is
+running and awaiting physical Save/Copy testing.
 Runtime tests at 100% and 150%, mixed-DPI displays, macOS capture, monitor
 selection, and the remaining product features are still open.
 
@@ -115,8 +116,9 @@ verified. Audit does not count as migration.
 - [x] Transparent full-screen selection overlay prototype on Windows; macOS remains untested.
 - [x] Windows primary-display capture and physical-pixel crop geometry contract; dynamic monitor and mixed-DPI synchronization remain open.
 - [x] Phase 4.1 Rust annotation data model, image-space coordinate mapping, five-tool software rendering, Slint preview, and fresh-frame compositing interface.
-- [x] Phase 5 Text and Mosaic annotations, shared Undo/Redo history, and common preview/export compositing; offline tests and Windows Release build passed, and the user manually verified Text, Mosaic, Undo/Redo, the existing tools, and PNG export. The final review's lowercase-glyph and painter-order corrections passed tests/build but await manual spot-check.
-- [ ] Native clipboard, local save, Windows OCR and macOS Vision OCR.
+- [x] Phase 5 Text and Mosaic annotations, shared Undo/Redo history, and common preview/export compositing; offline tests and Windows Release build passed, and the user manually verified Text, Mosaic, Undo/Redo, the existing tools, lowercase text, painter ordering, mosaic compositing, and PNG export.
+- [x] Phase 6 Windows PNG Save As and CF_DIBV5 image clipboard implementation; automated tests and Windows Release build passed. Physical Save/Copy runtime verification is pending.
+- [ ] Windows OCR and macOS Vision OCR.
 - [ ] Settings, notification, startup, config migration, version/About.
 - [ ] Single-instance and native update/installer strategy.
 - [ ] Windows x64, Windows ARM64, macOS Intel, macOS Apple Silicon builds and installed-runtime verification.
@@ -166,13 +168,22 @@ verified. Audit does not count as migration.
    and pixelation, painter order, history branching, and source immutability;
    35 tests passed. `cargo fmt --check`, `cargo check --offline`,
    `git diff --check`, and `cargo build --offline --release` also passed.
-   The Windows Release executable built successfully, and the user manually
-   confirmed Text, Mosaic, Undo/Redo, the existing annotation tools, and PNG
-   export. The final review then corrected lowercase glyph rendering and
-   mosaic painter ordering; both are automated-test and Release-build verified,
-   but not manually retested. These checks cover the available Windows setup
-   only; the DPI/display matrix and all other migration features remain open.
-4. **D — Remaining product features:** migrate clipboard/save, OCR, tray/hotkey,
+   The user has physically confirmed Text, Mosaic, Undo/Redo, the existing
+   annotation tools, lowercase text, painter ordering, mosaic compositing, and
+   PNG export in the Windows Release app.
+   **Phase 6 — Export & Clipboard:** added a native Windows PNG Save As dialog,
+   PNG encoding/writing of the same `render_composite` output used by preview,
+   and CF_DIBV5 clipboard transfer using movable global memory with explicit
+   ownership and cleanup. Save and Copy operate on an immutable crop/annotation
+   snapshot and leave the annotation session open; canceling Save As leaves it
+   unchanged. Implementation files: `native-app/Cargo.toml`,
+   `native-app/src/core/{clipboard,export}.rs`,
+   `native-app/src/platform/{mod,windows}.rs`, `native-app/src/main.rs`,
+   `native-app/ui/{overlay,windows}.slint`, and this plan. Forty offline tests,
+   `cargo fmt --check`, `cargo check --offline`, `git diff --check`, and the
+   Windows Release build passed. The Release app has been launched, but physical
+   Save As and clipboard behavior have NOT YET BEEN VERIFIED by the user.
+4. **D — Remaining product features:** migrate OCR, tray/hotkey,
    settings/config, startup, notifications, About, and updater/package flows.
 5. **E — Removal:** only after Windows and macOS build/runtime parity passes,
    remove Tauri and frontend tooling and update installers/workflows/docs.

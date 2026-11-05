@@ -12,7 +12,9 @@ mod overlay_ui {
 
 use core::{
     annotation_render,
-    annotations::{AnnotationEditor, AnnotationTool, ImagePoint, StrokeStyle, ViewportToImage},
+    annotations::{
+        Annotation, AnnotationEditor, AnnotationTool, ImagePoint, StrokeStyle, ViewportToImage,
+    },
     frame::CapturedFrame,
     selection::{LogicalRect, Selection},
     session::CaptureSession,
@@ -22,7 +24,11 @@ use settings_ui::SettingsWindow;
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
 };
 
 fn set_status(settings: &SettingsWindow, message: impl Into<slint::SharedString>) {
@@ -33,6 +39,65 @@ fn crop_output_path() -> PathBuf {
     std::env::temp_dir()
         .join("carambola-native")
         .join("selected-crop.png")
+}
+
+fn annotation_snapshot(
+    crop_slot: &Arc<Mutex<Option<CapturedFrame>>>,
+    editor_slot: &Arc<Mutex<Option<AnnotationEditor>>>,
+) -> Result<(CapturedFrame, Vec<Annotation>), String> {
+    let crop = crop_slot
+        .lock()
+        .map_err(|_| "Selected crop lock is unavailable")?
+        .clone()
+        .ok_or("Selected crop is no longer available")?;
+    let annotations = editor_slot
+        .lock()
+        .map_err(|_| "Annotation editor lock is unavailable")?
+        .as_ref()
+        .map(|editor| editor.document().annotations().to_vec())
+        .ok_or("Annotation session is no longer available")?;
+    Ok((crop, annotations))
+}
+
+fn start_export_operation(
+    overlay: &OverlayPrototype,
+    settings: slint::Weak<SettingsWindow>,
+    busy: Arc<AtomicBool>,
+    status: &'static str,
+    operation: impl FnOnce() -> Result<String, String> + Send + 'static,
+) {
+    if busy
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        overlay.set_export_status("An export operation is already running.".into());
+        return;
+    }
+    overlay.set_export_busy(true);
+    overlay.set_export_status(status.into());
+    let weak_overlay = overlay.as_weak();
+    thread::spawn(move || {
+        let result = operation();
+        let busy_for_dispatch = busy.clone();
+        let dispatched = slint::invoke_from_event_loop(move || {
+            busy_for_dispatch.store(false, Ordering::Release);
+            let message = match result {
+                Ok(message) => message,
+                Err(error) => format!("Export failed: {error}"),
+            };
+            if let Some(overlay) = weak_overlay.upgrade() {
+                overlay.set_export_busy(false);
+                overlay.set_export_status(message.clone().into());
+            }
+            if let Some(settings) = settings.upgrade() {
+                set_status(&settings, message);
+            }
+        });
+        if let Err(error) = dispatched {
+            busy.store(false, Ordering::Release);
+            log::error!("Could not return export result to the UI thread: {error}");
+        }
+    });
 }
 
 fn image_from_rgba(pixels: &[u8], width: u32, height: u32) -> Image {
@@ -121,6 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending_text_position = Arc::new(Mutex::new(None::<ImagePoint>));
     let selection = Arc::new(Mutex::new(Selection::default()));
     let capture_session = Arc::new(CaptureSession::default());
+    let export_busy = Arc::new(AtomicBool::new(false));
 
     let weak_settings = settings.as_weak();
     let weak_overlay = overlay.as_weak();
@@ -131,9 +197,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text_position_slot = pending_text_position.clone();
     let selection_slot = selection.clone();
     let active_flag = capture_session.clone();
+    let export_busy_flag = export_busy.clone();
     settings.on_open_overlay(move || {
         log::info!("Capture requested");
         platform::diagnose_cursor("capture requested");
+        if export_busy_flag.load(Ordering::Acquire) {
+            if let Some(settings) = weak_settings.upgrade() {
+                set_status(&settings, "Please wait for the current export to finish.");
+            }
+            return;
+        }
         if !active_flag.begin_capture() {
             return;
         }
@@ -150,6 +223,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             overlay.set_text_entry_value(String::new().into());
             overlay.set_can_undo(false);
             overlay.set_can_redo(false);
+            overlay.set_export_busy(false);
+            overlay.set_export_status(String::new().into());
             overlay.set_selection_x(0.0);
             overlay.set_selection_y(0.0);
             overlay.set_selection_width(0.0);
@@ -660,12 +735,113 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let weak_overlay = overlay.as_weak();
     let weak_settings = settings.as_weak();
+    let crop_slot = selected_crop.clone();
+    let editor_slot = annotation_editor.clone();
+    let text_position_slot = pending_text_position.clone();
+    let busy = export_busy.clone();
+    overlay.on_save_png(move || {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        if text_position_slot
+            .lock()
+            .expect("pending text position lock")
+            .is_some()
+        {
+            overlay.set_export_status("Add or cancel the current text before saving.".into());
+            return;
+        }
+        let (crop, annotations) = match annotation_snapshot(&crop_slot, &editor_slot) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                overlay.set_export_status(format!("Could not save screenshot: {error}").into());
+                return;
+            }
+        };
+        let path = match platform::save_png_dialog() {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                overlay
+                    .set_export_status("Save cancelled. The capture session is unchanged.".into());
+                return;
+            }
+            Err(error) => {
+                overlay.set_export_status(format!("Save As failed: {error}").into());
+                return;
+            }
+        };
+        start_export_operation(
+            &overlay,
+            weak_settings.clone(),
+            busy.clone(),
+            "Saving PNG…",
+            move || {
+                let rendered = annotation_render::render_composite(&crop, &annotations)
+                    .map_err(str::to_owned)?;
+                crate::core::export::write_png(&path, &rendered)?;
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "screenshot.png".into());
+                Ok(format!("Saved {name}"))
+            },
+        );
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let weak_settings = settings.as_weak();
+    let crop_slot = selected_crop.clone();
+    let editor_slot = annotation_editor.clone();
+    let text_position_slot = pending_text_position.clone();
+    let busy = export_busy.clone();
+    overlay.on_copy_image(move || {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        if text_position_slot
+            .lock()
+            .expect("pending text position lock")
+            .is_some()
+        {
+            overlay.set_export_status("Add or cancel the current text before copying.".into());
+            return;
+        }
+        let (crop, annotations) = match annotation_snapshot(&crop_slot, &editor_slot) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                overlay.set_export_status(format!("Could not copy screenshot: {error}").into());
+                return;
+            }
+        };
+        start_export_operation(
+            &overlay,
+            weak_settings.clone(),
+            busy.clone(),
+            "Copying image to clipboard…",
+            move || {
+                let rendered = annotation_render::render_composite(&crop, &annotations)
+                    .map_err(str::to_owned)?;
+                platform::copy_image_to_clipboard(&rendered)?;
+                Ok("Image copied to clipboard".into())
+            },
+        );
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let weak_settings = settings.as_weak();
     let frame_slot = captured_frame.clone();
     let crop_slot = selected_crop.clone();
     let bounds_slot = selection_bounds.clone();
     let editor_slot = annotation_editor.clone();
     let active_flag = capture_session.clone();
+    let busy = export_busy.clone();
     overlay.on_finish_annotations(move || {
+        if busy.load(Ordering::Acquire) {
+            if let Some(overlay) = weak_overlay.upgrade() {
+                overlay.set_export_status("Wait for the current export before finishing.".into());
+            }
+            return;
+        }
         platform::diagnose_cursor("done before close");
         let crop = crop_slot.lock().expect("selected crop lock").take();
         let annotations = editor_slot
@@ -707,15 +883,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let output_path = crop_output_path();
                 std::fs::create_dir_all(output_path.parent().expect("temp path parent"))
                     .map_err(|error| error.to_string())?;
-                image::save_buffer_with_format(
-                    &output_path,
-                    output.pixels(),
-                    output.width(),
-                    output.height(),
-                    image::ColorType::Rgba8,
-                    image::ImageFormat::Png,
-                )
-                .map_err(|error| error.to_string())?;
+                crate::core::export::write_png(&output_path, &output)?;
                 Ok::<_, String>((output_path, output.width(), output.height()))
             })();
             let dispatched = slint::invoke_from_event_loop(move || {

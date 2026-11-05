@@ -1,5 +1,7 @@
 pub mod annotation_render;
 pub mod annotations;
+pub mod clipboard;
+pub mod export;
 pub mod frame;
 pub mod geometry;
 pub mod selection;
