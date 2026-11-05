@@ -59,8 +59,37 @@ pub fn get_current_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Respo
 /// Second half of the activation handshake: called by the frontend once the new
 /// screenshot has been decoded and the previous session state has been cleared.
 #[tauri::command]
-pub fn present_overlay(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    crate::window::present_overlay(&app_handle, &state)
+pub fn present_overlay(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    capture_id: u64,
+) -> Result<(), String> {
+    crate::window::present_overlay(&app_handle, &state, capture_id)
+}
+
+#[tauri::command]
+pub fn acknowledge_overlay_render(
+    state: State<'_, AppState>,
+    capture_id: u64,
+    viewport_width: f64,
+    viewport_height: f64,
+    dpr: f64,
+    canvas_width: u32,
+    canvas_height: u32,
+    image_width: u32,
+    image_height: u32,
+) -> Result<(), String> {
+    crate::window::acknowledge_overlay_render(
+        &state,
+        capture_id,
+        viewport_width,
+        viewport_height,
+        dpr,
+        canvas_width,
+        canvas_height,
+        image_width,
+        image_height,
+    )
 }
 
 /// Decodes the raw RGBA payload produced by the frontend compositor. The buffer
