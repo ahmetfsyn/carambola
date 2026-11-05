@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { OverlayContainer } from "./components/overlay/OverlayContainer";
 import {
   getCurrentFrameBytes,
+  acknowledgeOverlayRender,
   markOverlayFrontendReady,
   presentOverlay,
   hideOverlay,
@@ -13,6 +14,7 @@ import { startAutomaticUpdateCheck } from "./lib/updater";
 
 /** Payload emitted by the backend once a fresh frame is frozen in memory. */
 interface CaptureReadyPayload {
+  captureId: number;
   triggeredAt: number;
   display: DisplayInfo;
   captureMs: number;
@@ -32,12 +34,61 @@ function nextAnimationFrame(): Promise<void> {
   return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
 }
 
-/** Allow the hidden WebView2 surface to composite the new canvas before HWND show. */
-async function waitForWebViewPaint(): Promise<void> {
-  // rAF runs before paint. Waiting for a second frame guarantees a paint
-  // opportunity between callbacks without relying on an arbitrary timeout.
-  await nextAnimationFrame();
-  await nextAnimationFrame();
+/** Wait until viewport, DPR, backing store, and decoded frame agree for 3 frames. */
+async function waitForStableCanvas(image: FrameImage, captureId: number) {
+  const imageWidth = "naturalWidth" in image ? image.naturalWidth : image.width;
+  const imageHeight = "naturalHeight" in image ? image.naturalHeight : image.height;
+  let previous = "";
+  let stableFrames = 0;
+  let cancelled = false;
+  let timeoutId = 0;
+  try {
+    return await Promise.race([
+      (async () => {
+        while (!cancelled) {
+          await nextAnimationFrame();
+          const canvas = document.querySelector("canvas");
+          if (!canvas) continue;
+          const dpr = window.devicePixelRatio || 1;
+          const viewportWidth = window.innerWidth;
+          const viewportHeight = window.innerHeight;
+          const expectedWidth = Math.round(viewportWidth * dpr);
+          const expectedHeight = Math.round(viewportHeight * dpr);
+          if (!imageWidth || !imageHeight || canvas.width !== expectedWidth || canvas.height !== expectedHeight) {
+            stableFrames = 0;
+            continue;
+          }
+          const sample = [viewportWidth, viewportHeight, dpr, canvas.width, canvas.height, imageWidth, imageHeight].join(":");
+          stableFrames = sample === previous ? stableFrames + 1 : 0;
+          previous = sample;
+          if (stableFrames >= 2) {
+            return {
+              captureId,
+              viewportWidth,
+              viewportHeight,
+              dpr,
+              canvasWidth: canvas.width,
+              canvasHeight: canvas.height,
+              imageWidth,
+              imageHeight,
+            };
+          }
+        }
+        throw new Error("Overlay synchronization was cancelled");
+      })(),
+      new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(
+          () => {
+            cancelled = true;
+            reject(new Error("Overlay viewport, DPI, and canvas did not stabilize before presentation"));
+          },
+          1800,
+        );
+      }),
+    ]);
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 }
 
 /**
@@ -96,7 +147,6 @@ async function loadFrameImage(): Promise<FrameImage | null> {
 }
 
 export const App: React.FC = () => {
-  const [displayInfo, setDisplayInfo] = useState<DisplayInfo | null>(null);
   const [backgroundImage, setBackgroundImage] = useState<FrameImage | null>(null);
   // Incremented together with each new frame so the overlay resets its session
   // in the very same React commit that installs the fresh screenshot.
@@ -141,10 +191,9 @@ export const App: React.FC = () => {
       const previous = backgroundImageRef.current;
       backgroundImageRef.current = image;
       flushSync(() => {
-        setDisplayInfo(payload.display);
         setBackgroundImage(image);
         setPresentationReady(false);
-        setCaptureToken((token) => token + 1);
+        setCaptureToken(payload.captureId);
       });
       if (previous !== image) releaseFrameImage(previous);
 
@@ -155,10 +204,11 @@ export const App: React.FC = () => {
         // WebView2 has presented the canvas to its native composition surface.
         // Keep the HWND hidden for one compositor frame so the first show
         // cannot expose the initial empty, dimmed canvas.
-        await waitForWebViewPaint();
+        const metrics = await waitForStableCanvas(image, payload.captureId);
         if (seq !== activationSeq.current) return;
 
-        await presentOverlay();
+        await acknowledgeOverlayRender(metrics);
+        await presentOverlay(payload.captureId);
         // Start the entry transition only after the native window is present
         // and the WebView has had a frame to render while its content is hidden.
         await nextAnimationFrame();
@@ -200,18 +250,10 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // The overlay canvas is laid out in CSS pixels, while the frozen screenshot
-  // is stored in physical pixels. `devicePixelRatio` is the authoritative
-  // CSS-to-device-pixel ratio for this webview and therefore the correct factor
-  // for mapping a selection onto the screenshot, even when the capture backend
-  // reports a different DPI scale.
-  const scaleFactor = window.devicePixelRatio || displayInfo?.scaleFactor || 1;
-
   return (
     <div className="w-screen h-screen overflow-hidden select-none">
       <OverlayContainer
         backgroundImage={backgroundImage}
-        scaleFactor={scaleFactor}
         captureToken={captureToken}
         presentationReady={presentationReady}
       />

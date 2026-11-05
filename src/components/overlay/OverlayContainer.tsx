@@ -7,6 +7,7 @@ import React, {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Point, Rect, DragState, HandleType } from "../../types/crop";
 import {
   ToolType,
@@ -54,14 +55,12 @@ function prefersReducedMotion(): boolean {
 
 interface OverlayContainerProps {
   backgroundImage: ImageBitmap | HTMLImageElement | null;
-  scaleFactor: number;
   captureToken: number;
   presentationReady: boolean;
 }
 
 export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   backgroundImage,
-  scaleFactor,
   captureToken,
   presentationReady,
 }) => {
@@ -71,7 +70,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   // physical pixels (`css * dpr`) so the screenshot is rendered crisply at the
   // display's native resolution, while all interaction coordinates stay in CSS
   // pixels (the canvas context is scaled by `dpr` in `renderCanvas`).
-  const dpr = window.devicePixelRatio || 1;
+  const [dpr, setDpr] = useState(() => window.devicePixelRatio || 1);
 
   // Crop & interaction state
   const [crop, setCrop] = useState<Rect | null>(null);
@@ -144,16 +143,30 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     width: window.innerWidth,
     height: window.innerHeight,
   });
+  const imageScale = getImageScale(backgroundImage, windowSize.width);
 
   // Track window resize
   useEffect(() => {
     const handleResize = () => {
       setWindowSize({ width: window.innerWidth, height: window.innerHeight });
+      setDpr(window.devicePixelRatio || 1);
     };
     window.addEventListener("resize", handleResize);
+    let disposed = false;
+    let unlistenResize: (() => void) | undefined;
+    let unlistenScale: (() => void) | undefined;
+    const currentWindow = getCurrentWindow();
+    void currentWindow.onResized(() => handleResize()).then((unlisten) => {
+      if (disposed) unlisten(); else unlistenResize = unlisten;
+    }).catch(() => {});
+    void currentWindow.onScaleChanged(({ payload }) => {
+      setDpr(payload.scaleFactor || window.devicePixelRatio || 1);
+      handleResize();
+    }).then((unlisten) => {
+      if (disposed) unlisten(); else unlistenScale = unlisten;
+    }).catch(() => {});
 
     // Tear down safely even if registration resolves after unmount (StrictMode).
-    let disposed = false;
     let unlistenSettings: (() => void) | null = null;
     listen("open_shortcut_settings", () => {
       setIsSettingsOpen(true);
@@ -170,6 +183,8 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     return () => {
       disposed = true;
       window.removeEventListener("resize", handleResize);
+      unlistenResize?.();
+      unlistenScale?.();
       unlistenSettings?.();
       unlistenSettings = null;
     };
@@ -362,7 +377,6 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage)
       return;
     try {
-      const imageScale = getImageScale(backgroundImage, windowSize.width);
       const bytes = composeCropRgba(
         crop,
         elements,
@@ -408,7 +422,6 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage)
       return;
     try {
-      const imageScale = getImageScale(backgroundImage, windowSize.width);
       const bytes = composeCropRgba(
         crop,
         elements,
@@ -454,7 +467,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     if (!crop || crop.width <= 0 || crop.height <= 0) return;
     setOcrLoading(true);
     try {
-      const text = await extractOcrText(crop, scaleFactor);
+      const text = await extractOcrText(crop, imageScale);
       setOcrLoading(false);
       setToastMessage(`OCR Extracted (${text.length} chars)`);
       setTimeout(() => setToastMessage(null), 2500);
@@ -466,7 +479,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       setToastMessage(message);
       setTimeout(() => setToastMessage(null), 3500);
     }
-  }, [crop, scaleFactor]);
+  }, [crop, imageScale]);
 
   const handleClose = useCallback(() => {
     requestClose();
@@ -791,7 +804,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       />
 
       {/* Live Dimension Badge */}
-      {crop && <DimensionBadge crop={crop} scaleFactor={scaleFactor} />}
+      {crop && <DimensionBadge crop={crop} scaleFactor={imageScale} />}
 
       {/* Floating Toolbar */}
       {crop && dragState.mode === "none" && !currentDrawing && (

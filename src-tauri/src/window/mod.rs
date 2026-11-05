@@ -1,4 +1,4 @@
-use crate::app_state::{AppState, DisplayBounds};
+use crate::app_state::{AppState, DisplayBounds, NativeOverlayGeometry, OverlayGeometrySignature};
 use crate::capture::capture_screen;
 use log::{debug, error, info, warn};
 use serde::Serialize;
@@ -16,6 +16,8 @@ pub const OVERLAY_LABEL: &str = "overlay-main";
 /// overlay is never shown with stale pixels or a stale selection.
 #[derive(Clone, Debug, Serialize)]
 pub struct CaptureReadyPayload {
+    #[serde(rename = "captureId")]
+    pub capture_id: u64,
     #[serde(rename = "triggeredAt")]
     pub triggered_at_ms: u64,
     pub display: crate::app_state::DisplayInfo,
@@ -206,8 +208,6 @@ pub fn prime_overlay(app_handle: &AppHandle, state: &AppState) {
     if let Some(bounds) = bounds {
         if let Err(e) = apply_overlay_geometry(&window, &bounds) {
             warn!("Failed to prime overlay geometry: {e}");
-        } else {
-            state.set_last_overlay_bounds(bounds);
         }
     }
 
@@ -224,12 +224,12 @@ pub fn prime_overlay(app_handle: &AppHandle, state: &AppState) {
 pub fn activate_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
     let activation_started = Instant::now();
 
-    if !state.try_begin_session() {
+    let Some(capture_id) = state.try_begin_session() else {
         info!("Ignoring activation: a screenshot session is already active");
         return Ok(());
-    }
+    };
 
-    match prepare_overlay(app_handle, state, activation_started) {
+    match prepare_overlay(app_handle, state, capture_id, activation_started) {
         Ok(()) => Ok(()),
         Err(err) => {
             // Never leave the lock held when initialization fails.
@@ -242,6 +242,7 @@ pub fn activate_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), 
 fn prepare_overlay(
     app_handle: &AppHandle,
     state: &AppState,
+    capture_id: u64,
     activation_started: Instant,
 ) -> Result<(), String> {
     info!("Activating screenshot overlay...");
@@ -258,16 +259,37 @@ fn prepare_overlay(
         e
     })?;
 
-    let bounds = frame.display_info.bounds.clone();
-    let frame = state.set_frame(frame);
-    let payload = payload_for_frame(&frame);
+    let frame = state.set_frame(frame, capture_id);
+    let payload = payload_for_frame(&frame, capture_id);
 
     // Geometry is applied while the window is still hidden, so the webview has
     // already laid out at the target size by the time it becomes visible.
-    if state.overlay_geometry_changed(&bounds) {
-        apply_overlay_geometry(&window, &bounds)?;
-        state.set_last_overlay_bounds(bounds);
+    let before = overlay_geometry_signature(&window, &frame)?;
+    if state.overlay_geometry_changed(&before) && !native_geometry_matches_frame(&before, &frame) {
+        apply_overlay_geometry(&window, &frame.display_info.bounds)?;
     }
+    let after = overlay_geometry_signature(&window, &frame)?;
+    if after.native.width.abs_diff(frame.width) > 2
+        || after.native.height.abs_diff(frame.height) > 2
+    {
+        return Err(format!(
+            "Native overlay size {}x{} does not match captured frame {}x{}",
+            after.native.width, after.native.height, frame.width, frame.height
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    if (after.native.x as f64 - frame.display_info.bounds.x).abs() > 1.0
+        || (after.native.y as f64 - frame.display_info.bounds.y).abs() > 1.0
+    {
+        return Err(format!(
+            "Native overlay origin ({}, {}) does not match selected display origin ({}, {})",
+            after.native.x,
+            after.native.y,
+            frame.display_info.bounds.x,
+            frame.display_info.bounds.y
+        ));
+    }
+    state.set_last_overlay_geometry(after);
 
     debug!(
         "[perf] native prepare: {} ({:.1}ms since activation start)",
@@ -287,8 +309,28 @@ fn prepare_overlay(
     Ok(())
 }
 
-fn payload_for_frame(frame: &crate::app_state::CapturedFrame) -> CaptureReadyPayload {
+fn native_geometry_matches_frame(
+    signature: &OverlayGeometrySignature,
+    frame: &crate::app_state::CapturedFrame,
+) -> bool {
+    let native = &signature.native;
+    let size_matches =
+        native.width.abs_diff(frame.width) <= 2 && native.height.abs_diff(frame.height) <= 2;
+    let scale_matches = (native.scale_factor - frame.display_info.scale_factor).abs() < 0.01;
+    #[cfg(target_os = "macos")]
+    let origin_matches = true;
+    #[cfg(not(target_os = "macos"))]
+    let origin_matches = (native.x as f64 - frame.display_info.bounds.x).abs() <= 1.0
+        && (native.y as f64 - frame.display_info.bounds.y).abs() <= 1.0;
+    size_matches && scale_matches && origin_matches
+}
+
+fn payload_for_frame(
+    frame: &crate::app_state::CapturedFrame,
+    capture_id: u64,
+) -> CaptureReadyPayload {
     CaptureReadyPayload {
+        capture_id,
         triggered_at_ms: frame.triggered_at_ms,
         display: frame.display_info.clone(),
         capture_ms: frame.capture_ms,
@@ -318,7 +360,10 @@ pub fn overlay_frontend_ready(app_handle: &AppHandle, state: &AppState) -> Resul
     let frame = state
         .get_frame()
         .ok_or_else(|| "Pending capture event has no captured frame".to_string())?;
-    emit_capture_ready(&window, payload_for_frame(&frame))?;
+    let capture_id = state
+        .current_capture_id()
+        .ok_or_else(|| "Pending capture has no id".to_string())?;
+    emit_capture_ready(&window, payload_for_frame(&frame, capture_id))?;
     info!("Delivered the first queued capture after overlay listener registration");
     Ok(())
 }
@@ -336,13 +381,19 @@ fn summarize(payload: &CaptureReadyPayload) -> String {
 
 /// Second phase of an activation: the frontend has reset its session and
 /// decoded the fresh frame, so the pre-created window can be presented.
-pub fn present_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), String> {
+pub fn present_overlay(
+    app_handle: &AppHandle,
+    state: &AppState,
+    capture_id: u64,
+) -> Result<(), String> {
     let window = app_handle
         .get_webview_window(OVERLAY_LABEL)
         .ok_or_else(|| "Overlay window not found".to_string())?;
 
-    if !state.is_session_active() {
-        return Err("No active capture session".to_string());
+    if !state.is_capture_render_ready(capture_id) {
+        return Err(
+            "Capture is not current or frontend has not confirmed stable rendering".to_string(),
+        );
     }
 
     if state.get_frame().is_none() {
@@ -398,6 +449,130 @@ pub fn present_overlay(app_handle: &AppHandle, state: &AppState) -> Result<(), S
 
     debug!("[perf] overlay presented (window visible and focused)");
     Ok(())
+}
+
+fn overlay_geometry_signature(
+    window: &WebviewWindow,
+    frame: &crate::app_state::CapturedFrame,
+) -> Result<OverlayGeometrySignature, String> {
+    let position = window
+        .outer_position()
+        .map_err(|e| format!("Failed to read overlay position: {e}"))?;
+    let size = window
+        .inner_size()
+        .map_err(|e| format!("Failed to read overlay size: {e}"))?;
+    let scale_factor = window
+        .scale_factor()
+        .map_err(|e| format!("Failed to read overlay scale factor: {e}"))?;
+    Ok(OverlayGeometrySignature {
+        monitor_id: frame.display_info.id,
+        monitor_name: frame.display_info.name.clone(),
+        bounds: frame.display_info.bounds.clone(),
+        scale_factor: frame.display_info.scale_factor,
+        physical_width: frame.display_info.physical_width,
+        physical_height: frame.display_info.physical_height,
+        frame_width: frame.width,
+        frame_height: frame.height,
+        native: NativeOverlayGeometry {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+            scale_factor,
+        },
+    })
+}
+
+pub fn acknowledge_overlay_render(
+    state: &AppState,
+    capture_id: u64,
+    viewport_width: f64,
+    viewport_height: f64,
+    dpr: f64,
+    canvas_width: u32,
+    canvas_height: u32,
+    image_width: u32,
+    image_height: u32,
+) -> Result<(), String> {
+    let frame = state
+        .get_frame()
+        .ok_or_else(|| "No captured frame is ready".to_string())?;
+    if !state.is_active_capture(capture_id) {
+        return Err("Capture was superseded before render acknowledgement".to_string());
+    }
+    validate_overlay_render_metrics(
+        viewport_width,
+        viewport_height,
+        dpr,
+        canvas_width,
+        canvas_height,
+        image_width,
+        image_height,
+        frame.width,
+        frame.height,
+    )?;
+    state.mark_capture_render_ready(capture_id)
+}
+
+fn validate_overlay_render_metrics(
+    viewport_width: f64,
+    viewport_height: f64,
+    dpr: f64,
+    canvas_width: u32,
+    canvas_height: u32,
+    image_width: u32,
+    image_height: u32,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<(), String> {
+    if ![viewport_width, viewport_height, dpr]
+        .iter()
+        .all(|n| n.is_finite() && *n > 0.0)
+    {
+        return Err("Frontend reported invalid viewport or device pixel ratio".to_string());
+    }
+    if image_width != frame_width || image_height != frame_height {
+        return Err("Rendered image dimensions do not match the captured frame".to_string());
+    }
+    let expected_canvas_width = (viewport_width * dpr).round();
+    let expected_canvas_height = (viewport_height * dpr).round();
+    if (canvas_width as f64 - expected_canvas_width).abs() > 1.0
+        || (canvas_height as f64 - expected_canvas_height).abs() > 1.0
+    {
+        return Err(
+            "Canvas backing dimensions have not synchronized with the viewport and DPI".to_string(),
+        );
+    }
+    if (expected_canvas_width - frame_width as f64).abs() > 2.0
+        || (expected_canvas_height - frame_height as f64).abs() > 2.0
+    {
+        return Err(format!(
+            "Overlay viewport/DPI ({expected_canvas_width:.0}x{expected_canvas_height:.0}) does not match captured frame ({}x{})",
+            frame_width, frame_height
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_overlay_render_metrics;
+
+    #[test]
+    fn render_metrics_accept_matching_dpi_and_reject_stale_geometry() {
+        assert!(validate_overlay_render_metrics(
+            1536.0, 864.0, 1.25, 1920, 1080, 1920, 1080, 1920, 1080
+        )
+        .is_ok());
+        assert!(validate_overlay_render_metrics(
+            1536.0, 864.0, 1.0, 1536, 864, 1920, 1080, 1920, 1080
+        )
+        .is_err());
+        assert!(validate_overlay_render_metrics(
+            1600.0, 900.0, 1.1, 1920, 1080, 1920, 1080, 1920, 1080
+        )
+        .is_err());
+    }
 }
 
 /// Reports a failed capture through the system log and gives macOS users an

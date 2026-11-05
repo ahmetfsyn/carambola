@@ -128,6 +128,7 @@ pub fn run() {
             commands::save_crop_image,
             commands::hide_overlay,
             commands::present_overlay,
+            commands::acknowledge_overlay_render,
             commands::extract_ocr,
             commands::get_shortcut,
             commands::set_shortcut,

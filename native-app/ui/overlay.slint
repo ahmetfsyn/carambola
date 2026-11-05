@@ -1,0 +1,157 @@
+export component OverlayPrototype inherits Window {
+    title: "Carambola screenshot selection";
+    in property <length> frame-viewport-width: 1280px;
+    in property <length> frame-viewport-height: 720px;
+    width: root.frame-viewport-width;
+    height: root.frame-viewport-height;
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+
+    in property <image> captured-image;
+    in property <length> selection-x: 0px;
+    in property <length> selection-y: 0px;
+    in property <length> selection-width: 0px;
+    in property <length> selection-height: 0px;
+    in property <bool> annotation-mode: false;
+    in property <image> annotation-image;
+    in property <int> selected-tool: 0;
+
+    callback pointer-down(float, float, float, float);
+    callback pointer-move(float, float, float, float);
+    callback pointer-up(float, float, float, float);
+    callback cancel-selection();
+    callback focus-selection();
+    callback tool-selected(int);
+    callback finish-annotations();
+
+    focus-selection => { escape-scope.focus(); }
+
+    changed visible => {
+        if (self.visible) {
+            escape-scope.focus();
+        }
+    }
+
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.captured-image;
+        image-fit: fill;
+    }
+
+    // Four masks preserve the captured screenshot inside the selection and
+    // darken the rest without re-copying or re-capturing pixels during drag.
+    Rectangle { x: 0px; y: 0px; width: parent.width; height: root.selection-y; background: #07101d88; }
+    Rectangle { x: 0px; y: root.selection-y + root.selection-height; width: parent.width; height: parent.height - root.selection-y - root.selection-height; background: #07101d88; }
+    Rectangle { x: 0px; y: root.selection-y; width: root.selection-x; height: root.selection-height; background: #07101d88; }
+    Rectangle { x: root.selection-x + root.selection-width; y: root.selection-y; width: parent.width - root.selection-x - root.selection-width; height: root.selection-height; background: #07101d88; }
+
+    Image {
+        x: root.selection-x;
+        y: root.selection-y;
+        width: root.selection-width;
+        height: root.selection-height;
+        source: root.annotation-image;
+        image-fit: fill;
+        visible: root.annotation-mode;
+    }
+
+    Rectangle {
+        x: root.selection-x;
+        y: root.selection-y;
+        width: root.selection-width;
+        height: root.selection-height;
+        background: transparent;
+        border-color: #ffffff;
+        border-width: 1px;
+    }
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        // Keep the fullscreen capture surface's cursor explicit and visible
+        // across the hidden-window -> overlay focus transition.
+        mouse-cursor: crosshair;
+        changed pressed => {
+            if (self.pressed) {
+                root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px);
+            } else {
+                root.pointer-up(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px);
+            }
+        }
+        moved => { root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px); }
+    }
+
+    // Compact annotation toolbar. It is placed after the full-window touch
+    // area so the buttons receive clicks without starting a drawing stroke.
+    Rectangle {
+        x: min(root.selection-x, parent.width - 360px);
+        y: root.selection-y > 48px
+            ? root.selection-y - 48px
+            : root.selection-y + root.selection-height + 8px;
+        width: 360px;
+        height: 40px;
+        visible: root.annotation-mode;
+        background: #111827ee;
+        border-color: #64748b;
+        border-width: 1px;
+        border-radius: 5px;
+
+        for tool[i] in ["Pen", "Arrow", "Rect", "Triangle", "Ellipse"]: Rectangle {
+            Rectangle {
+                x: 4px + i * 58px;
+                y: 4px;
+                width: 56px;
+                height: 32px;
+                background: root.selected-tool == i ? #2563eb : #334155;
+                border-radius: 3px;
+                Text {
+                    text: tool;
+                    color: white;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.tool-selected(i); }
+                }
+            }
+        }
+
+        Rectangle {
+            x: 296px;
+            y: 4px;
+            width: 60px;
+            height: 32px;
+            background: #15803d;
+            border-radius: 3px;
+            Text {
+                text: "Done";
+                color: white;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.finish-annotations(); }
+            }
+        }
+    }
+
+    escape-scope := FocusScope {
+        width: 1px;
+        height: 1px;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.cancel-selection();
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+}
+
