@@ -65,23 +65,37 @@ fn refresh_annotation_preview(
     crop_slot: &Arc<Mutex<Option<CapturedFrame>>>,
     editor_slot: &Arc<Mutex<Option<AnnotationEditor>>>,
 ) -> Result<(), &'static str> {
-    let crop_dimensions = crop_slot
-        .lock()
-        .expect("selected crop lock")
-        .as_ref()
-        .map(|crop| (crop.width(), crop.height()));
-    let Some((width, height)) = crop_dimensions else {
+    let crop = crop_slot.lock().expect("selected crop lock").clone();
+    let Some(crop) = crop else {
         return Err("selected crop is no longer available");
     };
-    let annotations = editor_slot
-        .lock()
-        .expect("annotation editor lock")
-        .as_ref()
-        .map(|editor| editor.annotations_for_render(StrokeStyle::default()))
-        .ok_or("annotation editor is no longer available")?;
-    let layer = annotation_render::render(&annotations, width, height)?;
-    overlay.set_annotation_image(image_from_rgba(layer.pixels(), width, height));
+    let (annotations, can_undo, can_redo) = {
+        let guard = editor_slot.lock().expect("annotation editor lock");
+        let Some(editor) = guard.as_ref() else {
+            return Err("annotation editor is no longer available");
+        };
+        (
+            editor.annotations_for_render(StrokeStyle::default()),
+            editor.can_undo(),
+            editor.can_redo(),
+        )
+    };
+    let rendered = annotation_render::render_composite(&crop, &annotations)?;
+    let output = image_from_rgba(rendered.pixels(), rendered.width(), rendered.height());
+    overlay.set_annotation_image(output);
+    overlay.set_can_undo(can_undo);
+    overlay.set_can_redo(can_redo);
     Ok(())
+}
+
+fn update_preview_if_possible(
+    overlay: &OverlayPrototype,
+    crop_slot: &Arc<Mutex<Option<CapturedFrame>>>,
+    editor_slot: &Arc<Mutex<Option<AnnotationEditor>>>,
+) {
+    if let Err(error) = refresh_annotation_preview(overlay, crop_slot, editor_slot) {
+        log::warn!("Could not render annotation preview: {error}");
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -104,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selected_crop = Arc::new(Mutex::new(None::<CapturedFrame>));
     let selection_bounds = Arc::new(Mutex::new(None::<LogicalRect>));
     let annotation_editor = Arc::new(Mutex::new(None::<AnnotationEditor>));
+    let pending_text_position = Arc::new(Mutex::new(None::<ImagePoint>));
     let selection = Arc::new(Mutex::new(Selection::default()));
     let capture_session = Arc::new(CaptureSession::default());
 
@@ -113,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crop_slot = selected_crop.clone();
     let bounds_slot = selection_bounds.clone();
     let editor_slot = annotation_editor.clone();
+    let text_position_slot = pending_text_position.clone();
     let selection_slot = selection.clone();
     let active_flag = capture_session.clone();
     settings.on_open_overlay(move || {
@@ -125,10 +141,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         crop_slot.lock().expect("selected crop lock").take();
         *bounds_slot.lock().expect("selection bounds lock") = None;
         *editor_slot.lock().expect("annotation editor lock") = None;
+        *text_position_slot.lock().expect("text position lock") = None;
         *selection_slot.lock().expect("selection lock") = Selection::default();
         if let Some(overlay) = weak_overlay.upgrade() {
             overlay.set_annotation_mode(false);
             overlay.set_annotation_image(Image::default());
+            overlay.set_text_entry_visible(false);
+            overlay.set_text_entry_value(String::new().into());
+            overlay.set_can_undo(false);
+            overlay.set_can_redo(false);
             overlay.set_selection_x(0.0);
             overlay.set_selection_y(0.0);
             overlay.set_selection_width(0.0);
@@ -272,6 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crop_slot = selected_crop.clone();
     let bounds_slot = selection_bounds.clone();
     let editor_slot = annotation_editor.clone();
+    let text_position_slot = pending_text_position.clone();
     let selection_slot = selection.clone();
     let active_flag = capture_session.clone();
     overlay.on_cancel_selection(move || {
@@ -283,6 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         crop_slot.lock().expect("selected crop lock").take();
         *bounds_slot.lock().expect("selection bounds lock") = None;
         *editor_slot.lock().expect("annotation editor lock") = None;
+        *text_position_slot.lock().expect("text position lock") = None;
         selection_slot.lock().expect("selection lock").cancel();
         if let Some(settings) = weak_settings.upgrade() {
             set_status(&settings, "Capture cancelled. Ready for another capture.");
@@ -291,6 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(overlay) = weak_overlay.upgrade() {
             overlay.set_annotation_mode(false);
             overlay.set_annotation_image(Image::default());
+            overlay.set_text_entry_visible(false);
             overlay.window().set_fullscreen(false);
             let _ = overlay.hide();
             overlay.set_captured_image(Image::default());
@@ -301,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak_overlay = overlay.as_weak();
     let selection_slot = selection.clone();
     let editor_slot = annotation_editor.clone();
+    let text_position_slot = pending_text_position.clone();
     let bounds_slot = selection_bounds.clone();
     let crop_slot = selected_crop.clone();
     let active_flag = capture_session.clone();
@@ -329,6 +354,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Ok(Some(point)) = point else {
                 return;
             };
+            if editor_slot
+                .lock()
+                .expect("annotation editor lock")
+                .as_ref()
+                .is_some_and(|editor| editor.active_tool() == AnnotationTool::Text)
+            {
+                *text_position_slot.lock().expect("text position lock") = Some(point);
+                overlay.set_text_entry_value(String::new().into());
+                overlay.set_text_entry_x((x + 8.0).max(0.0) as f32);
+                overlay.set_text_entry_y((y + 8.0).min(height - 52.0).max(0.0) as f32);
+                overlay.set_text_entry_visible(true);
+                return;
+            }
             if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
                 editor.begin(point);
             }
@@ -420,11 +458,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bounds_slot = selection_bounds.clone();
     let selection_slot = selection.clone();
     let editor_slot = annotation_editor.clone();
+    let text_position_slot = pending_text_position.clone();
     let active_flag = capture_session.clone();
     overlay.on_pointer_up(move |x, y, width, height| {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
+        if text_position_slot
+            .lock()
+            .expect("text position lock")
+            .is_some()
+        {
+            return;
+        }
         if editor_slot
             .lock()
             .expect("annotation editor lock")
@@ -544,6 +590,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
+    let crop_slot = selected_crop.clone();
+    let editor_slot = annotation_editor.clone();
+    let text_position_slot = pending_text_position.clone();
+    overlay.on_submit_text(move |text| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        overlay.set_text_entry_visible(false);
+        let position = text_position_slot
+            .lock()
+            .expect("text position lock")
+            .take();
+        let Some(position) = position else {
+            return;
+        };
+        let dimensions = crop_slot
+            .lock()
+            .expect("selected crop lock")
+            .as_ref()
+            .map(|crop| (crop.width(), crop.height()));
+        let Some((width, height)) = dimensions else {
+            return;
+        };
+        let result = match editor_slot.lock().expect("annotation editor lock").as_mut() {
+            Some(editor) => editor.add_text(position, text.to_string(), width, height),
+            None => Err("annotation editor is no longer available"),
+        };
+        match result {
+            Ok(_) => update_preview_if_possible(&overlay, &crop_slot, &editor_slot),
+            Err(error) => log::warn!("Could not add text annotation: {error}"),
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let text_position_slot = pending_text_position.clone();
+    overlay.on_cancel_text(move || {
+        *text_position_slot.lock().expect("text position lock") = None;
+        if let Some(overlay) = weak_overlay.upgrade() {
+            overlay.set_text_entry_visible(false);
+            overlay.set_text_entry_value(String::new().into());
+            overlay.invoke_focus_selection();
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let crop_slot = selected_crop.clone();
+    let editor_slot = annotation_editor.clone();
+    overlay.on_undo_annotation(move || {
+        if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
+            editor.undo();
+        }
+        if let Some(overlay) = weak_overlay.upgrade() {
+            update_preview_if_possible(&overlay, &crop_slot, &editor_slot);
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let crop_slot = selected_crop.clone();
+    let editor_slot = annotation_editor.clone();
+    overlay.on_redo_annotation(move || {
+        if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
+            editor.redo();
+        }
+        if let Some(overlay) = weak_overlay.upgrade() {
+            update_preview_if_possible(&overlay, &crop_slot, &editor_slot);
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
     let weak_settings = settings.as_weak();
     let frame_slot = captured_frame.clone();
     let crop_slot = selected_crop.clone();
@@ -573,6 +688,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(overlay) = weak_overlay.upgrade() {
             overlay.set_annotation_mode(false);
             overlay.set_annotation_image(Image::default());
+            overlay.set_text_entry_visible(false);
             overlay.window().set_fullscreen(false);
             let _ = overlay.hide();
             platform::diagnose_cursor("done after close");
@@ -586,9 +702,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let session_for_dispatch = active_flag.clone();
         std::thread::spawn(move || {
             let saved = (|| {
-                let layer = annotation_render::render(&annotations, crop.width(), crop.height())
+                let output = annotation_render::render_composite(&crop, &annotations)
                     .map_err(str::to_owned)?;
-                let output = annotation_render::composite(&crop, &layer).map_err(str::to_owned)?;
                 let output_path = crop_output_path();
                 std::fs::create_dir_all(output_path.parent().expect("temp path parent"))
                     .map_err(|error| error.to_string())?;

@@ -3,12 +3,19 @@
 Status: Phase A audit complete. Phase B Slint/Winit prototype builds. Phase C
 passed capture, exact crop-to-PNG verification, Escape cancellation, and a
 subsequent capture/crop at the available 125% scale. Phase 4.1's annotation
-model, renderer, preview, and compositing code pass offline checks; full Windows
-interactive annotation/export verification remains open.
+foundation and Phase 5's annotation completion are implemented. Phase 5 passed
+`cargo fmt --check`, `cargo check --offline`, all 35 `cargo test --offline`
+tests, `git diff --check`, and the Windows `cargo build --offline --release`.
+The user manually confirmed Text, Mosaic, Undo/Redo, existing annotation tools,
+and PNG export.
+The final review then corrected lowercase glyph rendering and mosaic painter
+ordering; those two output cases passed automated tests and the Release build
+but have not yet been manually retested.
 Runtime tests at 100% and 150%, mixed-DPI displays, macOS capture, monitor
 selection, and the remaining product features are still open.
 
-This migration is being developed on `codex/native-rust-migration`. The existing
+Phase 5 annotation completion is being reviewed on
+`feat/native-annotation-completion`. The existing
 Tauri application remains the behavioral reference and release implementation
 until the native application has passed the parity and runtime gates below.
 Nothing in this plan authorizes publishing or replacing the v1.0.0 release.
@@ -107,7 +114,8 @@ verified. Audit does not count as migration.
 - [ ] Native tray and global shortcut on Windows and macOS.
 - [x] Transparent full-screen selection overlay prototype on Windows; macOS remains untested.
 - [x] Windows primary-display capture and physical-pixel crop geometry contract; dynamic monitor and mixed-DPI synchronization remain open.
-- [x] Rust annotation data model, image-space coordinate mapping, five-tool software rendering, Slint preview, and fresh-frame compositing interface; Windows interactive drawing/export verification remains open.
+- [x] Phase 4.1 Rust annotation data model, image-space coordinate mapping, five-tool software rendering, Slint preview, and fresh-frame compositing interface.
+- [x] Phase 5 Text and Mosaic annotations, shared Undo/Redo history, and common preview/export compositing; offline tests and Windows Release build passed, and the user manually verified Text, Mosaic, Undo/Redo, the existing tools, and PNG export. The final review's lowercase-glyph and painter-order corrections passed tests/build but await manual spot-check.
 - [ ] Native clipboard, local save, Windows OCR and macOS Vision OCR.
 - [ ] Settings, notification, startup, config migration, version/About.
 - [ ] Single-instance and native update/installer strategy.
@@ -148,17 +156,22 @@ verified. Audit does not count as migration.
    **Phase 4.1 — Annotation foundation:** added a framework-independent model
    with stable IDs/z-order and selected-crop physical-pixel geometry; viewport
    mapping feeds a separate transparent renderer for pen, arrow, rectangle,
-   triangle, and ellipse. The native overlay now keeps the crop immutable while
-   previewing strokes and composites a fresh output frame on Done. All 26
-   offline tests pass, including renderer geometry, arrow direction, scale
-   mapping, and source immutability. A Phase C debug build previously captured
-   the desktop and displayed the selection overlay, but that run predates this
-   annotation code. The Phase 4.1 release build started; capture then failed
-   because the Windows adapter found the still-running debug process by its old
-   window title. The source title lookup is now synchronized, but the release
-   executable remained locked by the running test process, so the updated build
-   could not be relaunched. Selection, drawing, Escape, and export remain NOT
-   TESTED for Phase 4.1.
+   triangle, and ellipse. The native overlay keeps the crop immutable while
+   previewing strokes and composites a fresh output frame on Done.
+   **Phase 5 — Native annotation completion:** added Text and Mosaic
+   annotations and one shared undo/redo history across all annotation types.
+   Preview and PNG export use the same deterministic compositor against the
+   original selected crop; mosaic effects and vector/text marks follow document
+   painter order. Offline automated checks cover text rendering, mosaic bounds
+   and pixelation, painter order, history branching, and source immutability;
+   35 tests passed. `cargo fmt --check`, `cargo check --offline`,
+   `git diff --check`, and `cargo build --offline --release` also passed.
+   The Windows Release executable built successfully, and the user manually
+   confirmed Text, Mosaic, Undo/Redo, the existing annotation tools, and PNG
+   export. The final review then corrected lowercase glyph rendering and
+   mosaic painter ordering; both are automated-test and Release-build verified,
+   but not manually retested. These checks cover the available Windows setup
+   only; the DPI/display matrix and all other migration features remain open.
 4. **D — Remaining product features:** migrate clipboard/save, OCR, tray/hotkey,
    settings/config, startup, notifications, About, and updater/package flows.
 5. **E — Removal:** only after Windows and macOS build/runtime parity passes,

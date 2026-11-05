@@ -1,3 +1,5 @@
+import { LineEdit } from "std-widgets.slint";
+
 export component OverlayPrototype inherits Window {
     title: "Carambola screenshot selection";
     in property <length> frame-viewport-width: 1280px;
@@ -16,6 +18,12 @@ export component OverlayPrototype inherits Window {
     in property <bool> annotation-mode: false;
     in property <image> annotation-image;
     in property <int> selected-tool: 0;
+    in property <bool> text-entry-visible: false;
+    in-out property <string> text-entry-value: "";
+    in property <length> text-entry-x: 0px;
+    in property <length> text-entry-y: 0px;
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
 
     callback pointer-down(float, float, float, float);
     callback pointer-move(float, float, float, float);
@@ -24,6 +32,10 @@ export component OverlayPrototype inherits Window {
     callback focus-selection();
     callback tool-selected(int);
     callback finish-annotations();
+    callback submit-text(string);
+    callback cancel-text();
+    callback undo-annotation();
+    callback redo-annotation();
 
     focus-selection => { escape-scope.focus(); }
 
@@ -31,6 +43,11 @@ export component OverlayPrototype inherits Window {
         if (self.visible) {
             escape-scope.focus();
         }
+    }
+
+    changed text-entry-visible => {
+        if (self.text-entry-visible) { text-input.focus(); }
+        else { escape-scope.focus(); }
     }
 
     Image {
@@ -86,11 +103,11 @@ export component OverlayPrototype inherits Window {
     // Compact annotation toolbar. It is placed after the full-window touch
     // area so the buttons receive clicks without starting a drawing stroke.
     Rectangle {
-        x: min(root.selection-x, parent.width - 360px);
+        x: min(root.selection-x, parent.width - 520px);
         y: root.selection-y > 48px
             ? root.selection-y - 48px
             : root.selection-y + root.selection-height + 8px;
-        width: 360px;
+        width: 520px;
         height: 40px;
         visible: root.annotation-mode;
         background: #111827ee;
@@ -98,11 +115,11 @@ export component OverlayPrototype inherits Window {
         border-width: 1px;
         border-radius: 5px;
 
-        for tool[i] in ["Pen", "Arrow", "Rect", "Triangle", "Ellipse"]: Rectangle {
+        for tool[i] in ["Pen", "Arrow", "Rect", "Triangle", "Ellipse", "Text", "Mosaic"]: Rectangle {
             Rectangle {
-                x: 4px + i * 58px;
+                x: 4px + i * 51px;
                 y: 4px;
-                width: 56px;
+                width: 50px;
                 height: 32px;
                 background: root.selected-tool == i ? #2563eb : #334155;
                 border-radius: 3px;
@@ -121,9 +138,31 @@ export component OverlayPrototype inherits Window {
         }
 
         Rectangle {
-            x: 296px;
+            x: 360px;
             y: 4px;
-            width: 60px;
+            width: 48px;
+            height: 32px;
+            background: root.can-undo ? #334155 : #1f2937;
+            border-radius: 3px;
+            Text { text: "Undo"; color: root.can-undo ? white : #64748b; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { enabled: root.can-undo; mouse-cursor: pointer; clicked => { root.undo-annotation(); } }
+        }
+
+        Rectangle {
+            x: 412px;
+            y: 4px;
+            width: 48px;
+            height: 32px;
+            background: root.can-redo ? #334155 : #1f2937;
+            border-radius: 3px;
+            Text { text: "Redo"; color: root.can-redo ? white : #64748b; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { enabled: root.can-redo; mouse-cursor: pointer; clicked => { root.redo-annotation(); } }
+        }
+
+        Rectangle {
+            x: 464px;
+            y: 4px;
+            width: 52px;
             height: 32px;
             background: #15803d;
             border-radius: 3px;
@@ -138,6 +177,36 @@ export component OverlayPrototype inherits Window {
                 mouse-cursor: pointer;
                 clicked => { root.finish-annotations(); }
             }
+        }
+    }
+
+    Rectangle {
+        x: min(root.text-entry-x, parent.width - 300px);
+        y: min(root.text-entry-y, parent.height - 52px);
+        width: 300px;
+        height: 44px;
+        visible: root.text-entry-visible;
+        background: #111827ee;
+        border-color: #64748b;
+        border-width: 1px;
+        border-radius: 5px;
+        text-input := LineEdit {
+            x: 4px; y: 4px; width: 198px; height: 34px;
+            text <=> root.text-entry-value;
+            placeholder-text: "Enter text";
+            accepted => { root.submit-text(self.text); }
+        }
+        Rectangle {
+            x: 206px; y: 4px; width: 44px; height: 34px;
+            background: #15803d; border-radius: 3px;
+            Text { text: "Add"; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { mouse-cursor: pointer; clicked => { root.submit-text(root.text-entry-value); } }
+        }
+        Rectangle {
+            x: 254px; y: 4px; width: 42px; height: 34px;
+            background: #334155; border-radius: 3px;
+            Text { text: "Cancel"; color: white; font-size: 9px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { mouse-cursor: pointer; clicked => { root.cancel-text(); } }
         }
     }
 
