@@ -84,6 +84,8 @@ pub enum AnnotationTool {
     Rectangle,
     Triangle,
     Ellipse,
+    Text,
+    Mosaic,
 }
 
 impl AnnotationTool {
@@ -94,6 +96,8 @@ impl AnnotationTool {
             2 => Some(Self::Rectangle),
             3 => Some(Self::Triangle),
             4 => Some(Self::Ellipse),
+            5 => Some(Self::Text),
+            6 => Some(Self::Mosaic),
             _ => None,
         }
     }
@@ -105,17 +109,39 @@ impl AnnotationTool {
             Self::Rectangle => 2,
             Self::Triangle => 3,
             Self::Ellipse => 4,
+            Self::Text => 5,
+            Self::Mosaic => 6,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AnnotationGeometry {
-    Pen { points: Vec<ImagePoint> },
-    Arrow { start: ImagePoint, end: ImagePoint },
-    Rectangle { bounds: ImageBounds },
-    Triangle { bounds: ImageBounds },
-    Ellipse { bounds: ImageBounds },
+    Pen {
+        points: Vec<ImagePoint>,
+    },
+    Arrow {
+        start: ImagePoint,
+        end: ImagePoint,
+    },
+    Rectangle {
+        bounds: ImageBounds,
+    },
+    Triangle {
+        bounds: ImageBounds,
+    },
+    Ellipse {
+        bounds: ImageBounds,
+    },
+    Text {
+        position: ImagePoint,
+        text: String,
+        font_size: f64,
+    },
+    Mosaic {
+        bounds: ImageBounds,
+        block_size: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,6 +192,31 @@ impl Annotation {
                     );
                 }
             }
+            AnnotationGeometry::Text {
+                position,
+                text,
+                font_size,
+            } => {
+                if text.trim().is_empty() || text.chars().count() > 2_048 {
+                    return Err("text annotation must contain 1..=2048 non-empty characters");
+                }
+                if !valid_point(*position) {
+                    return Err("text position must be within the selected image");
+                }
+                if !font_size.is_finite() || !(8.0..=256.0).contains(font_size) {
+                    return Err("text size must be finite and between 8 and 256 pixels");
+                }
+            }
+            AnnotationGeometry::Mosaic { bounds, block_size } => {
+                if !bounds.is_valid_for(width, height) {
+                    return Err(
+                        "mosaic bounds must be finite, non-empty, and within the selected image",
+                    );
+                }
+                if !(2..=128).contains(block_size) {
+                    return Err("mosaic block size must be between 2 and 128 pixels");
+                }
+            }
         }
         Ok(())
     }
@@ -173,21 +224,22 @@ impl Annotation {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AnnotationDocument {
-    annotations: Vec<Annotation>,
+    history: Vec<Annotation>,
+    cursor: usize,
     next_id: u64,
 }
 
 impl AnnotationDocument {
     pub fn annotations(&self) -> &[Annotation] {
-        &self.annotations
+        &self.history[..self.cursor]
     }
 
     pub fn len(&self) -> usize {
-        self.annotations.len()
+        self.cursor
     }
 
     pub fn is_empty(&self) -> bool {
-        self.annotations.is_empty()
+        self.cursor == 0
     }
 
     pub fn add(
@@ -199,7 +251,7 @@ impl AnnotationDocument {
     ) -> Result<u64, &'static str> {
         let annotation = Annotation {
             id: self.next_id,
-            order: self.annotations.len() as u64,
+            order: self.cursor as u64,
             geometry,
             style,
         };
@@ -209,9 +261,34 @@ impl AnnotationDocument {
             .next_id
             .checked_add(1)
             .ok_or("annotation id overflow")?;
-        self.annotations.push(annotation);
+        self.history.truncate(self.cursor);
+        self.history.push(annotation);
+        self.cursor += 1;
         self.next_id = next_id;
         Ok(id)
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        self.cursor -= 1;
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        if self.cursor >= self.history.len() {
+            return false;
+        }
+        self.cursor += 1;
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.cursor > 0
+    }
+    pub fn can_redo(&self) -> bool {
+        self.cursor < self.history.len()
     }
 }
 
@@ -275,6 +352,52 @@ impl AnnotationEditor {
         self.draft.is_some()
     }
 
+    pub fn active_tool(&self) -> AnnotationTool {
+        self.active_tool
+    }
+
+    pub fn add_text(
+        &mut self,
+        position: ImagePoint,
+        text: String,
+        width: u32,
+        height: u32,
+    ) -> Result<bool, &'static str> {
+        if text.trim().is_empty() {
+            return Ok(false);
+        }
+        self.document
+            .add(
+                AnnotationGeometry::Text {
+                    position,
+                    text,
+                    font_size: 24.0,
+                },
+                StrokeStyle::default(),
+                width,
+                height,
+            )
+            .map(|_| true)
+    }
+
+    pub fn undo(&mut self) -> bool {
+        self.draft = None;
+        self.document.undo()
+    }
+
+    pub fn redo(&mut self) -> bool {
+        self.draft = None;
+        self.document.redo()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.document.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.document.can_redo()
+    }
+
     pub fn select_tool(&mut self, tool: AnnotationTool) {
         self.active_tool = tool;
     }
@@ -321,11 +444,11 @@ impl AnnotationEditor {
     }
 
     pub fn annotations_for_render(&self, style: StrokeStyle) -> Vec<Annotation> {
-        let mut annotations = self.document.annotations.clone();
+        let mut annotations = self.document.annotations().to_vec();
         if let Some(draft) = &self.draft {
             annotations.push(Annotation {
                 id: u64::MAX,
-                order: self.document.annotations.len() as u64,
+                order: self.document.len() as u64,
                 geometry: draft.geometry(),
                 style,
             });
@@ -352,6 +475,15 @@ impl Draft {
             },
             AnnotationTool::Ellipse => AnnotationGeometry::Ellipse {
                 bounds: ImageBounds::from_points(self.start, self.current),
+            },
+            AnnotationTool::Text => AnnotationGeometry::Text {
+                position: self.start,
+                text: String::new(),
+                font_size: 24.0,
+            },
+            AnnotationTool::Mosaic => AnnotationGeometry::Mosaic {
+                bounds: ImageBounds::from_points(self.start, self.current),
+                block_size: 12,
             },
         }
     }
@@ -537,5 +669,95 @@ mod tests {
         assert!(!editor.is_drawing());
         assert!(!editor.finish(StrokeStyle::default(), 10, 10).unwrap());
         assert!(editor.document().is_empty());
+    }
+
+    #[test]
+    fn text_requires_content_and_keeps_its_image_position() {
+        let mut editor = AnnotationEditor::default();
+        assert!(!editor
+            .add_text(ImagePoint { x: 2.0, y: 3.0 }, "  ".into(), 20, 20)
+            .unwrap());
+        assert!(editor
+            .add_text(ImagePoint { x: 2.0, y: 3.0 }, "Hello".into(), 20, 20)
+            .unwrap());
+        assert_eq!(
+            editor.document().annotations()[0].geometry,
+            AnnotationGeometry::Text {
+                position: ImagePoint { x: 2.0, y: 3.0 },
+                text: "Hello".into(),
+                font_size: 24.0,
+            }
+        );
+        assert!(editor
+            .add_text(ImagePoint { x: 21.0, y: 0.0 }, "outside".into(), 20, 20)
+            .is_err());
+    }
+
+    #[test]
+    fn undo_redo_mixed_operations_and_new_operation_clears_redo() {
+        let mut editor = AnnotationEditor::default();
+        editor.begin(ImagePoint { x: 1.0, y: 1.0 });
+        editor.update(ImagePoint { x: 8.0, y: 8.0 });
+        assert!(editor.finish(StrokeStyle::default(), 32, 32).unwrap());
+        editor.select_tool(AnnotationTool::Mosaic);
+        editor.begin(ImagePoint { x: 10.0, y: 10.0 });
+        editor.update(ImagePoint { x: 18.0, y: 18.0 });
+        assert!(editor.finish(StrokeStyle::default(), 32, 32).unwrap());
+        assert!(editor
+            .add_text(ImagePoint { x: 2.0, y: 20.0 }, "A".into(), 32, 32)
+            .unwrap());
+        assert_eq!(editor.document().len(), 3);
+
+        assert!(editor.undo());
+        assert_eq!(editor.document().len(), 2);
+        assert!(editor.can_redo());
+        assert!(editor.redo());
+        assert_eq!(editor.document().len(), 3);
+        assert!(editor.undo());
+        editor.select_tool(AnnotationTool::Ellipse);
+        editor.begin(ImagePoint { x: 20.0, y: 2.0 });
+        editor.update(ImagePoint { x: 28.0, y: 12.0 });
+        assert!(editor.finish(StrokeStyle::default(), 32, 32).unwrap());
+        assert!(!editor.can_redo());
+        assert!(!editor.redo());
+        assert_eq!(editor.document().len(), 3);
+    }
+
+    #[test]
+    fn history_boundaries_are_safe_and_new_ids_remain_unique() {
+        let mut doc = AnnotationDocument::default();
+        assert!(!doc.undo());
+        assert!(!doc.redo());
+        let first = doc
+            .add(
+                AnnotationGeometry::Text {
+                    position: ImagePoint { x: 0.0, y: 0.0 },
+                    text: "one".into(),
+                    font_size: 12.0,
+                },
+                StrokeStyle::default(),
+                20,
+                20,
+            )
+            .unwrap();
+        assert!(doc.undo());
+        let second = doc
+            .add(
+                AnnotationGeometry::Mosaic {
+                    bounds: ImageBounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1.0,
+                        height: 1.0,
+                    },
+                    block_size: 2,
+                },
+                StrokeStyle::default(),
+                20,
+                20,
+            )
+            .unwrap();
+        assert!(second > first);
+        assert!(!doc.can_redo());
     }
 }
