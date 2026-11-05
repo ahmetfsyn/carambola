@@ -24,6 +24,8 @@ export component OverlayPrototype inherits Window {
     in property <length> text-entry-y: 0px;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
+    in property <bool> export-busy: false;
+    in property <string> export-status: "";
 
     callback pointer-down(float, float, float, float);
     callback pointer-move(float, float, float, float);
@@ -36,6 +38,8 @@ export component OverlayPrototype inherits Window {
     callback cancel-text();
     callback undo-annotation();
     callback redo-annotation();
+    callback save-png();
+    callback copy-image();
 
     focus-selection => { escape-scope.focus(); }
 
@@ -103,12 +107,12 @@ export component OverlayPrototype inherits Window {
     // Compact annotation toolbar. It is placed after the full-window touch
     // area so the buttons receive clicks without starting a drawing stroke.
     Rectangle {
-        x: min(root.selection-x, parent.width - 520px);
-        y: root.selection-y > 48px
-            ? root.selection-y - 48px
+        x: min(root.selection-x, parent.width - 620px);
+        y: root.selection-y > 72px
+            ? root.selection-y - 72px
             : root.selection-y + root.selection-height + 8px;
-        width: 520px;
-        height: 40px;
+        width: 620px;
+        height: 64px;
         visible: root.annotation-mode;
         background: #111827ee;
         border-color: #64748b;
@@ -138,9 +142,9 @@ export component OverlayPrototype inherits Window {
         }
 
         Rectangle {
-            x: 360px;
+            x: 364px;
             y: 4px;
-            width: 48px;
+            width: 45px;
             height: 32px;
             background: root.can-undo ? #334155 : #1f2937;
             border-radius: 3px;
@@ -149,9 +153,9 @@ export component OverlayPrototype inherits Window {
         }
 
         Rectangle {
-            x: 412px;
+            x: 413px;
             y: 4px;
-            width: 48px;
+            width: 45px;
             height: 32px;
             background: root.can-redo ? #334155 : #1f2937;
             border-radius: 3px;
@@ -160,23 +164,66 @@ export component OverlayPrototype inherits Window {
         }
 
         Rectangle {
-            x: 464px;
+            x: 462px;
             y: 4px;
-            width: 52px;
+            width: 48px;
             height: 32px;
-            background: #15803d;
+            background: root.export-busy ? #1f2937 : #334155;
+            border-radius: 3px;
+            Text { text: "Copy"; color: root.export-busy ? #64748b : white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                enabled: !root.export-busy;
+                mouse-cursor: pointer;
+                clicked => { root.copy-image(); }
+            }
+        }
+
+        Rectangle {
+            x: 514px;
+            y: 4px;
+            width: 48px;
+            height: 32px;
+            background: root.export-busy ? #1f2937 : #2563eb;
+            border-radius: 3px;
+            Text { text: "Save"; color: root.export-busy ? #64748b : white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                enabled: !root.export-busy;
+                mouse-cursor: pointer;
+                clicked => { root.save-png(); }
+            }
+        }
+
+        Rectangle {
+            x: 566px;
+            y: 4px;
+            width: 50px;
+            height: 32px;
+            background: root.export-busy ? #1f2937 : #15803d;
             border-radius: 3px;
             Text {
                 text: "Done";
-                color: white;
+                color: root.export-busy ? #64748b : white;
                 font-size: 11px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
             TouchArea {
+                enabled: !root.export-busy;
                 mouse-cursor: pointer;
                 clicked => { root.finish-annotations(); }
             }
+        }
+
+        Text {
+            x: 8px;
+            y: 42px;
+            width: 604px;
+            height: 18px;
+            text: root.export-status;
+            color: #cbd5e1;
+            font-size: 10px;
+            vertical-alignment: center;
+            overflow: elide;
         }
     }
 
@@ -207,6 +254,36 @@ export component OverlayPrototype inherits Window {
             background: #334155; border-radius: 3px;
             Text { text: "Cancel"; color: white; font-size: 9px; horizontal-alignment: center; vertical-alignment: center; }
             TouchArea { mouse-cursor: pointer; clicked => { root.cancel-text(); } }
+        }
+    }
+
+    Rectangle {
+        visible: root.export-busy;
+        width: parent.width;
+        height: parent.height;
+        background: #00000044;
+        Rectangle {
+            x: (parent.width - 320px) / 2;
+            y: (parent.height - 52px) / 2;
+            width: 320px;
+            height: 52px;
+            background: #111827ee;
+            border-color: #64748b;
+            border-width: 1px;
+            border-radius: 6px;
+            Text {
+                text: root.export-status;
+                color: white;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            enabled: root.export-busy;
         }
     }
 

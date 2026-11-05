@@ -49,6 +49,27 @@ pub fn activate_overlay() -> Result<(), String> {
     Ok(())
 }
 
+/// Show the native PNG Save As dialog. Supported by the Windows prototype.
+pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(target_os = "windows")]
+    return windows::save_png_dialog();
+
+    #[cfg(not(target_os = "windows"))]
+    Err("Native PNG Save As is not implemented on this platform".into())
+}
+
+/// Transfer an opaque screenshot image to the platform image clipboard.
+pub fn copy_image_to_clipboard(frame: &crate::core::frame::CapturedFrame) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    return windows::copy_image_to_clipboard(frame);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = frame;
+        Err("Image clipboard support is not implemented on this platform".into())
+    }
+}
+
 /// Opt-in Win32 cursor trace for diagnosing a physically missing pointer.
 pub fn diagnose_cursor(stage: &str) {
     #[cfg(target_os = "windows")]
