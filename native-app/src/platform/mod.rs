@@ -174,6 +174,8 @@ pub fn trace_native_event(operation: &str) {
 }
 
 #[cfg(target_os = "windows")]
+pub mod taskbar;
+#[cfg(target_os = "windows")]
 pub mod tray;
 #[cfg(target_os = "windows")]
 pub mod window_diagnostics;

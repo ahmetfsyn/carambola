@@ -804,6 +804,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .expect("selection bounds lock") = None;
                         *frame_slot.lock().expect("capture frame lock") = Some(frame);
                         *selection_slot.lock().expect("selection lock") = Selection::default();
+                        #[cfg(target_os = "windows")]
+                        let taskbar_window_pending =
+                            !platform::taskbar::ensure_overlay_removed(
+                                overlay.window(),
+                                settings.window(),
+                            );
                         platform::trace_event("overlay.set_fullscreen_true.before");
                         trace_overlay_state(&overlay, "overlay.set_fullscreen_true.before");
                         overlay.window().set_fullscreen(true);
@@ -837,6 +843,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "after_show",
                             overlay.window(),
                         );
+                        #[cfg(target_os = "windows")]
+                        if taskbar_window_pending
+                            && !platform::taskbar::ensure_overlay_removed(
+                                overlay.window(),
+                                settings.window(),
+                            )
+                        {
+                            let weak_overlay = overlay.as_weak();
+                            let weak_settings = settings.as_weak();
+                            if let Err(error) = slint::spawn_local(async move {
+                                let Some(overlay) = weak_overlay.upgrade() else {
+                                    return;
+                                };
+                                let native_window = match overlay.window().winit_window().await {
+                                    Ok(window) => window,
+                                    Err(error) => {
+                                        log::warn!("Overlay HWND unavailable for taskbar removal: {error}");
+                                        return;
+                                    }
+                                };
+                                drop(native_window);
+                                if overlay.window().is_visible() {
+                                    if let Some(settings) = weak_settings.upgrade() {
+                                        platform::taskbar::ensure_overlay_removed(
+                                            overlay.window(),
+                                            settings.window(),
+                                        );
+                                    }
+                                }
+                            }) {
+                                log::warn!("Could not wait for Overlay HWND to remove its taskbar tab: {error}");
+                            }
+                        }
                         platform::diagnose_cursor("overlay shown");
                         if !active_flag.capture_ready() {
                             set_status(

@@ -27,3 +27,15 @@ monitor arrangement when reporting results.
   without a white flash or visible window-shrinking transition.
 - [ ] Repeat captures and confirm the hotkey, tray, crop, annotation, and export
   paths continue to work.
+
+## Overlay taskbar regression
+
+- [ ] Start Carambola and confirm the Settings window's taskbar behavior is unchanged.
+- [ ] Trigger a screenshot using the global `Ctrl+Shift+S` hotkey.
+- [ ] On the first capture and on later captures, watch the taskbar while the
+  Overlay opens, remains fullscreen, and closes. No iconless Carambola entry
+  should appear.
+- [ ] Exit the Overlay using Escape; confirm the iconless taskbar entry does not appear during closure.
+- [ ] Trigger another screenshot and exit using the normal completion action; confirm the entry remains absent.
+- [ ] Repeat both exit paths several times, including after opening and closing Settings.
+- [ ] Confirm the tray icon remains available and Carambola continues running in the background.
