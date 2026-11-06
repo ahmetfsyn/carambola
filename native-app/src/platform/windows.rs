@@ -631,3 +631,54 @@ pub fn activate_overlay() -> Result<(), String> {
     crate::platform::window_diagnostics::trace_native_operation("ActivateOverlay.after", window);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::enumerate_displays;
+    use crate::core::display::select_display;
+    use std::collections::HashSet;
+
+    #[test]
+    fn win32_monitor_enumeration_metadata_and_selection_are_consistent() {
+        let displays = enumerate_displays().expect("EnumDisplayMonitors should report the desktop");
+        assert!(!displays.is_empty());
+
+        let primary_displays = displays
+            .iter()
+            .filter(|display| display.is_primary)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primary_displays.len(),
+            1,
+            "Windows should report exactly one primary monitor"
+        );
+        assert!(
+            displays[0].is_primary,
+            "the primary display is sorted first"
+        );
+
+        let mut device_names = HashSet::new();
+        for display in &displays {
+            assert!(!display.id.trim().is_empty());
+            assert!(
+                device_names.insert(display.id.as_str()),
+                "monitor IDs must be unique"
+            );
+            assert!(display.bounds.right > display.bounds.left);
+            assert!(display.bounds.bottom > display.bounds.top);
+            assert!(display.bounds.width() > 0);
+            assert!(display.bounds.height() > 0);
+            assert!(display.effective_dpi > 0);
+        }
+
+        let primary = primary_displays[0];
+        assert_eq!(select_display(&displays, None).unwrap(), primary);
+        for display in &displays {
+            assert_eq!(
+                select_display(&displays, Some(&display.id)).unwrap(),
+                display,
+                "an enumerated display ID should resolve to that display"
+            );
+        }
+    }
+}
