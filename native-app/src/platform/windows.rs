@@ -256,40 +256,169 @@ pub fn initialize() -> Result<(), String> {
         .map_err(|error| format!("Could not enable Per-Monitor DPI Awareness V2: {error}"))
 }
 
-/// Capture the primary monitor's current desktop pixels through GDI.
-/// The process is Per-Monitor-V2 aware before this function is called, so the
-/// screen metrics and BitBlt source coordinates describe physical pixels.
+struct MonitorEnumeration {
+    displays: Vec<crate::core::display::DisplayMetadata>,
+    error: Option<String>,
+}
+
+unsafe extern "system" fn enumerate_monitor_callback(
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    _dc: windows::Win32::Graphics::Gdi::HDC,
+    _rect: *mut windows::Win32::Foundation::RECT,
+    data: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFOEXW};
+
+    let enumeration = unsafe { &mut *(data.0 as *mut MonitorEnumeration) };
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if !unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+        enumeration.error = Some(format!(
+            "GetMonitorInfoW failed while enumerating displays: {}",
+            windows::core::Error::from_thread()
+        ));
+        return false.into();
+    }
+
+    let bounds = match crate::core::display::PhysicalBounds::new(
+        info.monitorInfo.rcMonitor.left,
+        info.monitorInfo.rcMonitor.top,
+        info.monitorInfo.rcMonitor.right,
+        info.monitorInfo.rcMonitor.bottom,
+    ) {
+        Ok(bounds) => bounds,
+        Err(error) => {
+            enumeration.error = Some(format!("Windows reported invalid display bounds: {error}"));
+            return false.into();
+        }
+    };
+
+    let device_name_end = info
+        .szDevice
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(info.szDevice.len());
+    let device_name = String::from_utf16_lossy(&info.szDevice[..device_name_end]);
+
+    let mut dpi_x = 0;
+    let mut dpi_y = 0;
+    if let Err(error) = unsafe {
+        windows::Win32::UI::HiDpi::GetDpiForMonitor(
+            monitor,
+            windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
+            &mut dpi_x,
+            &mut dpi_y,
+        )
+    } {
+        enumeration.error = Some(format!(
+            "Could not query effective DPI for {device_name}: {error}"
+        ));
+        return false.into();
+    }
+    if dpi_x == 0 || dpi_x != dpi_y {
+        enumeration.error = Some(format!(
+            "Windows reported invalid effective DPI for {device_name}: {dpi_x}x{dpi_y}"
+        ));
+        return false.into();
+    }
+
+    match crate::core::display::DisplayMetadata::new(
+        device_name,
+        bounds,
+        dpi_x,
+        info.monitorInfo.dwFlags & windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY
+            != 0,
+    ) {
+        Ok(display) => enumeration.displays.push(display),
+        Err(error) => {
+            enumeration.error = Some(format!("Invalid Windows display metadata: {error}"));
+            return false.into();
+        }
+    }
+    true.into()
+}
+
+/// Enumerate current Windows displays with signed physical virtual-desktop
+/// bounds. Device names identify the current topology; callers must re-resolve
+/// a selected ID before capture rather than persisting it across sessions.
+pub fn enumerate_displays() -> Result<Vec<crate::core::display::DisplayMetadata>, String> {
+    use windows::Win32::{Foundation::LPARAM, Graphics::Gdi::EnumDisplayMonitors};
+
+    let mut enumeration = MonitorEnumeration {
+        displays: Vec::new(),
+        error: None,
+    };
+    let succeeded = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(enumerate_monitor_callback),
+            LPARAM(&mut enumeration as *mut MonitorEnumeration as isize),
+        )
+    }
+    .as_bool();
+
+    if let Some(error) = enumeration.error {
+        return Err(error);
+    }
+    if !succeeded {
+        return Err(format!(
+            "EnumDisplayMonitors failed: {}",
+            windows::core::Error::from_thread()
+        ));
+    }
+    if enumeration.displays.is_empty() {
+        return Err("Windows did not report any connected displays".into());
+    }
+
+    enumeration.displays.sort_by(|left, right| {
+        right
+            .is_primary
+            .cmp(&left.is_primary)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(enumeration.displays)
+}
+
+/// Capture the requested display, defaulting to the primary display.
+/// The process is Per-Monitor-V2 aware before this function is called, so
+/// monitor bounds and BitBlt source coordinates describe physical pixels.
 /// Protected surfaces and secure-desktop content remain subject to Windows'
 /// normal capture restrictions.
-pub fn capture_primary() -> Result<CapturedFrame, String> {
+pub fn capture_display(requested_id: Option<&str>) -> Result<CapturedFrame, String> {
+    use crate::core::display::select_display;
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HGDIOBJ,
         SRCCOPY,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
-    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    if width <= 0 || height <= 0 {
-        return Err("Windows reported an empty primary monitor".into());
-    }
+    let displays = enumerate_displays()?;
+    let selected = select_display(&displays, requested_id)?.clone();
+    let width = i32::try_from(selected.bounds.width())
+        .map_err(|_| "Selected display width exceeds GDI limits")?;
+    let height = i32::try_from(selected.bounds.height())
+        .map_err(|_| "Selected display height exceeds GDI limits")?;
+    let source_x = selected.bounds.left;
+    let source_y = selected.bounds.top;
 
     unsafe {
         let screen_dc = GetDC(None);
         if screen_dc.is_invalid() {
-            return Err("GetDC failed while capturing the primary monitor".into());
+            return Err("GetDC failed while capturing the selected display".into());
         }
         let memory_dc = CreateCompatibleDC(Some(screen_dc));
         if memory_dc.is_invalid() {
             ReleaseDC(None, screen_dc);
-            return Err("CreateCompatibleDC failed while capturing the primary monitor".into());
+            return Err("CreateCompatibleDC failed while capturing the selected display".into());
         }
         let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
         if bitmap.is_invalid() {
             let _ = DeleteDC(memory_dc);
             ReleaseDC(None, screen_dc);
-            return Err("CreateCompatibleBitmap failed while capturing the primary monitor".into());
+            return Err(
+                "CreateCompatibleBitmap failed while capturing the selected display".into(),
+            );
         }
         let previous = SelectObject(memory_dc, HGDIOBJ(bitmap.0));
 
@@ -301,13 +430,11 @@ pub fn capture_primary() -> Result<CapturedFrame, String> {
                 width,
                 height,
                 Some(screen_dc),
-                0,
-                0,
+                source_x,
+                source_y,
                 SRCCOPY,
             )
-            .map_err(|error| {
-                format!("BitBlt failed while capturing the primary monitor: {error}")
-            })?;
+            .map_err(|error| format!("BitBlt failed while capturing {}: {error}", selected.id))?;
 
             // GetDIBits requires the bitmap to be deselected from every DC.
             let _ = SelectObject(memory_dc, previous);
@@ -322,7 +449,14 @@ pub fn capture_primary() -> Result<CapturedFrame, String> {
                 biCompression: 0,
                 ..Default::default()
             };
-            let mut bgra = vec![0u8; width as usize * height as usize * 4];
+            let buffer_len = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or("Selected display image dimensions overflow addressable memory")?;
+            let mut bgra = Vec::new();
+            bgra.try_reserve_exact(buffer_len)
+                .map_err(|error| format!("Could not allocate selected display pixels: {error}"))?;
+            bgra.resize(buffer_len, 0);
             let rows = GetDIBits(
                 memory_dc,
                 bitmap,
@@ -343,8 +477,33 @@ pub fn capture_primary() -> Result<CapturedFrame, String> {
         let _ = DeleteDC(memory_dc);
         ReleaseDC(None, screen_dc);
 
-        CapturedFrame::from_bgra32(width as u32, height as u32, captured?).map_err(str::to_owned)
+        let bgra = captured?;
+        let current_displays = enumerate_displays()?;
+        let current = current_displays
+            .iter()
+            .find(|display| display.id == selected.id)
+            .ok_or_else(|| {
+                format!(
+                    "Selected display '{}' disconnected during capture",
+                    selected.id
+                )
+            })?;
+        if current != &selected {
+            return Err(format!(
+                "Selected display '{}' changed bounds or DPI during capture",
+                selected.id
+            ));
+        }
+
+        CapturedFrame::from_bgra32(width as u32, height as u32, bgra)
+            .map_err(str::to_owned)?
+            .with_display_metadata(selected)
+            .map_err(str::to_owned)
     }
+}
+
+pub fn capture_primary() -> Result<CapturedFrame, String> {
+    capture_display(None)
 }
 
 /// Exclude the already-hidden settings HWND from capture and synchronize with

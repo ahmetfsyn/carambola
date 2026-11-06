@@ -1,5 +1,7 @@
 //! Immutable screenshot pixels and crop operations in physical frame pixels.
 
+use super::display::{DisplayMetadata, PhysicalPoint};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelRect {
     pub x: u32,
@@ -15,6 +17,13 @@ pub struct CapturedFrame {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    display: Option<FrameDisplay>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FrameDisplay {
+    metadata: DisplayMetadata,
+    origin: PhysicalPoint,
 }
 
 impl CapturedFrame {
@@ -33,7 +42,52 @@ impl CapturedFrame {
             width,
             height,
             rgba,
+            display: None,
         })
+    }
+
+    /// Associate a full-monitor frame with the display and physical desktop
+    /// origin that produced it.
+    pub fn with_display_metadata(
+        mut self,
+        metadata: DisplayMetadata,
+    ) -> Result<Self, &'static str> {
+        if self.width != metadata.bounds.width() || self.height != metadata.bounds.height() {
+            return Err("frame dimensions must match the selected display bounds");
+        }
+        self.display = Some(FrameDisplay {
+            origin: PhysicalPoint {
+                x: metadata.bounds.left,
+                y: metadata.bounds.top,
+            },
+            metadata,
+        });
+        Ok(self)
+    }
+
+    pub fn display_metadata(&self) -> Option<&DisplayMetadata> {
+        self.display.as_ref().map(|display| &display.metadata)
+    }
+
+    pub fn desktop_origin(&self) -> Option<PhysicalPoint> {
+        self.display.as_ref().map(|display| display.origin)
+    }
+
+    /// Map a frame-local pixel edge to the signed desktop coordinate space.
+    pub fn local_to_desktop(&self, x: u32, y: u32) -> Option<PhysicalPoint> {
+        let display = self.display.as_ref()?;
+        if x > self.width || y > self.height {
+            return None;
+        }
+        let monitor_x =
+            u32::try_from(i64::from(display.origin.x) - i64::from(display.metadata.bounds.left))
+                .ok()?
+                .checked_add(x)?;
+        let monitor_y =
+            u32::try_from(i64::from(display.origin.y) - i64::from(display.metadata.bounds.top))
+                .ok()?
+                .checked_add(y)?;
+        display.metadata.local_to_desktop(monitor_x, monitor_y)
     }
 
     /// Convert a tightly packed 32-bit GDI DIB (BGRA byte order) into the
@@ -88,7 +142,27 @@ impl CapturedFrame {
             let start = (y as usize * self.width as usize + rect.x as usize) * 4;
             output.extend_from_slice(&self.rgba[start..start + row_bytes]);
         }
-        Self::new(rect.width, rect.height, output)
+        let mut crop = Self::new(rect.width, rect.height, output)?;
+        if let Some(display) = &self.display {
+            let crop_x = i32::try_from(rect.x).map_err(|_| "crop origin exceeds desktop limits")?;
+            let crop_y = i32::try_from(rect.y).map_err(|_| "crop origin exceeds desktop limits")?;
+            crop.display = Some(FrameDisplay {
+                metadata: display.metadata.clone(),
+                origin: PhysicalPoint {
+                    x: display
+                        .origin
+                        .x
+                        .checked_add(crop_x)
+                        .ok_or("crop desktop X origin overflow")?,
+                    y: display
+                        .origin
+                        .y
+                        .checked_add(crop_y)
+                        .ok_or("crop desktop Y origin overflow")?,
+                },
+            });
+        }
+        Ok(crop)
     }
 
     /// Pixelate a redaction rectangle by averaging each block from the
@@ -152,6 +226,73 @@ mod tests {
     fn rejects_invalid_frame_dimensions_and_buffer_lengths() {
         assert!(CapturedFrame::new(0, 1, vec![]).is_err());
         assert!(CapturedFrame::new(1, 1, vec![0; 3]).is_err());
+    }
+
+    #[test]
+    fn associates_monitor_metadata_and_maps_frame_pixels_to_desktop() {
+        use crate::core::display::{DisplayMetadata, PhysicalBounds, PhysicalPoint};
+
+        let metadata = DisplayMetadata::new(
+            "DISPLAY2".into(),
+            PhysicalBounds::new(-2, 3, 2, 6).unwrap(),
+            144,
+            false,
+        )
+        .unwrap();
+        let frame = CapturedFrame::new(4, 3, vec![0; 4 * 3 * 4])
+            .unwrap()
+            .with_display_metadata(metadata.clone())
+            .unwrap();
+
+        assert_eq!(frame.display_metadata(), Some(&metadata));
+        assert_eq!(frame.desktop_origin(), Some(PhysicalPoint { x: -2, y: 3 }));
+        assert_eq!(
+            frame.local_to_desktop(3, 2),
+            Some(PhysicalPoint { x: 1, y: 5 })
+        );
+        let mismatched = DisplayMetadata::new(
+            "DISPLAY2".into(),
+            PhysicalBounds::new(0, 0, 8, 3).unwrap(),
+            96,
+            false,
+        )
+        .unwrap();
+        assert!(CapturedFrame::new(4, 3, vec![0; 4 * 3 * 4])
+            .unwrap()
+            .with_display_metadata(mismatched)
+            .is_err());
+    }
+
+    #[test]
+    fn monitor_metadata_survives_crop_and_crop_origin_tracks_desktop_pixels() {
+        use crate::core::display::{DisplayMetadata, PhysicalBounds, PhysicalPoint};
+
+        let metadata = DisplayMetadata::new(
+            "DISPLAY2".into(),
+            PhysicalBounds::new(-4, -3, 4, 3).unwrap(),
+            120,
+            false,
+        )
+        .unwrap();
+        let frame = CapturedFrame::new(8, 6, vec![0; 8 * 6 * 4])
+            .unwrap()
+            .with_display_metadata(metadata.clone())
+            .unwrap();
+        let crop = frame
+            .crop(PixelRect {
+                x: 2,
+                y: 1,
+                width: 3,
+                height: 2,
+            })
+            .unwrap();
+
+        assert_eq!(crop.display_metadata(), Some(&metadata));
+        assert_eq!(crop.desktop_origin(), Some(PhysicalPoint { x: -2, y: -2 }));
+        assert_eq!(
+            crop.local_to_desktop(1, 1),
+            Some(PhysicalPoint { x: -1, y: -1 })
+        );
     }
 
     #[test]

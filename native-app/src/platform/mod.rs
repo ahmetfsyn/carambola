@@ -25,6 +25,33 @@ pub fn capture_primary() -> Result<crate::core::frame::CapturedFrame, String> {
     Err("Native screen capture is not implemented for this platform".into())
 }
 
+/// Return current display metadata in physical virtual-desktop coordinates.
+pub fn enumerate_displays() -> Result<Vec<crate::core::display::DisplayMetadata>, String> {
+    #[cfg(target_os = "windows")]
+    return windows::enumerate_displays();
+
+    #[cfg(not(target_os = "windows"))]
+    Ok(Vec::new())
+}
+
+/// Capture a display selected by its current device ID, or the primary display
+/// when `display_id` is `None`.
+pub fn capture_display(
+    display_id: Option<&str>,
+) -> Result<crate::core::frame::CapturedFrame, String> {
+    #[cfg(target_os = "windows")]
+    return windows::capture_display(display_id);
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = display_id;
+        Err("macOS screen capture is not implemented yet".into())
+    }
+
+    #[allow(unreachable_code)]
+    Err("Native screen capture is not implemented on this platform".into())
+}
+
 pub fn prepare_capture() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     return windows::prepare_capture();

@@ -1,6 +1,11 @@
 //! End-to-end core test: logical pointer drag -> physical crop -> source pixels.
 
-use super::{frame::CapturedFrame, geometry::ViewportToFrame, selection::Selection};
+use super::{
+    display::{DisplayMetadata, PhysicalBounds, PhysicalPoint},
+    frame::CapturedFrame,
+    geometry::ViewportToFrame,
+    selection::Selection,
+};
 
 #[test]
 fn capture_to_crop_preserves_exact_pixels_at_125_percent_dpi() {
@@ -10,7 +15,18 @@ fn capture_to_crop_preserves_exact_pixels_at_125_percent_dpi() {
             rgba.extend_from_slice(&[x, y, x.wrapping_add(y), 255]);
         }
     }
-    let frame = CapturedFrame::new(8, 6, rgba).unwrap();
+    let frame = CapturedFrame::new(8, 6, rgba)
+        .unwrap()
+        .with_display_metadata(
+            DisplayMetadata::new(
+                "DISPLAY2".into(),
+                PhysicalBounds::new(-4, -3, 4, 3).unwrap(),
+                120,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
     // At 125% DPI the logical viewport is smaller than the physical capture.
     let small_transform = ViewportToFrame {
         viewport_width: 6.4,
@@ -27,4 +43,5 @@ fn capture_to_crop_preserves_exact_pixels_at_125_percent_dpi() {
 
     assert_eq!((crop.width(), crop.height()), (2, 1));
     assert_eq!(crop.pixels(), &[1, 1, 2, 255, 2, 1, 3, 255]);
+    assert_eq!(crop.desktop_origin(), Some(PhysicalPoint { x: -3, y: -2 }));
 }

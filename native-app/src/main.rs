@@ -15,6 +15,7 @@ use core::{
     annotations::{
         Annotation, AnnotationEditor, AnnotationTool, ImagePoint, StrokeStyle, ViewportToImage,
     },
+    display::DisplayMetadata,
     frame::CapturedFrame,
     lifecycle::{
         overlay_close_policy, settings_close_policy, AppAction, ClosePolicy, SettingsRestoreAction,
@@ -25,7 +26,7 @@ use core::{
 };
 use overlay_ui::OverlayPrototype;
 use settings_ui::SettingsWindow;
-use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
+use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use std::{
     path::PathBuf,
     sync::{
@@ -294,12 +295,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     backend_result?;
     log::info!("Native capture prototype started");
+
+    #[cfg(target_os = "windows")]
+    let displays = platform::enumerate_displays().map_err(std::io::Error::other)?;
+    #[cfg(not(target_os = "windows"))]
+    let displays = Vec::<DisplayMetadata>::new();
+    let default_display_index = displays
+        .iter()
+        .position(|display| display.is_primary)
+        .unwrap_or(0);
+    let display_options = displays
+        .iter()
+        .map(|display| display.label().into())
+        .collect::<Vec<slint::SharedString>>();
+    let displays = Arc::new(displays);
+
     platform::trace_event("main.before_settings_create");
 
     let settings = SettingsWindow::new().map_err(|error| {
         platform::trace_event(&format!("main.settings_create.failed error={error}"));
         error
     })?;
+    settings.set_display_options(ModelRc::new(VecModel::from(display_options)));
+    settings.set_selected_display_index(default_display_index as i32);
     platform::trace_event("main.after_settings_create");
     platform::trace_slint_native_handle("Settings", "after_component_create", settings.window());
     let overlay = OverlayPrototype::new().map_err(|error| {
@@ -319,6 +337,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selection = Arc::new(Mutex::new(Selection::default()));
     let capture_session = Arc::new(CaptureSession::default());
     let export_busy = Arc::new(AtomicBool::new(false));
+    let selected_display_id = Arc::new(Mutex::new(None::<String>));
+
+    {
+        let displays = displays.clone();
+        let selected_display_id = selected_display_id.clone();
+        settings.on_display_selected(move |index| {
+            let display_id = usize::try_from(index)
+                .ok()
+                .and_then(|index| displays.get(index))
+                .map(|display| display.id.clone());
+            if let Some(display_id) = display_id {
+                *selected_display_id.lock().expect("selected display lock") = Some(display_id);
+            }
+        });
+    }
 
     let weak_settings = settings.as_weak();
     let weak_overlay = overlay.as_weak();
@@ -330,6 +363,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selection_slot = selection.clone();
     let active_flag = capture_session.clone();
     let export_busy_flag = export_busy.clone();
+    let selected_display_slot = selected_display_id.clone();
+    let displays_for_capture = displays.clone();
     let capture_restore_state = Arc::new(AtomicU8::new(SettingsVisibility::Hidden as u8));
     let restore_state_slot = capture_restore_state.clone();
     settings.on_open_overlay(move || {
@@ -365,6 +400,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *editor_slot.lock().expect("annotation editor lock") = None;
         *text_position_slot.lock().expect("text position lock") = None;
         *selection_slot.lock().expect("selection lock") = Selection::default();
+        let requested_display = selected_display_slot
+            .lock()
+            .expect("selected display lock")
+            .clone();
+        let display_label = requested_display
+            .as_deref()
+            .and_then(|id| displays_for_capture.iter().find(|display| display.id == id))
+            .or_else(|| displays_for_capture.iter().find(|display| display.is_primary))
+            .map(DisplayMetadata::label)
+            .unwrap_or_else(|| "selected display".to_owned());
         if let Some(overlay) = weak_overlay.upgrade() {
             overlay.set_annotation_mode(false);
             overlay.set_annotation_image(Image::default());
@@ -380,7 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             overlay.set_selection_height(0.0);
         }
         if let Some(settings) = weak_settings.upgrade() {
-            set_status(&settings, "Capturing the primary display…");
+            set_status(&settings, format!("Capturing {display_label}…"));
         }
 
         let weak_settings = weak_settings.clone();
@@ -389,6 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let selection_slot = selection_slot.clone();
         let active_flag = active_flag.clone();
         let restore_state_slot = restore_state_slot.clone();
+        let requested_display = requested_display.clone();
         if weak_overlay.upgrade().is_none() {
             finish_capture_session(&active_flag, "overlay_unavailable_before_capture");
             return;
@@ -429,14 +475,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the overlay itself in the desktop pixels. Capture work stays off the
         // UI thread; the frozen frame is shown after the worker completes.
         std::thread::spawn(move || {
-            platform::trace_event("capture.capture_primary.worker_begin");
-            let captured = platform::capture_primary();
             platform::trace_event(&format!(
-                "capture.capture_primary.worker_end success={}",
+                "capture.capture_display.worker_begin requested_id={requested_display:?}"
+            ));
+            let captured = match requested_display.as_deref() {
+                Some(display_id) => platform::capture_display(Some(display_id)),
+                None => platform::capture_primary(),
+            };
+            platform::trace_event(&format!(
+                "capture.capture_display.worker_end success={}",
                 captured.is_ok()
             ));
             log::info!(
-                "Primary-display capture completed: success={}",
+                "Selected-display capture completed: success={}",
                 captured.is_ok()
             );
             let session_for_dispatch = active_flag.clone();
@@ -459,16 +510,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match captured {
                     Ok(frame) => {
-                        let scale_factor = overlay.window().scale_factor();
+                        let Some(display) = frame.display_metadata().cloned() else {
+                            set_status(&settings, "The captured frame has no display metadata.");
+                            restore_capture_settings(Some(&settings), return_visibility);
+                            finish_capture_session(&active_flag, "capture_metadata_missing");
+                            return;
+                        };
+                        let current_displays = match platform::enumerate_displays() {
+                            Ok(displays) => displays,
+                            Err(error) => {
+                                set_status(
+                                    &settings,
+                                    format!("Could not verify the captured display: {error}"),
+                                );
+                                restore_capture_settings(Some(&settings), return_visibility);
+                                finish_capture_session(&active_flag, "display_verification_failed");
+                                return;
+                            }
+                        };
+                        if !current_displays.iter().any(|current| current == &display) {
+                            set_status(
+                                &settings,
+                                format!("Display {} changed or disconnected before the overlay opened.", display.id),
+                            );
+                            restore_capture_settings(Some(&settings), return_visibility);
+                            finish_capture_session(&active_flag, "display_changed_before_overlay");
+                            return;
+                        }
+
+                        let (Some(frame_origin), Some(frame_bottom_right)) = (
+                            frame.desktop_origin(),
+                            frame.local_to_desktop(frame.width(), frame.height()),
+                        ) else {
+                            set_status(&settings, "The captured frame has invalid desktop bounds.");
+                            restore_capture_settings(Some(&settings), return_visibility);
+                            finish_capture_session(&active_flag, "frame_desktop_bounds_invalid");
+                            return;
+                        };
+                        if frame_bottom_right.x != display.bounds.right
+                            || frame_bottom_right.y != display.bounds.bottom
+                        {
+                            set_status(&settings, "The captured frame dimensions do not match the selected display.");
+                            restore_capture_settings(Some(&settings), return_visibility);
+                            finish_capture_session(&active_flag, "frame_display_bounds_mismatch");
+                            return;
+                        }
+
+                        let scale_factor = display.scale_factor() as f32;
                         if scale_factor <= 0.0 || !scale_factor.is_finite() {
                             set_status(
                                 &settings,
-                                "The overlay reported an invalid display scale factor.",
+                                "The selected display reported an invalid scale factor.",
                             );
                             restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(&active_flag, "invalid_overlay_scale");
+                            finish_capture_session(&active_flag, "invalid_display_scale");
                             return;
                         }
+                        platform::trace_event(&format!(
+                            "overlay.target_display id={:?} bounds=({}, {}, {}, {}) dpi={} scale_factor={}",
+                            display.id,
+                            display.bounds.left,
+                            display.bounds.top,
+                            display.bounds.right,
+                            display.bounds.bottom,
+                            display.effective_dpi,
+                            scale_factor
+                        ));
+                        platform::trace_event(&format!(
+                            "capture.frame_desktop_geometry monitor_id={:?} origin=({}, {}) end=({}, {})",
+                            display.id,
+                            frame_origin.x,
+                            frame_origin.y,
+                            frame_bottom_right.x,
+                            frame_bottom_right.y
+                        ));
+                        // Slint's fullscreen boolean maps to winit Borderless(None),
+                        // which chooses the monitor containing the HWND. Set both
+                        // physical bounds first so this session's target is
+                        // independent of the Overlay's previous placement/size.
+                        overlay
+                            .window()
+                            .set_position(slint::PhysicalPosition::new(frame_origin.x, frame_origin.y));
+                        overlay.window().set_size(slint::PhysicalSize::new(
+                            frame.width(),
+                            frame.height(),
+                        ));
                         overlay.set_frame_viewport_width(frame.width() as f32 / scale_factor);
                         overlay.set_frame_viewport_height(frame.height() as f32 / scale_factor);
                         log::info!(
@@ -755,7 +881,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .lock()
             .expect("capture frame lock")
             .as_ref()
-            .map(|frame| (frame.width(), frame.height()))
+            .map(|frame| {
+                (
+                    frame.width(),
+                    frame.height(),
+                    frame
+                        .display_metadata()
+                        .map(|display| display.scale_factor())
+                        .unwrap_or_else(|| overlay.window().scale_factor() as f64),
+                )
+            })
         else {
             return;
         };
@@ -767,7 +902,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let transform = core::geometry::ViewportToFrame {
             viewport_width: width,
             viewport_height: height,
-            scale_factor: overlay.window().scale_factor() as f64,
+            scale_factor: frame.2,
             frame_width: frame.0,
             frame_height: frame.1,
         };
@@ -836,18 +971,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .lock()
             .expect("selection lock")
             .update(x as f64, y as f64, width, height);
-        let Some((frame_width, frame_height)) = frame_slot
+        let Some((frame_width, frame_height, scale_factor)) = frame_slot
             .lock()
             .expect("capture frame lock")
             .as_ref()
-            .map(|frame| (frame.width(), frame.height()))
+            .map(|frame| {
+                (
+                    frame.width(),
+                    frame.height(),
+                    frame
+                        .display_metadata()
+                        .map(|display| display.scale_factor())
+                        .unwrap_or_else(|| overlay.window().scale_factor() as f64),
+                )
+            })
         else {
             return;
         };
         let transform = core::geometry::ViewportToFrame {
             viewport_width: width,
             viewport_height: height,
-            scale_factor: overlay.window().scale_factor() as f64,
+            scale_factor,
             frame_width,
             frame_height,
         };
