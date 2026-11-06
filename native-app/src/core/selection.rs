@@ -1,14 +1,7 @@
 //! Pointer drag normalization into exact captured-frame pixel bounds.
 
+pub use super::geometry::LogicalRect;
 use super::{frame::PixelRect, geometry::ViewportToFrame};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LogicalRect {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Selection {
@@ -90,12 +83,7 @@ fn normalized_bounds(
         width: right - left,
         height: bottom - top,
     };
-    let logical = LogicalRect {
-        x: left as f64 * transform.viewport_width / transform.frame_width as f64,
-        y: top as f64 * transform.viewport_height / transform.frame_height as f64,
-        width: pixels.width as f64 * transform.viewport_width / transform.frame_width as f64,
-        height: pixels.height as f64 * transform.viewport_height / transform.frame_height as f64,
-    };
+    let logical = transform.logical_rect_for_pixels(pixels)?;
     Ok(Some((pixels, logical)))
 }
 

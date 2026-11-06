@@ -16,7 +16,8 @@ use core::{
         Annotation, AnnotationEditor, AnnotationTool, ImagePoint, StrokeStyle, ViewportToImage,
     },
     display::DisplayMetadata,
-    frame::CapturedFrame,
+    frame::{CapturedFrame, PixelRect},
+    geometry::{FrameViewport, ViewportToFrame},
     lifecycle::{
         overlay_close_policy, settings_close_policy, AppAction, ClosePolicy, SettingsRestoreAction,
         SettingsVisibility, TrayCommand,
@@ -26,6 +27,7 @@ use core::{
 };
 use overlay_ui::OverlayPrototype;
 use settings_ui::SettingsWindow;
+use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use std::{
     path::PathBuf,
@@ -224,6 +226,140 @@ fn annotation_point(
     .map(Some)
 }
 
+fn current_frame_transform(
+    viewport_slot: &Arc<Mutex<Option<FrameViewport>>>,
+    viewport_width: f64,
+    viewport_height: f64,
+) -> Option<ViewportToFrame> {
+    viewport_slot
+        .lock()
+        .expect("frame viewport lock")
+        .as_ref()
+        .copied()?
+        .transform_for(viewport_width, viewport_height)
+        .ok()
+}
+
+fn clear_selection_preview(overlay: &OverlayPrototype) {
+    overlay.set_selection_x(0.0);
+    overlay.set_selection_y(0.0);
+    overlay.set_selection_width(0.0);
+    overlay.set_selection_height(0.0);
+}
+
+fn install_overlay_scale_factor_handler(
+    overlay: &OverlayPrototype,
+    viewport_slot: Arc<Mutex<Option<FrameViewport>>>,
+    selection_slot: Arc<Mutex<Selection>>,
+    selection_pixels_slot: Arc<Mutex<Option<PixelRect>>>,
+    selection_bounds_slot: Arc<Mutex<Option<LogicalRect>>>,
+    crop_slot: Arc<Mutex<Option<CapturedFrame>>>,
+    text_position_slot: Arc<Mutex<Option<ImagePoint>>>,
+) {
+    let weak_overlay = overlay.as_weak();
+    overlay.window().on_winit_window_event(move |_, event| {
+        let winit::event::WindowEvent::ScaleFactorChanged { scale_factor, .. } = event else {
+            return EventResult::Propagate;
+        };
+
+        // Slint stores its scale factor as f32, so derive the viewport from
+        // the same effective value before Slint lays out the new event.
+        let effective_scale_factor = f64::from(*scale_factor as f32);
+        platform::trace_event(&format!(
+            "overlay.scale_factor_changed.begin scale_factor={effective_scale_factor}"
+        ));
+        selection_slot.lock().expect("selection lock").cancel();
+
+        let synchronized = {
+            let mut viewport_guard = viewport_slot.lock().expect("frame viewport lock");
+            let Some(viewport) = viewport_guard.as_mut() else {
+                platform::trace_event("overlay.scale_factor_changed.ignored no_captured_frame");
+                return EventResult::Propagate;
+            };
+            match viewport.synchronize_scale_factor(effective_scale_factor) {
+                Ok(logical_size) => Ok((*viewport, logical_size)),
+                Err(error) => {
+                    *viewport_guard = None;
+                    Err(error)
+                }
+            }
+        };
+
+        let (viewport, logical_size) = match synchronized {
+            Ok(viewport) => viewport,
+            Err(error) => {
+                log::warn!("Rejected Overlay scale-factor change: {error}");
+                platform::trace_event(&format!(
+                    "overlay.scale_factor_changed.invalid error={error}"
+                ));
+                return EventResult::Propagate;
+            }
+        };
+
+        let selected_pixels = *selection_pixels_slot
+            .lock()
+            .expect("selection pixel rectangle lock");
+        let logical_selection = selected_pixels
+            .map(|pixels| viewport.project_pixels(pixels))
+            .transpose();
+        let logical_selection = match logical_selection {
+            Ok(selection) => selection,
+            Err(error) => {
+                *viewport_slot.lock().expect("frame viewport lock") = None;
+                *selection_bounds_slot.lock().expect("selection bounds lock") = None;
+                log::warn!("Rejected Overlay selection geometry after DPI change: {error}");
+                platform::trace_event(&format!(
+                    "overlay.scale_factor_changed.selection_invalid error={error}"
+                ));
+                return EventResult::Propagate;
+            }
+        };
+        *selection_bounds_slot.lock().expect("selection bounds lock") = logical_selection;
+
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return EventResult::Propagate;
+        };
+        overlay.set_frame_viewport_width(logical_size.width as f32);
+        overlay.set_frame_viewport_height(logical_size.height as f32);
+        if let Some(rect) = logical_selection {
+            overlay.set_selection_x(rect.x as f32);
+            overlay.set_selection_y(rect.y as f32);
+            overlay.set_selection_width(rect.width as f32);
+            overlay.set_selection_height(rect.height as f32);
+        } else {
+            clear_selection_preview(&overlay);
+        }
+
+        if let (Some(point), Some(bounds), Some(crop)) = (
+            *text_position_slot.lock().expect("text position lock"),
+            logical_selection,
+            crop_slot
+                .lock()
+                .expect("selected crop lock")
+                .as_ref()
+                .cloned(),
+        ) {
+            if crop.width() > 0 && crop.height() > 0 {
+                let x = bounds.x + point.x * bounds.width / f64::from(crop.width()) + 8.0;
+                let y = bounds.y + point.y * bounds.height / f64::from(crop.height()) + 8.0;
+                overlay.set_text_entry_x(x.max(0.0) as f32);
+                overlay
+                    .set_text_entry_y(y.min((logical_size.height - 52.0).max(0.0)).max(0.0) as f32);
+            }
+        }
+
+        platform::trace_event(&format!(
+            "overlay.scale_factor_changed.synchronized scale_factor={} frame={}x{} viewport={}x{}",
+            viewport.scale_factor(),
+            viewport.frame_width(),
+            viewport.frame_height(),
+            logical_size.width,
+            logical_size.height
+        ));
+        EventResult::Propagate
+    });
+}
+
 fn contains(bounds: LogicalRect, x: f64, y: f64) -> bool {
     x >= bounds.x && y >= bounds.y && x <= bounds.x + bounds.width && y <= bounds.y + bounds.height
 }
@@ -332,12 +468,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let captured_frame = Arc::new(Mutex::new(None::<CapturedFrame>));
     let selected_crop = Arc::new(Mutex::new(None::<CapturedFrame>));
     let selection_bounds = Arc::new(Mutex::new(None::<LogicalRect>));
+    let selection_pixels = Arc::new(Mutex::new(None::<PixelRect>));
     let annotation_editor = Arc::new(Mutex::new(None::<AnnotationEditor>));
     let pending_text_position = Arc::new(Mutex::new(None::<ImagePoint>));
     let selection = Arc::new(Mutex::new(Selection::default()));
+    let frame_viewport = Arc::new(Mutex::new(None::<FrameViewport>));
     let capture_session = Arc::new(CaptureSession::default());
     let export_busy = Arc::new(AtomicBool::new(false));
     let selected_display_id = Arc::new(Mutex::new(None::<String>));
+
+    install_overlay_scale_factor_handler(
+        &overlay,
+        frame_viewport.clone(),
+        selection.clone(),
+        selection_pixels.clone(),
+        selection_bounds.clone(),
+        selected_crop.clone(),
+        pending_text_position.clone(),
+    );
 
     {
         let displays = displays.clone();
@@ -358,9 +506,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_slot = captured_frame.clone();
     let crop_slot = selected_crop.clone();
     let bounds_slot = selection_bounds.clone();
+    let selection_pixels_slot = selection_pixels.clone();
     let editor_slot = annotation_editor.clone();
     let text_position_slot = pending_text_position.clone();
     let selection_slot = selection.clone();
+    let frame_viewport_slot = frame_viewport.clone();
     let active_flag = capture_session.clone();
     let export_busy_flag = export_busy.clone();
     let selected_display_slot = selected_display_id.clone();
@@ -397,6 +547,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_slot.lock().expect("capture frame lock").take();
         crop_slot.lock().expect("selected crop lock").take();
         *bounds_slot.lock().expect("selection bounds lock") = None;
+        *selection_pixels_slot
+            .lock()
+            .expect("selection pixel rectangle lock") = None;
+        *frame_viewport_slot
+            .lock()
+            .expect("frame viewport lock") = None;
         *editor_slot.lock().expect("annotation editor lock") = None;
         *text_position_slot.lock().expect("text position lock") = None;
         *selection_slot.lock().expect("selection lock") = Selection::default();
@@ -432,6 +588,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak_overlay = weak_overlay.clone();
         let frame_slot = frame_slot.clone();
         let selection_slot = selection_slot.clone();
+        let frame_viewport_slot = frame_viewport_slot.clone();
         let active_flag = active_flag.clone();
         let restore_state_slot = restore_state_slot.clone();
         let requested_display = requested_display.clone();
@@ -474,6 +631,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Capture before showing the transparent overlay so GDI cannot include
         // the overlay itself in the desktop pixels. Capture work stays off the
         // UI thread; the frozen frame is shown after the worker completes.
+        let bounds_for_result = bounds_slot.clone();
+        let selection_pixels_for_result = selection_pixels_slot.clone();
         std::thread::spawn(move || {
             platform::trace_event(&format!(
                 "capture.capture_display.worker_begin requested_id={requested_display:?}"
@@ -566,6 +725,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             finish_capture_session(&active_flag, "invalid_display_scale");
                             return;
                         }
+                        let frame_viewport = match FrameViewport::new(
+                            frame.width(),
+                            frame.height(),
+                            f64::from(scale_factor),
+                        ) {
+                            Ok(viewport) => viewport,
+                            Err(error) => {
+                                set_status(
+                                    &settings,
+                                    format!("The selected display has invalid Overlay geometry: {error}"),
+                                );
+                                restore_capture_settings(Some(&settings), return_visibility);
+                                finish_capture_session(&active_flag, "invalid_frame_viewport");
+                                return;
+                            }
+                        };
+                        let logical_viewport = frame_viewport.logical_size();
                         platform::trace_event(&format!(
                             "overlay.target_display id={:?} bounds=({}, {}, {}, {}) dpi={} scale_factor={}",
                             display.id,
@@ -595,14 +771,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             frame.width(),
                             frame.height(),
                         ));
-                        overlay.set_frame_viewport_width(frame.width() as f32 / scale_factor);
-                        overlay.set_frame_viewport_height(frame.height() as f32 / scale_factor);
+                        *frame_viewport_slot
+                            .lock()
+                            .expect("frame viewport lock") = Some(frame_viewport);
+                        overlay.set_frame_viewport_width(logical_viewport.width as f32);
+                        overlay.set_frame_viewport_height(logical_viewport.height as f32);
                         log::info!(
                             "Capture geometry: frame={}x{} logical_viewport={}x{} scale_factor={}",
                             frame.width(),
                             frame.height(),
-                            frame.width() as f32 / scale_factor,
-                            frame.height() as f32 / scale_factor,
+                            logical_viewport.width,
+                            logical_viewport.height,
                             scale_factor
                         );
                         overlay.set_captured_image(image_from_rgba(
@@ -617,6 +796,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         overlay.set_selection_height(0.0);
                         overlay.set_annotation_mode(false);
                         overlay.set_annotation_image(Image::default());
+                        *selection_pixels_for_result
+                            .lock()
+                            .expect("selection pixel rectangle lock") = None;
+                        *bounds_for_result
+                            .lock()
+                            .expect("selection bounds lock") = None;
                         *frame_slot.lock().expect("capture frame lock") = Some(frame);
                         *selection_slot.lock().expect("selection lock") = Selection::default();
                         platform::trace_event("overlay.set_fullscreen_true.before");
@@ -716,9 +901,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_slot = captured_frame.clone();
     let crop_slot = selected_crop.clone();
     let bounds_slot = selection_bounds.clone();
+    let selection_pixels_slot = selection_pixels.clone();
     let editor_slot = annotation_editor.clone();
     let text_position_slot = pending_text_position.clone();
     let selection_slot = selection.clone();
+    let frame_viewport_slot = frame_viewport.clone();
     let active_flag = capture_session.clone();
     let restore_state_slot = capture_restore_state.clone();
     overlay.on_cancel_selection(move || {
@@ -739,6 +926,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_slot.lock().expect("capture frame lock").take();
         crop_slot.lock().expect("selected crop lock").take();
         *bounds_slot.lock().expect("selection bounds lock") = None;
+        *selection_pixels_slot
+            .lock()
+            .expect("selection pixel rectangle lock") = None;
+        *frame_viewport_slot.lock().expect("frame viewport lock") = None;
         *editor_slot.lock().expect("annotation editor lock") = None;
         *text_position_slot.lock().expect("text position lock") = None;
         selection_slot.lock().expect("selection lock").cancel();
@@ -782,6 +973,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let text_position_slot = pending_text_position.clone();
     let bounds_slot = selection_bounds.clone();
     let crop_slot = selected_crop.clone();
+    let frame_viewport_slot = frame_viewport.clone();
     let active_flag = capture_session.clone();
     overlay.on_pointer_down(move |x, y, width, height| {
         if !active_flag.is_active() {
@@ -790,6 +982,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
+        if current_frame_transform(&frame_viewport_slot, width as f64, height as f64).is_none() {
+            selection_slot.lock().expect("selection lock").cancel();
+            if editor_slot
+                .lock()
+                .expect("annotation editor lock")
+                .is_none()
+            {
+                clear_selection_preview(&overlay);
+            }
+            return;
+        }
         if editor_slot
             .lock()
             .expect("annotation editor lock")
@@ -841,13 +1044,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let weak_overlay = overlay.as_weak();
     let selection_slot = selection.clone();
-    let frame_slot = captured_frame.clone();
+    let frame_viewport_slot = frame_viewport.clone();
     let bounds_slot = selection_bounds.clone();
     let crop_slot = selected_crop.clone();
     let editor_slot = annotation_editor.clone();
     overlay.on_pointer_move(move |x, y, width, height| {
         platform::diagnose_cursor_motion();
         let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let Some(transform) =
+            current_frame_transform(&frame_viewport_slot, width as f64, height as f64)
+        else {
+            selection_slot.lock().expect("selection lock").cancel();
+            if editor_slot
+                .lock()
+                .expect("annotation editor lock")
+                .is_none()
+            {
+                clear_selection_preview(&overlay);
+            }
             return;
         };
         if editor_slot
@@ -875,37 +1091,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
 
-        let width = width as f64;
-        let height = height as f64;
-        let Some(frame) = frame_slot
-            .lock()
-            .expect("capture frame lock")
-            .as_ref()
-            .map(|frame| {
-                (
-                    frame.width(),
-                    frame.height(),
-                    frame
-                        .display_metadata()
-                        .map(|display| display.scale_factor())
-                        .unwrap_or_else(|| overlay.window().scale_factor() as f64),
-                )
-            })
-        else {
-            return;
-        };
         let mut state = selection_slot.lock().expect("selection lock");
         if !state.is_dragging() {
             return;
         }
-        state.update(x as f64, y as f64, width, height);
-        let transform = core::geometry::ViewportToFrame {
-            viewport_width: width,
-            viewport_height: height,
-            scale_factor: frame.2,
-            frame_width: frame.0,
-            frame_height: frame.1,
-        };
+        state.update(
+            x as f64,
+            y as f64,
+            transform.viewport_width,
+            transform.viewport_height,
+        );
         if let Ok(Some((_, rect))) = state.preview(transform) {
             overlay.set_selection_x(rect.x as f32);
             overlay.set_selection_y(rect.y as f32);
@@ -920,11 +1115,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crop_slot = selected_crop.clone();
     let bounds_slot = selection_bounds.clone();
     let selection_slot = selection.clone();
+    let selection_pixels_slot = selection_pixels.clone();
+    let frame_viewport_slot = frame_viewport.clone();
     let editor_slot = annotation_editor.clone();
     let text_position_slot = pending_text_position.clone();
     let active_flag = capture_session.clone();
     overlay.on_pointer_up(move |x, y, width, height| {
         let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let Some(transform) =
+            current_frame_transform(&frame_viewport_slot, width as f64, height as f64)
+        else {
+            selection_slot.lock().expect("selection lock").cancel();
+            if editor_slot
+                .lock()
+                .expect("annotation editor lock")
+                .is_none()
+            {
+                clear_selection_preview(&overlay);
+            }
             return;
         };
         if text_position_slot
@@ -965,36 +1175,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
 
-        let width = width as f64;
-        let height = height as f64;
-        selection_slot
-            .lock()
-            .expect("selection lock")
-            .update(x as f64, y as f64, width, height);
-        let Some((frame_width, frame_height, scale_factor)) = frame_slot
-            .lock()
-            .expect("capture frame lock")
-            .as_ref()
-            .map(|frame| {
-                (
-                    frame.width(),
-                    frame.height(),
-                    frame
-                        .display_metadata()
-                        .map(|display| display.scale_factor())
-                        .unwrap_or_else(|| overlay.window().scale_factor() as f64),
-                )
-            })
-        else {
-            return;
-        };
-        let transform = core::geometry::ViewportToFrame {
-            viewport_width: width,
-            viewport_height: height,
-            scale_factor,
-            frame_width,
-            frame_height,
-        };
+        selection_slot.lock().expect("selection lock").update(
+            x as f64,
+            y as f64,
+            transform.viewport_width,
+            transform.viewport_height,
+        );
         let result = selection_slot
             .lock()
             .expect("selection lock")
@@ -1021,13 +1207,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log::error!("Could not transition capture session into annotation state");
             return;
         }
+        *selection_pixels_slot
+            .lock()
+            .expect("selection pixel rectangle lock") = Some(pixels);
+        *bounds_slot.lock().expect("selection bounds lock") = Some(logical);
         platform::trace_event("capture.session.transition=Annotating");
         overlay.set_selection_x(logical.x as f32);
         overlay.set_selection_y(logical.y as f32);
         overlay.set_selection_width(logical.width as f32);
         overlay.set_selection_height(logical.height as f32);
         overlay.set_selected_tool(AnnotationTool::Pen.ui_index());
-        *bounds_slot.lock().expect("selection bounds lock") = Some(logical);
         *crop_slot.lock().expect("selected crop lock") = Some(crop);
         *editor_slot.lock().expect("annotation editor lock") = Some(AnnotationEditor::default());
         overlay.set_annotation_mode(true);
@@ -1232,6 +1421,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_slot = captured_frame.clone();
     let crop_slot = selected_crop.clone();
     let bounds_slot = selection_bounds.clone();
+    let selection_pixels_slot = selection_pixels.clone();
+    let frame_viewport_slot = frame_viewport.clone();
     let editor_slot = annotation_editor.clone();
     let active_flag = capture_session.clone();
     let busy = export_busy.clone();
@@ -1277,6 +1468,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         frame_slot.lock().expect("capture frame lock").take();
         *bounds_slot.lock().expect("selection bounds lock") = None;
+        *selection_pixels_slot
+            .lock()
+            .expect("selection pixel rectangle lock") = None;
+        *frame_viewport_slot.lock().expect("frame viewport lock") = None;
         *editor_slot.lock().expect("annotation editor lock") = None;
         if let Some(overlay) = weak_overlay.upgrade() {
             trace_overlay_state(&overlay, "capture.done.hide_overlay.before");
