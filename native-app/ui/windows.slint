@@ -7,7 +7,9 @@ export component SettingsWindow inherits Window {
     background: #0b1020;
 
     callback open-overlay();
+    callback exit-app();
     in property <string> status: "Ready — capture the primary display.";
+    in property <bool> tray-available: false;
 
     Rectangle {
         background: #0b1020;
@@ -41,7 +43,7 @@ export component SettingsWindow inherits Window {
                     }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text {
-                        text: "PHASE 6";
+                        text: "PHASE 7";
                         color: #f1c75b;
                         font-size: 11px;
                         font-weight: 700;
@@ -80,6 +82,7 @@ export component SettingsWindow inherits Window {
                     spacing: 12px;
                     Text { text: "Status"; color: #e9f2ff; font-size: 15px; font-weight: 650; }
                     Text { text: root.status; color: #aab6c9; font-size: 13px; wrap: word-wrap; }
+                    Text { text: "Ctrl + Shift + S captures from anywhere. Closing this window keeps Carambola in the notification area."; color: #aab6c9; font-size: 12px; wrap: word-wrap; }
                     Text { text: "Windows capture uses GDI BitBlt and returns physical-pixel RGBA."; color: #aab6c9; font-size: 12px; }
                     Text { text: "macOS capture is not implemented in this phase."; color: #f1c75b; font-size: 12px; }
                 }
@@ -88,6 +91,11 @@ export component SettingsWindow inherits Window {
             HorizontalLayout {
                 spacing: 12px;
                 Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button {
+                    visible: !root.tray-available;
+                    text: "Exit Carambola";
+                    clicked => { root.exit-app(); }
+                }
                 Button {
                     text: "Capture primary display";
                     clicked => { root.open-overlay(); }

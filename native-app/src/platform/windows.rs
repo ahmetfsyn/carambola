@@ -36,6 +36,7 @@ pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
     };
 
     let owner = find_app_window(w!("Carambola screenshot selection"))?;
+    crate::platform::window_diagnostics::trace_native_operation("save_png_dialog.before", owner);
     let mut file_name = "Carambola Screenshot.png"
         .encode_utf16()
         .collect::<Vec<_>>();
@@ -64,7 +65,9 @@ pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
         ..Default::default()
     };
 
-    if !unsafe { GetSaveFileNameW(&mut dialog) }.as_bool() {
+    let accepted = unsafe { GetSaveFileNameW(&mut dialog) }.as_bool();
+    crate::platform::window_diagnostics::trace_native_operation("save_png_dialog.after", owner);
+    if !accepted {
         let error = unsafe { CommDlgExtendedError() }.0;
         if error == 0 {
             return Ok(None);
@@ -344,16 +347,15 @@ pub fn capture_primary() -> Result<CapturedFrame, String> {
     }
 }
 
-/// Hide the settings HWND synchronously, then synchronize with DWM before the
-/// capture worker reads desktop pixels.
+/// Exclude the already-hidden settings HWND from capture and synchronize with
+/// DWM before the capture worker reads desktop pixels. Slint owns visibility.
 pub fn prepare_capture() -> Result<(), String> {
     use windows::core::w;
     use windows::Win32::{
         Foundation::HWND,
         Graphics::Dwm::DwmFlush,
         UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowThreadProcessId, IsWindowVisible, SetWindowDisplayAffinity,
-            ShowWindow, SW_HIDE, WDA_EXCLUDEFROMCAPTURE,
+            FindWindowW, GetWindowThreadProcessId, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
         },
     };
 
@@ -366,25 +368,29 @@ pub fn prepare_capture() -> Result<(), String> {
     if process_id != std::process::id() {
         return Err("The located settings window belongs to a different process".into());
     }
+    crate::platform::window_diagnostics::trace_native_operation(
+        "SetWindowDisplayAffinity(EXCLUDEFROMCAPTURE).before",
+        window,
+    );
     unsafe { SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) }
         .map_err(|error| format!("Could not exclude the settings window from capture: {error}"))?;
-    let _ = unsafe { ShowWindow(window, SW_HIDE) };
-    if unsafe { IsWindowVisible(window).as_bool() } {
-        return Err("Windows did not hide the native settings window before capture".into());
-    }
-    unsafe { DwmFlush() }.map_err(|error| format!("DwmFlush failed before capture: {error}"))
+    crate::platform::window_diagnostics::trace_native_operation(
+        "SetWindowDisplayAffinity(EXCLUDEFROMCAPTURE).after",
+        window,
+    );
+    let flush =
+        unsafe { DwmFlush() }.map_err(|error| format!("DwmFlush failed before capture: {error}"));
+    crate::platform::window_diagnostics::trace_native_operation("DwmFlush.after", window);
+    flush
 }
 
-/// Restore the settings HWND after capture. Slint keeps the settings window
-/// logically visible while this native HWND is hidden, keeping its event loop
-/// alive before the selection overlay is shown.
-pub fn restore_settings() -> Result<(), String> {
+/// Reset capture affinity. Slint owns all settings-window visibility changes.
+pub fn reset_capture_affinity() -> Result<(), String> {
     use windows::core::w;
     use windows::Win32::{
         Foundation::HWND,
         UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowThreadProcessId, SetWindowDisplayAffinity, ShowWindow, SW_SHOW,
-            WDA_NONE,
+            FindWindowW, GetWindowThreadProcessId, SetWindowDisplayAffinity, WDA_NONE,
         },
     };
 
@@ -397,9 +403,44 @@ pub fn restore_settings() -> Result<(), String> {
     if process_id != std::process::id() {
         return Err("The located settings window belongs to a different process".into());
     }
-    unsafe { SetWindowDisplayAffinity(window, WDA_NONE) }
-        .map_err(|error| format!("Could not reset settings-window capture affinity: {error}"))?;
-    let _ = unsafe { ShowWindow(window, SW_SHOW) };
+    crate::platform::window_diagnostics::trace_native_operation(
+        "SetWindowDisplayAffinity(NONE).before",
+        window,
+    );
+    let result = unsafe { SetWindowDisplayAffinity(window, WDA_NONE) }
+        .map_err(|error| format!("Could not reset settings-window capture affinity: {error}"));
+    crate::platform::window_diagnostics::trace_native_operation(
+        "SetWindowDisplayAffinity(NONE).after",
+        window,
+    );
+    result
+}
+
+pub fn activate_settings() -> Result<(), String> {
+    use windows::core::w;
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, SetForegroundWindow},
+    };
+
+    let window: HWND = unsafe {
+        FindWindowW(None, w!("Carambola — Native Screenshot Annotation"))
+            .map_err(|error| format!("Could not locate the native settings window: {error}"))?
+    };
+    let mut process_id = 0u32;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+    if process_id != std::process::id() {
+        return Err("The located settings window belongs to a different process".into());
+    }
+    crate::platform::window_diagnostics::trace_native_operation(
+        "SetForegroundWindow(Settings).before",
+        window,
+    );
+    let _ = unsafe { SetForegroundWindow(window) };
+    crate::platform::window_diagnostics::trace_native_operation(
+        "SetForegroundWindow(Settings).after",
+        window,
+    );
     Ok(())
 }
 
@@ -422,10 +463,12 @@ pub fn activate_overlay() -> Result<(), String> {
     if process_id != std::process::id() {
         return Err("The located selection overlay belongs to a different process".into());
     }
+    crate::platform::window_diagnostics::trace_native_operation("ActivateOverlay.before", window);
     unsafe {
         let _ = SetForegroundWindow(window);
         let _ = SetActiveWindow(window);
         let _ = SetFocus(Some(window));
     }
+    crate::platform::window_diagnostics::trace_native_operation("ActivateOverlay.after", window);
     Ok(())
 }

@@ -33,9 +33,17 @@ pub fn prepare_capture() -> Result<(), String> {
     Ok(())
 }
 
-pub fn restore_settings() -> Result<(), String> {
+pub fn reset_capture_affinity() -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    return windows::restore_settings();
+    return windows::reset_capture_affinity();
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+pub fn activate_settings() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    return windows::activate_settings();
 
     #[allow(unreachable_code)]
     Ok(())
@@ -82,3 +90,63 @@ pub fn diagnose_cursor_motion() {
     #[cfg(target_os = "windows")]
     windows::diagnose_cursor_motion();
 }
+
+pub fn trace_event(event: &str) {
+    #[cfg(target_os = "windows")]
+    window_diagnostics::trace_event(event);
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = event;
+}
+
+pub fn begin_window_action(action: &str) -> u64 {
+    #[cfg(target_os = "windows")]
+    return window_diagnostics::begin_action(action);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = action;
+        0
+    }
+}
+
+pub fn finish_window_action(id: u64, outcome: &str) {
+    #[cfg(target_os = "windows")]
+    window_diagnostics::finish_action(id, outcome);
+    #[cfg(not(target_os = "windows"))]
+    let _ = (id, outcome);
+}
+
+pub fn clear_window_action(reason: &str) {
+    #[cfg(target_os = "windows")]
+    window_diagnostics::clear_action(reason);
+    #[cfg(not(target_os = "windows"))]
+    let _ = reason;
+}
+
+pub fn trace_component_state(role: &str, operation: &str, visible: bool, minimized: bool) {
+    #[cfg(target_os = "windows")]
+    window_diagnostics::trace_component_state(role, operation, visible, minimized);
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = (role, operation, visible, minimized);
+}
+
+pub fn trace_slint_native_handle(role: &str, stage: &str, window: &slint::Window) {
+    #[cfg(target_os = "windows")]
+    window_diagnostics::trace_slint_native_handle(role, stage, window);
+    #[cfg(not(target_os = "windows"))]
+    let _ = (role, stage, window);
+}
+
+pub fn trace_native_event(operation: &str) {
+    #[cfg(target_os = "windows")]
+    window_diagnostics::trace_native_event(operation);
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = operation;
+}
+
+#[cfg(target_os = "windows")]
+pub mod tray;
+#[cfg(target_os = "windows")]
+pub mod window_diagnostics;
