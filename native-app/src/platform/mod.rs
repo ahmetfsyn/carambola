@@ -14,15 +14,67 @@ pub fn initialize() -> Result<(), String> {
     Ok(())
 }
 
-pub fn capture_primary() -> Result<crate::core::frame::CapturedFrame, String> {
+/// Capture one explicitly selected display. The ID is resolved against the
+/// current topology at capture time so a disconnected monitor is an error.
+pub fn capture_display(
+    requested_id: Option<&str>,
+) -> Result<crate::core::frame::CapturedFrame, String> {
     #[cfg(target_os = "windows")]
-    return windows::capture_primary();
+    return windows::capture_display(requested_id);
 
     #[cfg(target_os = "macos")]
-    return macos::capture_primary();
+    {
+        if requested_id.is_some() {
+            return Err("Display-specific capture is not implemented on macOS".into());
+        }
+        return macos::capture_primary();
+    }
 
     #[allow(unreachable_code)]
     Err("Native screen capture is not implemented for this platform".into())
+}
+
+/// Show a short native success notification without creating another window.
+/// Windows uses the already-running tray icon; macOS and Linux use their
+/// standard notification entry points.
+pub fn show_notification(message: &str, owner_hwnd: isize) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    return tray::show_notification(owner_hwnd, message);
+
+    #[cfg(target_os = "macos")]
+    return macos::show_notification(message);
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let status = Command::new("notify-send")
+            .arg("--app-name=Carambola")
+            .arg("Carambola")
+            .arg(message)
+            .status()
+            .map_err(|error| format!("Could not start notify-send: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("notify-send exited with status {status}"))
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (message, owner_hwnd);
+        Err("Native notifications are not supported on this platform".into())
+    }
+}
+
+/// Resolve the display under the cursor at request time. Non-Windows
+/// platforms retain their existing primary-display capture behavior.
+pub fn display_at_cursor_id() -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    return windows::display_at_cursor().map(|display| Some(display.id));
+
+    #[cfg(not(target_os = "windows"))]
+    Ok(None)
 }
 
 /// Return current display metadata in physical virtual-desktop coordinates.

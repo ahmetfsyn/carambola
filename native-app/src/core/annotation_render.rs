@@ -4,7 +4,10 @@
 //! layer has the same physical dimensions and remains transparent wherever no
 //! annotation was drawn, so editing never changes the source screenshot.
 
-use super::annotations::{Annotation, AnnotationGeometry, ImagePoint, StrokeColor, StrokeStyle};
+use super::annotations::{
+    arrowhead_wings, Annotation, AnnotationGeometry, ImagePoint, StrokeColor, StrokeStyle,
+    TextAlignment, TextStyle,
+};
 use super::frame::CapturedFrame;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,33 +125,12 @@ fn draw_annotation(layer: &mut AnnotationLayer, annotation: &Annotation) {
         AnnotationGeometry::Text {
             position,
             text,
-            font_size,
+            text_style,
         } => {
-            layer.text(*position, text, *font_size, annotation.style.color);
+            layer.text(*position, text, *text_style, annotation.style.color);
         }
         AnnotationGeometry::Mosaic { .. } => {}
     }
-}
-
-/// Return the two arrowhead wing endpoints, oriented behind the arrow tip.
-pub fn arrowhead_wings(start: ImagePoint, end: ImagePoint, width: f64) -> Option<[ImagePoint; 2]> {
-    let dx = end.x - start.x;
-    let dy = end.y - start.y;
-    let length = dx.hypot(dy);
-    if !length.is_finite() || length <= f64::EPSILON || !width.is_finite() || width <= 0.0 {
-        return None;
-    }
-    let ux = dx / length;
-    let uy = dy / length;
-    let head_length = (width.max(1.0) * 4.0).max(8.0).min(length * 0.45);
-    let wing_angle = std::f64::consts::PI / 6.0;
-    let back_x = -ux * head_length;
-    let back_y = -uy * head_length;
-    let rotate = |angle: f64| ImagePoint {
-        x: end.x + back_x * angle.cos() - back_y * angle.sin(),
-        y: end.y + back_x * angle.sin() + back_y * angle.cos(),
-    };
-    Some([rotate(wing_angle), rotate(-wing_angle)])
 }
 
 /// Composite a transparent annotation layer onto a copy of the crop.
@@ -252,40 +234,63 @@ fn pixelate_region(
 }
 
 impl AnnotationLayer {
-    fn text(&mut self, position: ImagePoint, text: &str, font_size: f64, color: StrokeColor) {
-        if !font_size.is_finite() || font_size <= 0.0 {
+    fn text(&mut self, position: ImagePoint, text: &str, style: TextStyle, color: StrokeColor) {
+        #[cfg(target_os = "windows")]
+        if windows_text::draw(self, position, text, style, color) {
             return;
         }
-        let cell = font_size / 7.0;
-        let origin_x = position.x;
-        let mut x = origin_x;
-        let mut y = position.y;
-        for ch in text.chars() {
-            if ch == '\n' {
-                x = origin_x;
-                y += cell * 9.0;
-                continue;
-            }
-            if ch == '\r' {
-                continue;
-            }
-            let rows = glyph_rows(ch);
-            for (row, bits) in rows.iter().enumerate() {
-                for col in 0..5 {
-                    if bits & (1 << (4 - col)) != 0 {
-                        self.fill_rect(
-                            x + col as f64 * cell,
-                            y + row as f64 * cell,
-                            x + (col + 1) as f64 * cell,
-                            y + (row + 1) as f64 * cell,
-                            color,
-                        );
+
+        self.text_bitmap(position, text, style, color);
+    }
+
+    fn text_bitmap(
+        &mut self,
+        position: ImagePoint,
+        text: &str,
+        style: TextStyle,
+        color: StrokeColor,
+    ) {
+        if !style.font_size.is_finite() || style.font_size <= 0.0 {
+            return;
+        }
+        let cell = style.font_size / 7.0;
+        let lines = text.split('\n').collect::<Vec<_>>();
+        let max_line_width = lines
+            .iter()
+            .map(|line| line.chars().filter(|ch| *ch != '\r').count() as f64 * cell * 6.0)
+            .fold(0.0, f64::max);
+        for (line_index, line) in lines.iter().enumerate() {
+            let line_width = line.chars().filter(|ch| *ch != '\r').count() as f64 * cell * 6.0;
+            let alignment_offset = match style.alignment {
+                TextAlignment::Left => 0.0,
+                TextAlignment::Center => (max_line_width - line_width) / 2.0,
+                TextAlignment::Right => max_line_width - line_width,
+            };
+            let y = position.y + line_index as f64 * cell * 9.0;
+            let mut char_index = 0usize;
+            for ch in line.chars().filter(|ch| *ch != '\r') {
+                let rows = glyph_rows(ch);
+                let x = position.x + alignment_offset + char_index as f64 * cell * 6.0;
+                for (row, bits) in rows.iter().enumerate() {
+                    let italic_offset = if style.italic {
+                        (6 - row) as f64 * cell * 0.12
+                    } else {
+                        0.0
+                    };
+                    for col in 0..5 {
+                        if bits & (1 << (4 - col)) != 0 {
+                            let left = x + italic_offset + col as f64 * cell;
+                            let top = y + row as f64 * cell;
+                            let right = left + cell;
+                            let bottom = top + cell;
+                            self.fill_rect(left, top, right, bottom, color);
+                            if style.bold {
+                                self.fill_rect(right, top, right + cell * 0.2, bottom, color);
+                            }
+                        }
                     }
                 }
-            }
-            x += cell * 6.0;
-            if x >= self.width as f64 {
-                break;
+                char_index += 1;
             }
         }
     }
@@ -376,6 +381,205 @@ impl AnnotationLayer {
                     blend_pixel(&mut self.rgba[offset..offset + 4], style.color);
                 }
             }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_text {
+    use super::{blend_over, AnnotationLayer, ImagePoint, StrokeColor, TextAlignment, TextStyle};
+    use std::{mem::size_of, ptr};
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::{COLORREF, SIZE},
+            Graphics::Gdi::{
+                CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject,
+                GetTextExtentPoint32W, GetTextMetricsW, SelectObject, SetBkMode, SetTextAlign,
+                SetTextColor, TextOutW, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+                CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, FF_DONTCARE,
+                FW_BOLD, FW_NORMAL, HGDIOBJ, OUT_TT_PRECIS, TA_LEFT, TA_NOUPDATECP, TA_TOP,
+                TEXTMETRICW, TRANSPARENT,
+            },
+        },
+    };
+
+    pub(super) fn draw(
+        layer: &mut AnnotationLayer,
+        position: ImagePoint,
+        text: &str,
+        style: TextStyle,
+        color: StrokeColor,
+    ) -> bool {
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || !style.font_size.is_finite()
+            || style.font_size <= 0.0
+            || layer.width > i32::MAX as u32
+            || layer.height > i32::MAX as u32
+        {
+            return false;
+        }
+        let Some(byte_len) = (layer.width as usize)
+            .checked_mul(layer.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return false;
+        };
+        let Ok(image_bytes) = u32::try_from(byte_len) else {
+            return false;
+        };
+
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                return false;
+            }
+
+            let mut info = BITMAPINFO::default();
+            info.bmiHeader = BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: layer.width as i32,
+                biHeight: -(layer.height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: image_bytes,
+                ..Default::default()
+            };
+            let mut dib_bits = ptr::null_mut();
+            let bitmap =
+                match CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut dib_bits, None, 0) {
+                    Ok(bitmap) if !dib_bits.is_null() => bitmap,
+                    _ => {
+                        let _ = DeleteDC(dc);
+                        return false;
+                    }
+                };
+
+            // An empty face name asks GDI for the system default font. Text
+            // annotations use the same family for preview, save, and copy.
+            let system_font = [0u16];
+            let font_height = style.font_size.round().clamp(1.0, i32::MAX as f64) as i32;
+            let font = CreateFontW(
+                -font_height,
+                0,
+                0,
+                0,
+                if style.bold {
+                    FW_BOLD.0 as i32
+                } else {
+                    FW_NORMAL.0 as i32
+                },
+                u32::from(style.italic),
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_TT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                ANTIALIASED_QUALITY,
+                u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
+                PCWSTR(system_font.as_ptr()),
+            );
+            if font.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                let _ = DeleteDC(dc);
+                return false;
+            }
+
+            let previous_bitmap = SelectObject(dc, HGDIOBJ(bitmap.0));
+            let previous_font = SelectObject(dc, HGDIOBJ(font.0));
+            let result = if previous_bitmap.is_invalid() || previous_font.is_invalid() {
+                false
+            } else {
+                let dib = std::slice::from_raw_parts_mut(dib_bits.cast::<u8>(), byte_len);
+                dib.fill(0);
+                let _ = SetBkMode(dc, TRANSPARENT);
+                let _ = SetTextColor(dc, COLORREF(0x00ff_ffff));
+                let _ = SetTextAlign(dc, TA_LEFT | TA_TOP | TA_NOUPDATECP);
+
+                let mut metrics = TEXTMETRICW::default();
+                if !GetTextMetricsW(dc, &mut metrics).as_bool() {
+                    false
+                } else {
+                    let lines = text
+                        .split('\n')
+                        .map(|line| {
+                            line.chars()
+                                .filter(|character| *character != '\r')
+                                .collect::<String>()
+                                .encode_utf16()
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    let line_widths = lines
+                        .iter()
+                        .map(|line| {
+                            if line.is_empty() {
+                                return Some(0);
+                            }
+                            let mut size = SIZE::default();
+                            GetTextExtentPoint32W(dc, line, &mut size)
+                                .as_bool()
+                                .then_some(size.cx.max(0))
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(line_widths) = line_widths else {
+                        let _ = SelectObject(dc, previous_font);
+                        let _ = SelectObject(dc, previous_bitmap);
+                        let _ = DeleteObject(HGDIOBJ(font.0));
+                        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                        let _ = DeleteDC(dc);
+                        return false;
+                    };
+                    let max_width = line_widths.iter().copied().max().unwrap_or(0);
+                    let line_height = (metrics.tmHeight + metrics.tmExternalLeading)
+                        .max(font_height)
+                        .max(1);
+                    let mut drawn = true;
+                    for (line_index, (line, line_width)) in
+                        lines.iter().zip(line_widths).enumerate()
+                    {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let alignment_offset = match style.alignment {
+                            TextAlignment::Left => 0,
+                            TextAlignment::Center => (max_width - line_width) / 2,
+                            TextAlignment::Right => max_width - line_width,
+                        };
+                        let x = (position.x.round() as i32).saturating_add(alignment_offset);
+                        let y = (position.y.round() as i32).saturating_add(
+                            line_height.saturating_mul(line_index.min(i32::MAX as usize) as i32),
+                        );
+                        if !TextOutW(dc, x, y, line).as_bool() {
+                            drawn = false;
+                            break;
+                        }
+                    }
+                    if drawn {
+                        for (target, pixel) in
+                            layer.rgba.chunks_exact_mut(4).zip(dib.chunks_exact(4))
+                        {
+                            // Drawing white onto a zeroed DIB yields glyph coverage in RGB.
+                            let coverage = pixel[0].max(pixel[1]).max(pixel[2]);
+                            if coverage == 0 {
+                                continue;
+                            }
+                            let alpha =
+                                ((u16::from(color.a) * u16::from(coverage) + 127) / 255) as u8;
+                            blend_over(target, &[color.r, color.g, color.b, alpha]);
+                        }
+                    }
+                    drawn
+                }
+            };
+            let _ = SelectObject(dc, previous_font);
+            let _ = SelectObject(dc, previous_bitmap);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(dc);
+            result
         }
     }
 }
@@ -494,8 +698,8 @@ mod tests {
     use super::{arrowhead_wings, composite, glyph_rows, render, render_composite};
     use crate::core::{
         annotations::{
-            AnnotationDocument, AnnotationGeometry, ImageBounds, ImagePoint, StrokeColor,
-            StrokeStyle, ViewportToImage,
+            AnnotationDocument, AnnotationEditor, AnnotationGeometry, AnnotationTool, ImageBounds,
+            ImagePoint, StrokeColor, StrokeStyle, TextAlignment, TextStyle, ViewportToImage,
         },
         frame::CapturedFrame,
     };
@@ -660,6 +864,37 @@ mod tests {
     }
 
     #[test]
+    fn draft_and_committed_annotation_renders_match_for_each_drag_tool() {
+        let mut pixels = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32u8 {
+            for x in 0..32u8 {
+                pixels.extend_from_slice(&[x, y, x.wrapping_add(y), 255]);
+            }
+        }
+        let source = CapturedFrame::new(32, 32, pixels).unwrap();
+        let mut editor = AnnotationEditor::default();
+
+        for tool in [
+            AnnotationTool::Pen,
+            AnnotationTool::Arrow,
+            AnnotationTool::Rectangle,
+            AnnotationTool::Triangle,
+            AnnotationTool::Ellipse,
+            AnnotationTool::Mosaic,
+        ] {
+            editor.select_tool(tool);
+            editor.begin(ImagePoint { x: 3.0, y: 4.0 });
+            editor.update(ImagePoint { x: 25.0, y: 26.0 });
+            let preview =
+                render_composite(&source, &editor.annotations_for_render(style())).unwrap();
+
+            assert!(editor.finish(style(), 32, 32).unwrap(), "{tool:?}");
+            let committed = render_composite(&source, editor.document().annotations()).unwrap();
+            assert_eq!(preview, committed, "{tool:?}");
+        }
+    }
+
+    #[test]
     fn composite_preserves_source_and_crop_dimensions() {
         let source = CapturedFrame::new(12, 10, vec![24, 48, 72, 255].repeat(120)).unwrap();
         let original = source.clone();
@@ -721,7 +956,10 @@ mod tests {
             AnnotationGeometry::Text {
                 position: ImagePoint { x: 0.0, y: 0.0 },
                 text: "A".into(),
-                font_size: 14.0,
+                text_style: TextStyle {
+                    font_size: 14.0,
+                    ..TextStyle::default()
+                },
             },
             style(),
             12,
@@ -735,6 +973,115 @@ mod tests {
             .pixels()
             .chunks_exact(4)
             .all(|p| p[3] == 0 || p[0] == 255));
+    }
+
+    #[test]
+    fn multiline_text_styles_render_with_alignment_and_clipping() {
+        let position = ImagePoint { x: 5.0, y: 4.0 };
+        let text_style = TextStyle {
+            font_size: 14.0,
+            bold: true,
+            italic: true,
+            alignment: TextAlignment::Right,
+            ..TextStyle::default()
+        };
+        let mut document = AnnotationDocument::default();
+        document
+            .add(
+                AnnotationGeometry::Text {
+                    position,
+                    text: "AB\nC".into(),
+                    text_style,
+                },
+                StrokeStyle {
+                    width: 3.0,
+                    color: StrokeColor {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 255,
+                    },
+                },
+                40,
+                40,
+            )
+            .unwrap();
+        let layer = render(document.annotations(), 40, 40).unwrap();
+        assert!(
+            layer
+                .pixels()
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] != 0)
+                .count()
+                > 30
+        );
+        let mut left_aligned = AnnotationDocument::default();
+        left_aligned
+            .add(
+                AnnotationGeometry::Text {
+                    position,
+                    text: "AB\nC".into(),
+                    text_style: TextStyle {
+                        alignment: TextAlignment::Left,
+                        ..text_style
+                    },
+                },
+                style(),
+                40,
+                40,
+            )
+            .unwrap();
+        assert_ne!(render(left_aligned.annotations(), 40, 40).unwrap(), layer);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn system_default_font_renders_text() {
+        let mut document = AnnotationDocument::default();
+        document
+            .add(
+                AnnotationGeometry::Text {
+                    position: ImagePoint { x: 3.0, y: 3.0 },
+                    text: "System font 09".into(),
+                    text_style: TextStyle {
+                        font_size: 32.0,
+                        ..TextStyle::default()
+                    },
+                },
+                style(),
+                260,
+                64,
+            )
+            .unwrap();
+
+        let raster = render(document.annotations(), 260, 64).unwrap();
+        assert!(raster.pixels().iter().any(|pixel| *pixel != 0));
+    }
+
+    #[test]
+    fn text_draft_preview_matches_committed_rendering() {
+        let mut editor = AnnotationEditor::default();
+        editor.begin_text_annotation(ImagePoint { x: 3.0, y: 5.0 });
+        let text_style = TextStyle {
+            font_size: 20.0,
+            bold: true,
+            italic: true,
+            alignment: TextAlignment::Center,
+            ..TextStyle::default()
+        };
+        let color = StrokeColor {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        editor
+            .update_text_draft("First\nsecond".into(), text_style, color)
+            .unwrap();
+        let preview = render(&editor.annotations_for_render(style()), 48, 48).unwrap();
+        assert!(editor.commit_text_draft(48, 48).unwrap());
+        let committed = render(editor.document().annotations(), 48, 48).unwrap();
+        assert_eq!(preview, committed);
     }
 
     #[test]
@@ -887,7 +1234,10 @@ mod tests {
             AnnotationGeometry::Text {
                 position: ImagePoint { x: 0.0, y: 0.0 },
                 text: "OK".into(),
-                font_size: 16.0,
+                text_style: TextStyle {
+                    font_size: 16.0,
+                    ..TextStyle::default()
+                },
             },
             style(),
             3,
@@ -919,7 +1269,10 @@ mod tests {
             AnnotationGeometry::Text {
                 position: ImagePoint { x: 1.0, y: 1.0 },
                 text: "OK".into(),
-                font_size: 14.0,
+                text_style: TextStyle {
+                    font_size: 14.0,
+                    ..TextStyle::default()
+                },
             },
             style(),
             32,

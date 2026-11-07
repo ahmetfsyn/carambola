@@ -1,4 +1,4 @@
-import { LineEdit } from "std-widgets.slint";
+import { TextEdit } from "std-widgets.slint";
 
 component SelectionHandle inherits Rectangle {
     in property <MouseCursor> handle-cursor: MouseCursor.default;
@@ -19,6 +19,40 @@ component SelectionHandle inherits Rectangle {
     }
 }
 
+component ToolbarIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> tooltip;
+    in property <bool> enabled: true;
+    in property <bool> selected: false;
+    callback clicked();
+    callback tooltip-hovered(string, bool, length);
+    accessible-label: root.tooltip;
+    accessible-role: button;
+    background: !root.enabled ? #1f2937 : root.selected ? #0369a1 : area.has-hover ? #475569 : #334155;
+    border-color: root.selected ? #38bdf8 : #475569;
+    border-width: root.selected ? 1px : 0px;
+    border-radius: 5px;
+
+    Image {
+        x: 8px;
+        y: root.height < 28px ? 3px : 8px;
+        width: root.width - 16px;
+        height: root.height < 28px ? root.height - 6px : root.height - 16px;
+        source: root.icon;
+        image-fit: contain;
+        opacity: root.enabled ? 1.0 : 0.42;
+    }
+
+    area := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+        changed has-hover => {
+            root.tooltip-hovered(root.tooltip, self.has-hover, root.x);
+        }
+    }
+}
+
 export component OverlayPrototype inherits Window {
     title: "Carambola screenshot selection";
     in property <length> frame-viewport-width: 1280px;
@@ -35,7 +69,6 @@ export component OverlayPrototype inherits Window {
     in property <length> selection-width: 0px;
     in property <length> selection-height: 0px;
     in property <bool> annotation-mode: false;
-    in property <bool> selection-adjustment-mode: false;
     in property <length> toolbar-auto-x: 0px;
     in property <length> toolbar-auto-y: 0px;
     in property <float> toolbar-scale: 1.0;
@@ -43,7 +76,7 @@ export component OverlayPrototype inherits Window {
     in property <bool> toolbar-manual-position: false;
     in property <length> toolbar-manual-x: 0px;
     in property <length> toolbar-manual-y: 0px;
-    out property <length> toolbar-effective-width: 620px * root.toolbar-scale;
+    out property <length> toolbar-effective-width: 472px * root.toolbar-scale;
     out property <length> toolbar-effective-height: 64px * root.toolbar-scale;
     out property <length> toolbar-position-x: max(0px, min(root.toolbar-manual-position ? root.toolbar-manual-x : root.toolbar-auto-x, root.width - root.toolbar-effective-width));
     out property <length> toolbar-position-y: max(0px, min(root.toolbar-manual-position ? root.toolbar-manual-y : root.toolbar-auto-y, root.height - root.toolbar-effective-height));
@@ -53,34 +86,53 @@ export component OverlayPrototype inherits Window {
     in property <image> annotation-image;
     in property <int> selected-tool: 0;
     in property <bool> text-entry-visible: false;
+    in property <bool> text-entry-existing: false;
+    in property <bool> text-entry-awaiting-position: false;
+    in property <string> text-entry-message: "";
     in-out property <string> text-entry-value: "";
+    in property <int> text-entry-line-count: 1;
     in property <length> text-entry-x: 0px;
     in property <length> text-entry-y: 0px;
+    in property <int> annotation-size: 3;
+    in-out property <int> annotation-color-index: 0;
+    in-out property <bool> color-palette-open: false;
+    in-out property <bool> text-bold: false;
+    in-out property <bool> text-italic: false;
+    in-out property <int> text-alignment: 0;
+    out property <length> text-entry-content-height: max(24px, min(116px, root.text-entry-line-count * 18px));
+    out property <length> text-entry-panel-height: root.text-entry-awaiting-position ? 96px : 78px + root.text-entry-content-height + (root.text-entry-message == "" ? 0px : 14px);
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
+    in property <bool> can-delete-last-annotation: false;
     in property <bool> export-busy: false;
     in property <string> export-status: "";
+    in-out property <string> toolbar-tooltip-text: "";
+    in-out property <length> toolbar-tooltip-item-x: 0px;
 
     callback pointer-down(float, float, float, float);
     callback pointer-move(float, float, float, float);
     callback pointer-up(float, float, float, float);
     callback pointer-cancel();
-    callback adjustment-pointer-event(PointerEventKind, float, float, float, float);
+    callback crop-selection-pointer-event(PointerEventKind, float, float, float, float);
     callback toolbar-pointer-event(PointerEventKind, float, float, float, float);
-    callback request-adjustment-mode(bool);
+    callback cycle-shape-tool();
+    callback annotation-color-changed(int);
+    callback annotation-size-adjusted(int);
+    callback delete-last-annotation();
     callback confirm-selection-action();
     callback cancel-selection-action();
     callback cancel-selection();
     callback focus-selection();
     callback tool-selected(int);
-    callback finish-annotations();
     callback submit-text(string);
     callback cancel-text();
+    callback text-content-changed(string);
+    callback text-style-changed(bool, bool, int);
+    callback request-text-reposition();
     callback undo-annotation();
     callback redo-annotation();
     callback save-png();
     callback copy-image();
-    callback request-new-selection();
     callback request-capture();
 
     focus-selection => { escape-scope.focus(); }
@@ -126,7 +178,7 @@ export component OverlayPrototype inherits Window {
         width: root.selection-width;
         height: root.selection-height;
         background: transparent;
-        border-color: root.selection-adjustment-mode ? #38bdf8 : #ffffff;
+        border-color: #ffffff;
         border-width: 1px;
     }
 
@@ -150,23 +202,60 @@ export component OverlayPrototype inherits Window {
     }
 
     // The frame is not a parent of these handles, so their outer halves stay
-    // visible outside the selection border. Phase 8.3 will wire gestures.
+    // visible outside the selection border. Handles remain live after crop
+    // creation; the inner perimeter bands provide an unambiguous move target
+    // while keeping the crop interior available to annotation tools.
     Rectangle {
         width: parent.width;
         height: parent.height;
         background: transparent;
-        visible: root.annotation-mode && root.selection-adjustment-mode
-            && root.selection-width > 0px && root.selection-height > 0px;
+        visible: root.selection-width > 0px && root.selection-height > 0px;
 
         TouchArea {
-            x: root.selection-x;
+            x: root.selection-x + 10px;
             y: root.selection-y;
-            width: root.selection-width;
-            height: root.selection-height;
+            width: max(0px, root.selection-width - 20px);
+            height: 12px;
             mouse-cursor: move;
             pointer-event(event) => {
                 if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
-                    root.adjustment-pointer-event(event.kind, (self.x + self.mouse-x) / 1px, (self.y + self.mouse-y) / 1px, root.width / 1px, root.height / 1px);
+                    root.crop-selection-pointer-event(event.kind, (self.x + self.mouse-x) / 1px, (self.y + self.mouse-y) / 1px, root.width / 1px, root.height / 1px);
+                }
+            }
+        }
+        TouchArea {
+            x: root.selection-x + 10px;
+            y: root.selection-y + root.selection-height - 12px;
+            width: max(0px, root.selection-width - 20px);
+            height: 12px;
+            mouse-cursor: move;
+            pointer-event(event) => {
+                if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                    root.crop-selection-pointer-event(event.kind, (self.x + self.mouse-x) / 1px, (self.y + self.mouse-y) / 1px, root.width / 1px, root.height / 1px);
+                }
+            }
+        }
+        TouchArea {
+            x: root.selection-x;
+            y: root.selection-y + 10px;
+            width: 12px;
+            height: max(0px, root.selection-height - 20px);
+            mouse-cursor: move;
+            pointer-event(event) => {
+                if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                    root.crop-selection-pointer-event(event.kind, (self.x + self.mouse-x) / 1px, (self.y + self.mouse-y) / 1px, root.width / 1px, root.height / 1px);
+                }
+            }
+        }
+        TouchArea {
+            x: root.selection-x + root.selection-width - 12px;
+            y: root.selection-y + 10px;
+            width: 12px;
+            height: max(0px, root.selection-height - 20px);
+            mouse-cursor: move;
+            pointer-event(event) => {
+                if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                    root.crop-selection-pointer-event(event.kind, (self.x + self.mouse-x) / 1px, (self.y + self.mouse-y) / 1px, root.width / 1px, root.height / 1px);
                 }
             }
         }
@@ -176,239 +265,253 @@ export component OverlayPrototype inherits Window {
             x: root.selection-x + root.selection-width / 2 - 5px;
             y: root.selection-y - 5px;
             handle-cursor: ns-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
         SelectionHandle {
             x: root.selection-x + root.selection-width - 5px;
             y: root.selection-y + root.selection-height / 2 - 5px;
             handle-cursor: ew-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
         SelectionHandle {
             x: root.selection-x + root.selection-width / 2 - 5px;
             y: root.selection-y + root.selection-height - 5px;
             handle-cursor: ns-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
         SelectionHandle {
             x: root.selection-x - 5px;
             y: root.selection-y + root.selection-height / 2 - 5px;
             handle-cursor: ew-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
         SelectionHandle {
             x: root.selection-x - 5px;
             y: root.selection-y - 5px;
             handle-cursor: nwse-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
         SelectionHandle {
             x: root.selection-x + root.selection-width - 5px;
             y: root.selection-y - 5px;
             handle-cursor: nesw-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
         SelectionHandle {
             x: root.selection-x + root.selection-width - 5px;
             y: root.selection-y + root.selection-height - 5px;
             handle-cursor: nwse-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
         SelectionHandle {
             x: root.selection-x - 5px;
             y: root.selection-y + root.selection-height - 5px;
             handle-cursor: nesw-resize;
-            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
         }
     }
 
-    // Compact annotation toolbar. It is placed after the full-window touch
-    // area so the buttons receive clicks without starting a drawing stroke.
+    // Compact tool row and shared annotation controls.
     Rectangle {
         x: root.toolbar-position-x;
         y: root.toolbar-position-y;
-        width: 620px;
+        width: 472px;
         height: 64px;
         transform-scale-x: root.toolbar-scale * 100%;
         transform-scale-y: root.toolbar-scale * 100%;
         transform-origin: { x: 0px, y: 0px };
         visible: root.annotation-mode;
-        background: #111827ee;
-        border-color: root.selection-adjustment-mode ? #38bdf8 : #64748b;
+        background: #0f172af2;
+        border-color: #64748b;
         border-width: 1px;
-        border-radius: 5px;
+        border-radius: 6px;
 
-        // Absorb presses in toolbar gaps instead of forwarding them to the canvas.
         TouchArea { }
 
-        for tool[i] in ["Pen", "Arrow", "Rect", "Triangle", "Ellipse", "Text", "Mosaic"]: Rectangle {
-            Rectangle {
-                x: 4px + i * 51px;
-                y: 4px;
-                width: 50px;
-                height: 32px;
-                background: root.selection-adjustment-mode ? #1f2937 : root.selected-tool == i ? #2563eb : #334155;
-                border-radius: 3px;
-                Text {
-                    text: tool;
-                    color: root.selection-adjustment-mode ? #64748b : white;
-                    font-size: 11px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+        ToolbarIconButton {
+            x: 8px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/pen.svg"); tooltip: "Pen";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 0;
+            clicked => { root.tool-selected(0); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        ToolbarIconButton {
+            x: 44px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/arrow.svg"); tooltip: "Arrow";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 1;
+            clicked => { root.tool-selected(1); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        ToolbarIconButton {
+            x: 80px; y: 5px; width: 32px; height: 32px;
+            icon: root.selected-tool == 3 ? @image-url("icons/triangle.svg") : root.selected-tool == 4 ? @image-url("icons/ellipse.svg") : @image-url("icons/rectangle.svg");
+            tooltip: root.selected-tool == 3 ? "Shape: Triangle (click to cycle)" : root.selected-tool == 4 ? "Shape: Ellipse (click to cycle)" : "Shape: Rectangle (click to cycle)";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 2 || root.selected-tool == 3 || root.selected-tool == 4;
+            clicked => { root.cycle-shape-tool(); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        ToolbarIconButton {
+            x: 116px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/text.svg"); tooltip: "Text";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 5;
+            clicked => { root.tool-selected(5); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        ToolbarIconButton {
+            x: 152px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/mosaic.svg"); tooltip: "Mosaic";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 6;
+            clicked => { root.tool-selected(6); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+
+        Rectangle { x: 190px; y: 8px; width: 1px; height: 26px; background: #475569; }
+
+        ToolbarIconButton {
+            x: 202px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/undo.svg"); tooltip: "Undo";
+            enabled: root.can-undo && !root.text-entry-visible;
+            clicked => { root.undo-annotation(); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        ToolbarIconButton {
+            x: 238px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/redo.svg"); tooltip: "Redo";
+            enabled: root.can-redo && !root.text-entry-visible;
+            clicked => { root.redo-annotation(); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+
+        Rectangle { x: 274px; y: 8px; width: 1px; height: 26px; background: #475569; }
+
+        ToolbarIconButton {
+            x: 286px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/copy.svg"); tooltip: "Copy";
+            enabled: !root.export-busy && !root.text-entry-visible;
+            clicked => { root.copy-image(); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        ToolbarIconButton {
+            x: 322px; y: 5px; width: 32px; height: 32px;
+            icon: @image-url("icons/save.svg"); tooltip: "Save";
+            enabled: !root.export-busy && !root.text-entry-visible;
+            clicked => { root.save-png(); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+
+        ToolbarIconButton {
+            x: 8px; y: 38px; width: 28px; height: 22px;
+            icon: @image-url("icons/color.svg"); tooltip: "Annotation color";
+            enabled: !root.export-busy;
+            clicked => { root.color-palette-open = !root.color-palette-open; }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        Rectangle {
+            x: 26px; y: 53px; width: 7px; height: 4px;
+            background: root.annotation-color-index == 0 ? #ff3750 : root.annotation-color-index == 1 ? #ffffff : root.annotation-color-index == 2 ? #facc15 : root.annotation-color-index == 3 ? #22d3ee : #22c55e;
+            border-radius: 2px;
+        }
+        for palette-color[i] in [#ff3750, #ffffff, #facc15, #22d3ee, #22c55e]: Rectangle {
+            x: 42px + i * 22px; y: 39px; width: 19px; height: 19px;
+            visible: root.color-palette-open;
+            background: palette-color;
+            border-color: root.annotation-color-index == i ? #38bdf8 : #64748b;
+            border-width: root.annotation-color-index == i ? 2px : 1px;
+            border-radius: 4px;
+            accessible-role: button;
+            accessible-label: i == 0 ? "Red" : i == 1 ? "White" : i == 2 ? "Yellow" : i == 3 ? "Cyan" : "Green";
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.annotation-color-index = i;
+                    root.annotation-color-changed(i);
+                    root.color-palette-open = false;
                 }
-                TouchArea {
-                    enabled: !root.selection-adjustment-mode;
-                    mouse-cursor: pointer;
-                    clicked => { root.tool-selected(i); }
-                }
             }
         }
 
-        Rectangle {
-            x: 364px;
-            y: 4px;
-            width: 45px;
-            height: 32px;
-            background: root.can-undo ? #334155 : #1f2937;
-            border-radius: 3px;
-            Text { text: "Undo"; color: root.can-undo ? white : #64748b; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea { enabled: root.can-undo; mouse-cursor: pointer; clicked => { root.undo-annotation(); } }
-        }
-
-        Rectangle {
-            x: 413px;
-            y: 4px;
-            width: 45px;
-            height: 32px;
-            background: root.can-redo ? #334155 : #1f2937;
-            border-radius: 3px;
-            Text { text: "Redo"; color: root.can-redo ? white : #64748b; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea { enabled: root.can-redo; mouse-cursor: pointer; clicked => { root.redo-annotation(); } }
-        }
-
-        Rectangle {
-            x: 462px;
-            y: 4px;
-            width: 48px;
-            height: 32px;
-            background: root.export-busy ? #1f2937 : #334155;
-            border-radius: 3px;
-            Text { text: "Copy"; color: root.export-busy ? #64748b : white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea {
-                enabled: !root.export-busy;
-                mouse-cursor: pointer;
-                clicked => { root.copy-image(); }
+        Text { x: 158px; y: 39px; width: 27px; height: 22px; text: "Size"; color: #cbd5e1; font-size: 9px; vertical-alignment: center; }
+        ToolbarIconButton {
+            x: 187px; y: 38px; width: 22px; height: 22px;
+            icon: @image-url("icons/minus.svg"); tooltip: "Smaller annotation";
+            enabled: !root.export-busy;
+            clicked => { root.annotation-size-adjusted(-1); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
             }
         }
-
-        Rectangle {
-            x: 514px;
-            y: 4px;
-            width: 48px;
-            height: 32px;
-            background: root.export-busy ? #1f2937 : #2563eb;
-            border-radius: 3px;
-            Text { text: "Save"; color: root.export-busy ? #64748b : white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea {
-                enabled: !root.export-busy;
-                mouse-cursor: pointer;
-                clicked => { root.save-png(); }
-            }
-        }
-
-        Rectangle {
-            x: 566px;
-            y: 4px;
-            width: 50px;
-            height: 32px;
-            background: root.export-busy ? #1f2937 : #15803d;
-            border-radius: 3px;
-            Text {
-                text: "Done";
-                color: root.export-busy ? #64748b : white;
-                font-size: 11px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            TouchArea {
-                enabled: !root.export-busy;
-                mouse-cursor: pointer;
-                clicked => { root.finish-annotations(); }
-            }
-        }
-
-        Rectangle {
-            x: 4px;
-            y: 40px;
-            width: 90px;
-            height: 20px;
-            background: root.selection-adjustment-mode ? #0284c7 : #334155;
-            border-radius: 3px;
-            Text {
-                text: root.selection-adjustment-mode ? "Annotate" : "Adjust";
-                color: white;
-                font-size: 10px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.request-adjustment-mode(!root.selection-adjustment-mode); }
-            }
-        }
-
-        Rectangle {
-            x: 98px;
-            y: 40px;
-            width: 130px;
-            height: 20px;
-            background: #334155;
-            border-radius: 3px;
-            Text {
-                text: "New Selection";
-                color: white;
-                font-size: 10px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.request-new-selection(); }
-            }
-        }
-
         Text {
-            x: 236px;
-            y: 42px;
-            width: 142px;
-            height: 18px;
-            visible: root.selection-adjustment-mode;
-            text: "Adjust selection";
-            color: #38bdf8;
-            font-size: 10px;
-            vertical-alignment: center;
+            x: 211px; y: 39px; width: 34px; height: 22px;
+            text: "\{root.annotation-size}";
+            color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center;
         }
-
+        ToolbarIconButton {
+            x: 247px; y: 38px; width: 22px; height: 22px;
+            icon: @image-url("icons/plus.svg"); tooltip: "Larger annotation";
+            enabled: !root.export-busy;
+            clicked => { root.annotation-size-adjusted(1); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
+        ToolbarIconButton {
+            x: 278px; y: 38px; width: 28px; height: 22px;
+            icon: @image-url("icons/delete.svg"); tooltip: "Delete last annotation";
+            enabled: root.can-delete-last-annotation && !root.text-entry-visible;
+            clicked => { root.delete-last-annotation(); }
+            tooltip-hovered(label, visible, item-x) => {
+                root.toolbar-tooltip-text = visible ? label : "";
+                root.toolbar-tooltip-item-x = item-x;
+            }
+        }
         Text {
-            x: root.selection-adjustment-mode ? 360px : 236px;
-            y: 42px;
-            width: root.selection-adjustment-mode ? 252px : 376px;
-            height: 18px;
+            x: 314px; y: 39px; width: 150px; height: 22px;
+            visible: root.export-status != "";
             text: root.export-status;
             color: #cbd5e1;
-            font-size: 10px;
+            font-size: 9px;
             vertical-alignment: center;
             overflow: elide;
         }
-
-        // The status row is the non-action drag surface when the toolbar is
-        // forced over the selection. Its coordinates are mapped back through
-        // the toolbar scale into the Overlay's logical viewport.
         TouchArea {
-            x: 236px;
-            y: 40px;
-            width: 376px;
-            height: 20px;
+            x: 314px; y: 38px; width: 150px; height: 22px;
             enabled: root.toolbar-drag-enabled;
             mouse-cursor: move;
             pointer-event(event) => {
@@ -426,35 +529,162 @@ export component OverlayPrototype inherits Window {
     }
 
     Rectangle {
-        x: min(root.text-entry-x, parent.width - 300px);
-        y: min(root.text-entry-y, parent.height - 52px);
-        width: 300px;
-        height: 44px;
+        visible: root.annotation-mode && root.toolbar-tooltip-text != "";
+        width: min(128px, root.width);
+        height: 24px;
+        x: max(
+            0px,
+            min(
+                root.width - self.width,
+                root.toolbar-position-x
+                    + (root.toolbar-tooltip-item-x + 16px) * root.toolbar-scale
+                    - self.width / 2
+            )
+        );
+        y: root.toolbar-position-y >= 28px
+            ? root.toolbar-position-y - 26px
+            : min(root.height - self.height, root.toolbar-position-y + root.toolbar-effective-height + 2px);
+        background: #020617;
+        border-color: #64748b;
+        border-width: 1px;
+        border-radius: 4px;
+        Text {
+            text: root.toolbar-tooltip-text;
+            color: #f8fafc;
+            font-size: 9px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    Rectangle {
+        x: max(0px, min(root.text-entry-x, parent.width - 360px));
+        y: max(0px, min(root.text-entry-y, parent.height - min(root.text-entry-panel-height, parent.height)));
+        width: min(360px, parent.width);
+        height: min(root.text-entry-panel-height, parent.height);
         visible: root.text-entry-visible;
         background: #111827ee;
         border-color: #64748b;
         border-width: 1px;
         border-radius: 5px;
-        text-input := LineEdit {
-            x: 4px; y: 4px; width: 198px; height: 34px;
+
+        text-input := TextEdit {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: root.text-entry-content-height;
             text <=> root.text-entry-value;
+            wrap: word-wrap;
+            font-size: 13px;
+            visible: !root.text-entry-awaiting-position;
             placeholder-text: "Enter text";
-            accepted => { root.submit-text(self.text); }
+            edited(text) => { root.text-content-changed(text); }
         }
         Rectangle {
-            x: 206px; y: 4px; width: 44px; height: 34px;
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: 36px;
+            visible: root.text-entry-awaiting-position;
+            background: #1f2937;
+            Text {
+                x: 8px;
+                y: 4px;
+                width: parent.width - 16px;
+                height: parent.height - 8px;
+                text: "Click the new text position in the selection.";
+                color: #e2e8f0;
+                font-size: 11px;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle {
+            x: 8px; y: 12px + root.text-entry-content-height; width: 28px; height: 24px;
+            visible: !root.text-entry-awaiting-position;
+            background: root.text-bold ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text { text: "B"; color: white; font-size: 11px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.text-bold = !root.text-bold;
+                    root.text-style-changed(root.text-bold, root.text-italic, root.text-alignment);
+                }
+            }
+        }
+        Rectangle {
+            x: 40px; y: 12px + root.text-entry-content-height; width: 28px; height: 24px;
+            visible: !root.text-entry-awaiting-position;
+            background: root.text-italic ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text { text: "I"; color: white; font-size: 11px; font-italic: true; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.text-italic = !root.text-italic;
+                    root.text-style-changed(root.text-bold, root.text-italic, root.text-alignment);
+                }
+            }
+        }
+        for alignment[i] in ["L", "C", "R"]: Rectangle {
+            x: 76px + i * 27px;
+            y: 12px + root.text-entry-content-height;
+            width: 24px;
+            height: 24px;
+            visible: !root.text-entry-awaiting-position;
+            background: root.text-alignment == i ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text { text: alignment; color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.text-alignment = i;
+                    root.text-style-changed(root.text-bold, root.text-italic, root.text-alignment);
+                }
+            }
+        }
+        Text {
+            x: 8px;
+            y: 40px + root.text-entry-content-height;
+            width: parent.width - 16px;
+            height: 14px;
+            visible: root.text-entry-message != "" && !root.text-entry-awaiting-position;
+            text: root.text-entry-message;
+            color: #cbd5e1;
+            font-size: 9px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            x: 8px; y: parent.height - 36px; width: 72px; height: 28px;
+            visible: root.text-entry-existing;
+            background: root.text-entry-awaiting-position ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text {
+                text: root.text-entry-awaiting-position ? "Cancel move" : "Move";
+                color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea { mouse-cursor: pointer; clicked => { root.request-text-reposition(); } }
+        }
+        Rectangle {
+            x: parent.width - 132px; y: parent.height - 36px; width: 60px; height: 28px;
             background: #15803d; border-radius: 3px;
-            Text { text: "Add"; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
-            TouchArea { mouse-cursor: pointer; clicked => { root.submit-text(root.text-entry-value); } }
+            Text { text: "Confirm"; color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                enabled: !root.text-entry-awaiting-position;
+                mouse-cursor: pointer;
+                clicked => { root.submit-text(root.text-entry-value); }
+            }
         }
         Rectangle {
-            x: 254px; y: 4px; width: 42px; height: 34px;
+            x: parent.width - 66px; y: parent.height - 36px; width: 58px; height: 28px;
             background: #334155; border-radius: 3px;
-            Text { text: "Cancel"; color: white; font-size: 9px; horizontal-alignment: center; vertical-alignment: center; }
+            Text { text: "Cancel"; color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
             TouchArea { mouse-cursor: pointer; clicked => { root.cancel-text(); } }
         }
     }
-
     Rectangle {
         visible: root.confirm-selection-action-visible;
         width: parent.width;
@@ -530,7 +760,11 @@ export component OverlayPrototype inherits Window {
         height: 1px;
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                root.cancel-selection();
+                if (root.text-entry-visible) {
+                    root.cancel-text();
+                } else {
+                    root.cancel-selection();
+                }
                 accept
             } else {
                 reject

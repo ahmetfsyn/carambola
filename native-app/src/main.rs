@@ -10,11 +10,15 @@ mod overlay_ui {
 use core::{
     annotation_render,
     annotations::{
-        Annotation, AnnotationEditor, AnnotationTool, ImagePoint, StrokeStyle, ViewportToImage,
+        Annotation, AnnotationEditor, AnnotationTool, ImagePoint, StrokeColor, TextAlignment,
+        TextAnnotationDraft, ViewportToImage,
     },
     frame::{CapturedFrame, PixelRect},
     geometry::{FrameViewport, LogicalViewport, ViewportToFrame},
-    lifecycle::{overlay_close_policy, AppAction, ClosePolicy, TrayCommand},
+    lifecycle::{
+        export_notification, export_should_close_overlay, overlay_close_policy, AppAction,
+        ClosePolicy, ExportKind, TrayCommand,
+    },
     selection::{hit_test_selection, GestureKind, LogicalRect, SelectionGeometry, SelectionHit},
     session::CaptureSession,
 };
@@ -23,7 +27,6 @@ use slint::private_unstable_api::re_exports::PointerEventKind;
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use std::{
-    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
         Arc, Mutex,
@@ -42,6 +45,48 @@ fn finish_capture_session(session: &CaptureSession, reason: &str) {
     session.finish();
 }
 
+fn close_capture_after_export(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    reason: &str,
+) -> Result<(), String> {
+    platform::trace_event(&format!(
+        "capture.export_success.close.begin reason={reason:?}"
+    ));
+    trace_overlay_state(overlay, "capture.export_success.close.before");
+    overlay
+        .hide()
+        .map_err(|error| format!("Could not hide the selection overlay: {error}"))?;
+    trace_overlay_state(overlay, "capture.export_success.close.hidden");
+    overlay.window().set_fullscreen(false);
+    platform::trace_slint_native_handle(
+        "Overlay",
+        "export_success.after_hide_and_fullscreen_exit",
+        overlay.window(),
+    );
+
+    *state.frame.lock().expect("capture frame lock") = None;
+    *state.crop.lock().expect("selected crop lock") = None;
+    *state.bounds.lock().expect("selection bounds lock") = None;
+    *state.geometry.lock().expect("selection geometry lock") = SelectionGeometry::default();
+    *state.active_kind.lock().expect("active gesture lock") = None;
+    *state.viewport.lock().expect("frame viewport lock") = None;
+    *state.editor.lock().expect("annotation editor lock") = None;
+    state.clear_text_interaction();
+    overlay.set_annotation_mode(false);
+    overlay.set_toolbar_tooltip_text("".into());
+    overlay.set_color_palette_open(false);
+    overlay.set_annotation_image(Image::default());
+    overlay.set_text_entry_visible(false);
+    overlay.set_text_entry_line_count(1);
+    overlay.set_captured_image(Image::default());
+    finish_capture_session(&state.session, reason);
+    platform::trace_event(&format!(
+        "capture.export_success.close.complete reason={reason:?}"
+    ));
+    Ok(())
+}
+
 fn trace_overlay_state(overlay: &OverlayPrototype, operation: &str) {
     platform::trace_component_state(
         "Overlay",
@@ -55,12 +100,6 @@ fn close_request_response(policy: ClosePolicy) -> slint::CloseRequestResponse {
     match policy {
         ClosePolicy::KeepShown => slint::CloseRequestResponse::KeepWindowShown,
     }
-}
-
-fn crop_output_path() -> PathBuf {
-    std::env::temp_dir()
-        .join("carambola-native")
-        .join("selected-crop.png")
 }
 
 fn annotation_snapshot(
@@ -85,7 +124,10 @@ fn start_export_operation(
     overlay: &OverlayPrototype,
     busy: Arc<AtomicBool>,
     status: &'static str,
+    kind: ExportKind,
+    notification_owner_hwnd: isize,
     operation: impl FnOnce() -> Result<String, String> + Send + 'static,
+    on_success: impl FnOnce(&OverlayPrototype) -> Result<(), String> + Send + 'static,
 ) {
     platform::trace_event(&format!("export.requested status={status:?}"));
     if busy
@@ -107,19 +149,30 @@ fn start_export_operation(
             "export.worker.end status={status:?} success={}",
             result.is_ok()
         ));
+        if let Some(message) = export_notification(&result, kind) {
+            if let Err(error) = platform::show_notification(message, notification_owner_hwnd) {
+                log::warn!("Could not show export success notification: {error}");
+            }
+        }
         let busy_for_dispatch = busy.clone();
         let dispatched = slint::invoke_from_event_loop(move || {
             platform::trace_event(&format!("export.result_dispatch.entered status={status:?}"));
-            busy_for_dispatch.store(false, Ordering::Release);
-            let message = match result {
+            let was_successful = export_should_close_overlay(&result);
+            let mut message = match result {
                 Ok(message) => message,
                 Err(error) => format!("Export failed: {error}"),
             };
             if let Some(overlay) = weak_overlay.upgrade() {
+                if was_successful {
+                    if let Err(error) = on_success(&overlay) {
+                        message = format!("{message}, but the overlay could not close: {error}");
+                    }
+                }
                 overlay.set_export_busy(false);
                 overlay.set_export_status(message.clone().into());
                 trace_overlay_state(&overlay, "export.completed");
             }
+            busy_for_dispatch.store(false, Ordering::Release);
         });
         if let Err(error) = dispatched {
             busy.store(false, Ordering::Release);
@@ -147,6 +200,22 @@ fn annotation_point(
     }
     .map(x - bounds.x, y - bounds.y)
     .map(Some)
+}
+
+fn text_alignment_from_index(index: i32) -> TextAlignment {
+    match index {
+        1 => TextAlignment::Center,
+        2 => TextAlignment::Right,
+        _ => TextAlignment::Left,
+    }
+}
+
+fn text_alignment_index(alignment: TextAlignment) -> i32 {
+    match alignment {
+        TextAlignment::Left => 0,
+        TextAlignment::Center => 1,
+        TextAlignment::Right => 2,
+    }
 }
 
 fn current_frame_transform(
@@ -180,14 +249,18 @@ struct SelectionState {
     viewport: Arc<Mutex<Option<FrameViewport>>>,
     editor: Arc<Mutex<Option<AnnotationEditor>>>,
     text_position: Arc<Mutex<Option<ImagePoint>>>,
+    text_awaiting_position: Arc<Mutex<bool>>,
     session: Arc<CaptureSession>,
     toolbar_snapshot: Arc<Mutex<Option<ToolbarPositionSnapshot>>>,
     toolbar_drag: Arc<Mutex<Option<ToolbarDrag>>>,
 }
 
-const TOOLBAR_DESIGN_WIDTH: f64 = 620.0;
+const TOOLBAR_DESIGN_WIDTH: f64 = 472.0;
 const TOOLBAR_DESIGN_HEIGHT: f64 = 64.0;
 const TOOLBAR_GAP: f64 = 8.0;
+const TEXT_EDITOR_WIDTH: f64 = 360.0;
+const TEXT_EDITOR_HEIGHT: f64 = 208.0;
+const CROP_MOVE_BAND: f64 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ToolbarLayout {
@@ -225,6 +298,7 @@ impl SelectionState {
             viewport: Arc::new(Mutex::new(None)),
             editor: Arc::new(Mutex::new(None)),
             text_position: Arc::new(Mutex::new(None)),
+            text_awaiting_position: Arc::new(Mutex::new(false)),
             session: Arc::new(CaptureSession::default()),
             toolbar_snapshot: Arc::new(Mutex::new(None)),
             toolbar_drag: Arc::new(Mutex::new(None)),
@@ -234,6 +308,76 @@ impl SelectionState {
     fn current_transform(&self, width: f64, height: f64) -> Option<ViewportToFrame> {
         current_frame_transform(&self.viewport, width, height)
     }
+
+    fn clear_text_interaction(&self) {
+        *self.text_position.lock().expect("text position lock") = None;
+        *self
+            .text_awaiting_position
+            .lock()
+            .expect("text reposition lock") = false;
+    }
+}
+
+fn show_text_editor(
+    overlay: &OverlayPrototype,
+    draft: &TextAnnotationDraft,
+    x: f64,
+    y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+) {
+    overlay.set_text_entry_value(draft.text.clone().into());
+    overlay.set_text_entry_line_count(text_editor_visual_line_count(&draft.text));
+    overlay.set_annotation_size(draft.text_style.font_size.round().clamp(8.0, 256.0) as i32);
+    overlay.set_annotation_color_index(draft.color.palette_index());
+    overlay.set_color_palette_open(false);
+    overlay.set_text_bold(draft.text_style.bold);
+    overlay.set_text_italic(draft.text_style.italic);
+    overlay.set_text_alignment(text_alignment_index(draft.text_style.alignment));
+    overlay.set_text_entry_existing(draft.annotation_id.is_some());
+    overlay.set_text_entry_awaiting_position(false);
+    overlay.set_text_entry_message("".into());
+    overlay.set_text_entry_x(
+        x.max(0.0)
+            .min((viewport_width - TEXT_EDITOR_WIDTH).max(0.0)) as f32,
+    );
+    overlay.set_text_entry_y(
+        y.max(0.0)
+            .min((viewport_height - TEXT_EDITOR_HEIGHT).max(0.0)) as f32,
+    );
+    overlay.set_text_entry_visible(true);
+}
+
+fn sync_annotation_controls(overlay: &OverlayPrototype, editor: &AnnotationEditor) {
+    overlay.set_annotation_size(editor.active_size().round() as i32);
+    overlay.set_annotation_color_index(editor.active_color().palette_index());
+}
+
+fn text_editor_visual_line_count(text: &str) -> i32 {
+    let lines = text
+        .split('\n')
+        .map(|line| {
+            line.chars()
+                .filter(|character| *character != '\r')
+                .count()
+                .div_ceil(42)
+                .max(1)
+        })
+        .sum::<usize>();
+    lines.clamp(1, 6) as i32
+}
+
+fn selection_move_band_contains(selection: LogicalRect, x: f64, y: f64) -> bool {
+    let right = selection.x + selection.width;
+    let bottom = selection.y + selection.height;
+    x >= selection.x
+        && x <= right
+        && y >= selection.y
+        && y <= bottom
+        && (x - selection.x <= CROP_MOVE_BAND
+            || right - x <= CROP_MOVE_BAND
+            || y - selection.y <= CROP_MOVE_BAND
+            || bottom - y <= CROP_MOVE_BAND)
 }
 
 fn present_pixel_rect(
@@ -326,15 +470,6 @@ fn calculate_toolbar_layout(
         };
     };
     let (x, _) = clamp_toolbar_position(selection.x, 0.0, viewport, scale);
-    let above_y = selection.y - height - TOOLBAR_GAP;
-    if above_y >= 0.0 {
-        return ToolbarLayout {
-            x,
-            y: above_y,
-            scale,
-            forced_inside: false,
-        };
-    }
     let below_y = selection.y + selection.height + TOOLBAR_GAP;
     if below_y + height <= viewport.height {
         return ToolbarLayout {
@@ -344,8 +479,36 @@ fn calculate_toolbar_layout(
             forced_inside: false,
         };
     }
+    let above_y = selection.y - height - TOOLBAR_GAP;
+    if above_y >= 0.0 {
+        return ToolbarLayout {
+            x,
+            y: above_y,
+            scale,
+            forced_inside: false,
+        };
+    }
     let max_x = (viewport.width - width).max(0.0);
     let max_y = (viewport.height - height).max(0.0);
+    let side_y = selection.y.clamp(0.0, max_y);
+    let right_x = selection.x + selection.width + TOOLBAR_GAP;
+    if right_x + width <= viewport.width {
+        return ToolbarLayout {
+            x: right_x,
+            y: side_y,
+            scale,
+            forced_inside: false,
+        };
+    }
+    let left_x = selection.x - width - TOOLBAR_GAP;
+    if left_x >= 0.0 {
+        return ToolbarLayout {
+            x: left_x,
+            y: side_y,
+            scale,
+            forced_inside: false,
+        };
+    }
     let x = if selection.width >= width {
         selection
             .x
@@ -495,18 +658,6 @@ fn selection_has_pending_edits(state: &SelectionState) -> bool {
             .is_some()
 }
 
-fn request_selection_reset(overlay: &OverlayPrototype, state: &SelectionState) {
-    if selection_has_pending_edits(state) {
-        overlay.set_confirm_selection_action_message(
-            "Discard the current selection and its annotations?".into(),
-        );
-        overlay.set_confirm_selection_action_visible(true);
-    } else if let Err(error) = reset_to_new_selection(overlay, state) {
-        log::warn!("Could not start a new selection: {error}");
-        set_status(overlay, format!("Could not start a new selection: {error}"));
-    }
-}
-
 fn reset_to_new_selection(
     overlay: &OverlayPrototype,
     state: &SelectionState,
@@ -536,7 +687,7 @@ fn reset_to_new_selection(
     *state.active_kind.lock().expect("active gesture lock") = None;
     *state.crop.lock().expect("selected crop lock") = None;
     *state.bounds.lock().expect("selection bounds lock") = None;
-    *state.text_position.lock().expect("text position lock") = None;
+    state.clear_text_interaction();
     *state
         .toolbar_snapshot
         .lock()
@@ -544,11 +695,12 @@ fn reset_to_new_selection(
     cancel_toolbar_drag(overlay, state);
     overlay.set_toolbar_manual_position(false);
     overlay.set_annotation_mode(false);
-    overlay.set_selection_adjustment_mode(false);
     overlay.set_confirm_selection_action_visible(false);
     overlay.set_annotation_image(Image::default());
     overlay.set_text_entry_visible(false);
     overlay.set_text_entry_value(String::new().into());
+    overlay.set_text_entry_line_count(1);
+    overlay.set_color_palette_open(false);
     overlay.set_can_undo(false);
     overlay.set_can_redo(false);
     clear_selection_preview(overlay);
@@ -587,9 +739,6 @@ fn begin_selection_gesture(
         .expect("selection geometry lock")
         .committed();
     let kind = if let Some(rect) = committed {
-        if !overlay.get_selection_adjustment_mode() {
-            return Ok(false);
-        }
         match hit_test_selection(rect, x, y, 5.0, transform)? {
             SelectionHit::Outside => GestureKind::Create,
             SelectionHit::Move => GestureKind::Move,
@@ -817,9 +966,15 @@ fn finish_selection_gesture(
     let kind = kind.unwrap_or(GestureKind::Create);
     if kind == GestureKind::Create {
         *state.editor.lock().expect("annotation editor lock") = Some(AnnotationEditor::default());
-        *state.text_position.lock().expect("text position lock") = None;
+        state.clear_text_interaction();
+        overlay.set_annotation_size(3);
+        overlay.set_annotation_color_index(0);
+        overlay.set_color_palette_open(false);
         overlay.set_text_entry_visible(false);
         overlay.set_text_entry_value(String::new().into());
+        overlay.set_text_entry_line_count(1);
+        overlay.set_text_entry_existing(false);
+        overlay.set_text_entry_awaiting_position(false);
         overlay.set_annotation_image(Image::default());
         if !state.session.is_active() {
             log::warn!("Selection was committed after its capture session ended");
@@ -838,7 +993,14 @@ fn finish_selection_gesture(
     overlay.set_selection_y(logical.y as f32);
     overlay.set_selection_width(logical.width as f32);
     overlay.set_selection_height(logical.height as f32);
-    overlay.set_selected_tool(AnnotationTool::Pen.ui_index());
+    let selected_tool_index = state
+        .editor
+        .lock()
+        .expect("annotation editor lock")
+        .as_ref()
+        .map(|editor| editor.active_tool().ui_index())
+        .unwrap_or_else(|| AnnotationTool::Pen.ui_index());
+    overlay.set_selected_tool(selected_tool_index);
     overlay.set_annotation_mode(true);
     overlay.set_confirm_selection_action_visible(false);
     platform::trace_event(&format!(
@@ -957,9 +1119,15 @@ fn install_overlay_scale_factor_handler(overlay: &OverlayPrototype, state: Selec
             if crop.width() > 0 && crop.height() > 0 {
                 let x = bounds.x + point.x * bounds.width / f64::from(crop.width()) + 8.0;
                 let y = bounds.y + point.y * bounds.height / f64::from(crop.height()) + 8.0;
-                overlay.set_text_entry_x(x.max(0.0) as f32);
-                overlay
-                    .set_text_entry_y(y.min((logical_size.height - 52.0).max(0.0)).max(0.0) as f32);
+                overlay.set_text_entry_x(
+                    x.max(0.0)
+                        .min((logical_size.width - TEXT_EDITOR_WIDTH).max(0.0))
+                        as f32,
+                );
+                overlay.set_text_entry_y(
+                    y.min((logical_size.height - TEXT_EDITOR_HEIGHT).max(0.0))
+                        .max(0.0) as f32,
+                );
             }
         }
 
@@ -980,26 +1148,28 @@ fn refresh_annotation_preview(
     crop_slot: &Arc<Mutex<Option<CapturedFrame>>>,
     editor_slot: &Arc<Mutex<Option<AnnotationEditor>>>,
 ) -> Result<(), &'static str> {
-    let crop = crop_slot.lock().expect("selected crop lock").clone();
-    let Some(crop) = crop else {
+    let crop_guard = crop_slot.lock().expect("selected crop lock");
+    let Some(crop) = crop_guard.as_ref() else {
         return Err("selected crop is no longer available");
     };
-    let (annotations, can_undo, can_redo) = {
+    let (annotations, can_undo, can_redo, can_delete_last) = {
         let guard = editor_slot.lock().expect("annotation editor lock");
         let Some(editor) = guard.as_ref() else {
             return Err("annotation editor is no longer available");
         };
         (
-            editor.annotations_for_render(StrokeStyle::default()),
+            editor.annotations_for_render(editor.active_stroke_style()),
             editor.can_undo(),
             editor.can_redo(),
+            editor.can_delete_last(),
         )
     };
-    let rendered = annotation_render::render_composite(&crop, &annotations)?;
+    let rendered = annotation_render::render_composite(crop, &annotations)?;
     let output = image_from_rgba(rendered.pixels(), rendered.width(), rendered.height());
     overlay.set_annotation_image(output);
     overlay.set_can_undo(can_undo);
     overlay.set_can_redo(can_redo);
+    overlay.set_can_delete_last_annotation(can_delete_last);
     Ok(())
 }
 
@@ -1087,23 +1257,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *state_for_capture.active_kind.lock().expect("active gesture lock") = None;
         *state_for_capture.viewport.lock().expect("frame viewport lock") = None;
         *state_for_capture.editor.lock().expect("annotation editor lock") = None;
-        *state_for_capture.text_position.lock().expect("text position lock") = None;
+        state_for_capture.clear_text_interaction();
 
         let Some(overlay) = weak_overlay.upgrade() else {
             finish_capture_session(&state_for_capture.session, "overlay_unavailable_before_capture");
             return;
         };
         overlay.set_annotation_mode(false);
-        overlay.set_selection_adjustment_mode(false);
+        overlay.set_toolbar_tooltip_text("".into());
+        overlay.set_color_palette_open(false);
+        overlay.set_annotation_color_index(0);
+        overlay.set_annotation_size(3);
         overlay.set_confirm_selection_action_visible(false);
         overlay.set_annotation_image(Image::default());
         overlay.set_text_entry_visible(false);
         overlay.set_text_entry_value(String::new().into());
+        overlay.set_text_entry_line_count(1);
         overlay.set_can_undo(false);
         overlay.set_can_redo(false);
         overlay.set_export_busy(false);
         overlay.set_export_status("Capturing desktop…".into());
         clear_selection_preview(&overlay);
+
+        let requested_display_id = match platform::display_at_cursor_id() {
+            Ok(display_id) => display_id,
+            Err(error) => {
+                set_status(&overlay, format!("Could not identify the display under the cursor: {error}"));
+                finish_capture_session(&state_for_capture.session, "cursor_display_query_failed");
+                return;
+            }
+        };
 
         platform::trace_event("capture.start.prepare_capture.begin");
         if let Err(error) = platform::prepare_capture() {
@@ -1117,9 +1300,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak_overlay = overlay.as_weak();
         let state_for_result = state_for_capture.clone();
         thread::spawn(move || {
-            platform::trace_event("capture.capture_primary.worker_begin");
-            let captured = platform::capture_primary();
-            platform::trace_event(&format!("capture.capture_primary.worker_end success={}", captured.is_ok()));
+            platform::trace_event(&format!(
+                "capture.capture_display.worker_begin display={requested_display_id:?}"
+            ));
+            let captured = platform::capture_display(requested_display_id.as_deref());
+            platform::trace_event(&format!(
+                "capture.capture_display.worker_end display={requested_display_id:?} success={}",
+                captured.is_ok()
+            ));
             let session_for_dispatch = state_for_result.session.clone();
             let session_for_queue_error = state_for_result.session.clone();
             let dispatched = slint::invoke_from_event_loop(move || {
@@ -1159,7 +1347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     };
                     if bottom_right.x != display.bounds.right || bottom_right.y != display.bounds.bottom {
-                        set_status(&overlay, "The captured frame dimensions do not match the primary display.");
+                        set_status(&overlay, "The captured frame dimensions do not match the selected display.");
                         finish_capture_session(&state_for_result.session, "frame_display_bounds_mismatch");
                         return;
                     }
@@ -1167,6 +1355,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "capture.frame_desktop_geometry display={:?} origin=({}, {}) end=({}, {})",
                         display.id, origin.x, origin.y, bottom_right.x, bottom_right.y
                     ));
+                    // Place and size the hidden HWND on the selected monitor
+                    // before borderless fullscreen. Winit resolves
+                    // Borderless(None) from MonitorFromWindow(hwnd).
                     overlay.window().set_position(slint::PhysicalPosition::new(origin.x, origin.y));
                 }
 
@@ -1213,7 +1404,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 overlay.set_frame_viewport_height(logical_size.height as f32);
                 overlay.set_captured_image(image_from_rgba(frame.pixels(), frame.width(), frame.height()));
                 overlay.set_annotation_mode(false);
-                overlay.set_selection_adjustment_mode(false);
                 overlay.set_annotation_image(Image::default());
                 clear_selection_preview(&overlay);
                 *state_for_result.frame.lock().expect("capture frame lock") = Some(frame);
@@ -1318,13 +1508,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .editor
             .lock()
             .expect("annotation editor lock") = None;
-        *state_for_cancel
-            .text_position
-            .lock()
-            .expect("text position lock") = None;
+        state_for_cancel.clear_text_interaction();
         if let Some(overlay) = weak_overlay.upgrade() {
             overlay.set_annotation_mode(false);
-            overlay.set_selection_adjustment_mode(false);
             overlay.set_annotation_image(Image::default());
             overlay.set_text_entry_visible(false);
             overlay.set_confirm_selection_action_visible(false);
@@ -1363,26 +1549,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             return;
         }
-        if overlay.get_annotation_mode() && !overlay.get_selection_adjustment_mode() {
-            if state_for_down
-                .current_transform(width as f64, height as f64)
-                .is_none()
-            {
-                return;
-            }
+        if overlay.get_annotation_mode() {
+            let transform = match state_for_down.current_transform(width as f64, height as f64) {
+                Some(transform) => transform,
+                None => return,
+            };
             if toolbar_contains(&overlay, x as f64, y as f64)
                 || state_for_down
                     .toolbar_drag
                     .lock()
                     .expect("toolbar drag lock")
                     .is_some()
-                || state_for_down
-                    .text_position
-                    .lock()
-                    .expect("text position lock")
-                    .is_some()
             {
                 return;
+            }
+
+            let committed = state_for_down
+                .geometry
+                .lock()
+                .expect("selection geometry lock")
+                .committed();
+            if let Some(rect) = committed {
+                let logical_bounds = *state_for_down.bounds.lock().expect("selection bounds lock");
+                let hit = match hit_test_selection(rect, x as f64, y as f64, 5.0, transform) {
+                    Ok(hit) => hit,
+                    Err(error) => {
+                        log::warn!("Could not hit-test crop selection: {error}");
+                        return;
+                    }
+                };
+                let starts_crop_gesture = match hit {
+                    SelectionHit::Outside | SelectionHit::Resize(_) => true,
+                    SelectionHit::Move => logical_bounds.is_some_and(|bounds| {
+                        selection_move_band_contains(bounds, x as f64, y as f64)
+                    }),
+                };
+                if starts_crop_gesture {
+                    if let Err(error) = begin_selection_gesture(
+                        &overlay,
+                        &state_for_down,
+                        x as f64,
+                        y as f64,
+                        width as f64,
+                        height as f64,
+                    ) {
+                        log::warn!("Could not begin crop selection gesture: {error}");
+                    }
+                    return;
+                }
             }
             let bounds = *state_for_down.bounds.lock().expect("selection bounds lock");
             let crop = state_for_down
@@ -1396,21 +1610,113 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Ok(Some(point)) = annotation_point(x as f64, y as f64, bounds, &crop) else {
                 return;
             };
-            if state_for_down
-                .editor
+            let awaiting_position = *state_for_down
+                .text_awaiting_position
                 .lock()
-                .expect("annotation editor lock")
-                .as_ref()
-                .is_some_and(|editor| editor.active_tool() == AnnotationTool::Text)
-            {
+                .expect("text reposition lock");
+            if awaiting_position {
+                let text_draft = {
+                    let mut guard = state_for_down
+                        .editor
+                        .lock()
+                        .expect("annotation editor lock");
+                    let Some(editor) = guard.as_mut() else {
+                        return;
+                    };
+                    if let Err(error) = editor.move_text_draft(point) {
+                        log::warn!("Could not move text annotation: {error}");
+                        return;
+                    }
+                    let Some(draft) = editor.text_draft().cloned() else {
+                        return;
+                    };
+                    draft
+                };
                 *state_for_down
                     .text_position
                     .lock()
                     .expect("text position lock") = Some(point);
-                overlay.set_text_entry_value(String::new().into());
-                overlay.set_text_entry_x((x + 8.0).max(0.0));
-                overlay.set_text_entry_y((y + 8.0).min((height - 52.0).max(0.0)));
-                overlay.set_text_entry_visible(true);
+                *state_for_down
+                    .text_awaiting_position
+                    .lock()
+                    .expect("text reposition lock") = false;
+                overlay.set_text_entry_awaiting_position(false);
+                overlay.set_text_entry_message("Text position updated.".into());
+                show_text_editor(
+                    &overlay,
+                    &text_draft,
+                    x as f64 + 8.0,
+                    y as f64 + 8.0,
+                    width as f64,
+                    height as f64,
+                );
+                if let Err(error) = refresh_annotation_preview(
+                    &overlay,
+                    &state_for_down.crop,
+                    &state_for_down.editor,
+                ) {
+                    log::warn!("Could not render text position preview: {error}");
+                }
+                return;
+            }
+            if state_for_down
+                .text_position
+                .lock()
+                .expect("text position lock")
+                .is_some()
+            {
+                return;
+            }
+            let text_tool = state_for_down
+                .editor
+                .lock()
+                .expect("annotation editor lock")
+                .as_ref()
+                .is_some_and(|editor| editor.active_tool() == AnnotationTool::Text);
+            if text_tool {
+                let text_draft = {
+                    let mut guard = state_for_down
+                        .editor
+                        .lock()
+                        .expect("annotation editor lock");
+                    let Some(editor) = guard.as_mut() else { return };
+                    if let Some(id) = editor.text_annotation_at(point) {
+                        if let Err(error) = editor.begin_text_edit(id) {
+                            log::warn!("Could not open text annotation for editing: {error}");
+                            return;
+                        }
+                    } else {
+                        editor.begin_text_annotation(point);
+                    }
+                    let Some(draft) = editor.text_draft().cloned() else {
+                        return;
+                    };
+                    editor.set_active_text_style(draft.text_style);
+                    editor.set_active_color(draft.color);
+                    Some(draft)
+                };
+                let Some(text_draft) = text_draft else {
+                    return;
+                };
+                *state_for_down
+                    .text_position
+                    .lock()
+                    .expect("text position lock") = Some(text_draft.position);
+                show_text_editor(
+                    &overlay,
+                    &text_draft,
+                    x as f64 + 8.0,
+                    y as f64 + 8.0,
+                    width as f64,
+                    height as f64,
+                );
+                if let Err(error) = refresh_annotation_preview(
+                    &overlay,
+                    &state_for_down.crop,
+                    &state_for_down.editor,
+                ) {
+                    log::warn!("Could not render text editor preview: {error}");
+                }
                 return;
             }
             if let Some(editor) = state_for_down
@@ -1559,9 +1865,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut guard = state_for_up.editor.lock().expect("annotation editor lock");
             if let Some(editor) = guard.as_mut().filter(|editor| editor.is_drawing()) {
                 editor.update(point);
-                if let Err(error) =
-                    editor.finish(StrokeStyle::default(), crop.width(), crop.height())
-                {
+                let style = editor.active_stroke_style();
+                if let Err(error) = editor.finish(style, crop.width(), crop.height()) {
                     log::warn!("Could not finish annotation: {error}");
                 }
             } else {
@@ -1610,33 +1915,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
-    let state_for_adjustment = selection.clone();
-    overlay.on_adjustment_pointer_event(move |kind, x, y, width, height| {
+    let state_for_crop_selection = selection.clone();
+    overlay.on_crop_selection_pointer_event(move |kind, x, y, width, height| {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
         let (x, y, width, height) = (x as f64, y as f64, width as f64, height as f64);
         match kind {
             PointerEventKind::Down => {
-                if let Err(error) =
-                    begin_selection_gesture(&overlay, &state_for_adjustment, x, y, width, height)
-                {
-                    log::warn!("Could not begin adjustment gesture: {error}");
+                if let Err(error) = begin_selection_gesture(
+                    &overlay,
+                    &state_for_crop_selection,
+                    x,
+                    y,
+                    width,
+                    height,
+                ) {
+                    log::warn!("Could not begin crop selection gesture: {error}");
                 }
             }
             PointerEventKind::Move => {
-                if let Err(error) =
-                    update_selection_gesture(&overlay, &state_for_adjustment, x, y, width, height)
-                {
+                if let Err(error) = update_selection_gesture(
+                    &overlay,
+                    &state_for_crop_selection,
+                    x,
+                    y,
+                    width,
+                    height,
+                ) {
                     log::warn!("Could not update adjustment gesture: {error}");
-                    cancel_selection_gesture(&overlay, &state_for_adjustment, width, height);
+                    cancel_selection_gesture(&overlay, &state_for_crop_selection, width, height);
                 }
             }
             PointerEventKind::Up => {
-                finish_selection_gesture(&overlay, &state_for_adjustment, x, y, width, height);
+                finish_selection_gesture(&overlay, &state_for_crop_selection, x, y, width, height);
             }
             PointerEventKind::Cancel => {
-                cancel_selection_gesture(&overlay, &state_for_adjustment, width, height);
+                cancel_selection_gesture(&overlay, &state_for_crop_selection, width, height);
             }
             _ => {}
         }
@@ -1660,41 +1975,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
-    let state_for_adjustment_mode = selection.clone();
-    overlay.on_request_adjustment_mode(move |enabled| {
-        let Some(overlay) = weak_overlay.upgrade() else {
-            return;
-        };
-        let has_selection = state_for_adjustment_mode
-            .geometry
-            .lock()
-            .expect("selection geometry lock")
-            .committed()
-            .is_some();
-        if enabled && !has_selection {
-            overlay.set_selection_adjustment_mode(false);
-            return;
-        }
-        if !enabled {
-            cancel_selection_gesture(
-                &overlay,
-                &state_for_adjustment_mode,
-                f64::from(overlay.get_frame_viewport_width()),
-                f64::from(overlay.get_frame_viewport_height()),
-            );
-        }
-        overlay.set_selection_adjustment_mode(enabled);
-        overlay.invoke_focus_selection();
-    });
-
-    let weak_overlay = overlay.as_weak();
-    let state_for_new_selection = selection.clone();
-    overlay.on_request_new_selection(move || {
+    let state_for_delete_last = selection.clone();
+    overlay.on_delete_last_annotation(move || {
         if let Some(overlay) = weak_overlay.upgrade() {
-            request_selection_reset(&overlay, &state_for_new_selection);
+            if !overlay.get_annotation_mode() || overlay.get_text_entry_visible() {
+                return;
+            }
+            let deleted = state_for_delete_last
+                .editor
+                .lock()
+                .expect("annotation editor lock")
+                .as_mut()
+                .is_some_and(AnnotationEditor::delete_last);
+            if deleted {
+                update_preview_if_possible(
+                    &overlay,
+                    &state_for_delete_last.crop,
+                    &state_for_delete_last.editor,
+                );
+                overlay.set_export_status("Last annotation deleted. Undo is available.".into());
+            }
+            overlay.invoke_focus_selection();
         }
     });
-
     let weak_overlay = overlay.as_weak();
     let state_for_confirm = selection.clone();
     overlay.on_confirm_selection_action(move || {
@@ -1721,18 +2024,207 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let editor_slot = selection.editor.clone();
+    let state_for_tool_selection = selection.clone();
     let weak_overlay = overlay.as_weak();
     overlay.on_tool_selected(move |index| {
         platform::diagnose_cursor("tool selected");
         let Some(tool) = AnnotationTool::from_ui_index(index) else {
             return;
         };
+        if state_for_tool_selection
+            .text_position
+            .lock()
+            .expect("text position lock")
+            .is_some()
+        {
+            return;
+        }
         if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
             editor.select_tool(tool);
             if let Some(overlay) = weak_overlay.upgrade() {
+                sync_annotation_controls(&overlay, editor);
                 overlay.set_selected_tool(index);
                 overlay.invoke_focus_selection();
             }
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_shape_cycle = selection.clone();
+    overlay.on_cycle_shape_tool(move || {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let mut guard = state_for_shape_cycle
+            .editor
+            .lock()
+            .expect("annotation editor lock");
+        let Some(editor) = guard.as_mut() else {
+            return;
+        };
+        let tool = editor.active_tool().next_shape();
+        editor.select_tool(tool);
+        sync_annotation_controls(&overlay, editor);
+        overlay.set_selected_tool(tool.ui_index());
+        overlay.invoke_focus_selection();
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_color = selection.clone();
+    overlay.on_annotation_color_changed(move |index| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let color = StrokeColor::from_palette_index(index);
+        let changed = {
+            let mut guard = state_for_color
+                .editor
+                .lock()
+                .expect("annotation editor lock");
+            if let Some(editor) = guard.as_mut() {
+                editor.set_active_color(color);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            overlay.set_annotation_color_index(color.palette_index());
+            update_preview_if_possible(&overlay, &state_for_color.crop, &state_for_color.editor);
+        }
+        overlay.invoke_focus_selection();
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_size = selection.clone();
+    overlay.on_annotation_size_adjusted(move |direction| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let size = {
+            let mut guard = state_for_size
+                .editor
+                .lock()
+                .expect("annotation editor lock");
+            let Some(editor) = guard.as_mut() else {
+                return;
+            };
+            let step = if editor.active_tool() == AnnotationTool::Text {
+                2.0
+            } else {
+                1.0
+            };
+            editor.set_active_size(editor.active_size() + f64::from(direction) * step)
+        };
+        overlay.set_annotation_size(size.round() as i32);
+        update_preview_if_possible(&overlay, &state_for_size.crop, &state_for_size.editor);
+        overlay.invoke_focus_selection();
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_text_content = selection.clone();
+    overlay.on_text_content_changed(move |text| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        overlay.set_text_entry_line_count(text_editor_visual_line_count(text.as_str()));
+        let result = {
+            let mut guard = state_for_text_content
+                .editor
+                .lock()
+                .expect("annotation editor lock");
+            match guard
+                .as_mut()
+                .and_then(|editor| editor.text_draft().cloned().map(|draft| (editor, draft)))
+            {
+                Some((editor, draft)) => {
+                    editor.update_text_draft(text.to_string(), draft.text_style, draft.color)
+                }
+                None => Err("text editor draft is unavailable"),
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("Could not update text preview: {error}");
+            return;
+        }
+        update_preview_if_possible(
+            &overlay,
+            &state_for_text_content.crop,
+            &state_for_text_content.editor,
+        );
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_text_style = selection.clone();
+    overlay.on_text_style_changed(move |bold, italic, alignment| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let result = {
+            let mut guard = state_for_text_style
+                .editor
+                .lock()
+                .expect("annotation editor lock");
+            if let Some(editor) = guard.as_mut() {
+                if let Some(draft) = editor.text_draft().cloned() {
+                    let mut text_style = draft.text_style;
+                    text_style.bold = bold;
+                    text_style.italic = italic;
+                    text_style.alignment = text_alignment_from_index(alignment);
+                    editor.set_active_text_style(text_style);
+                    editor.update_text_draft(draft.text, text_style, draft.color)
+                } else {
+                    Err("text editor draft is unavailable")
+                }
+            } else {
+                Err("annotation editor is unavailable")
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("Could not update text styling preview: {error}");
+            return;
+        }
+        update_preview_if_possible(
+            &overlay,
+            &state_for_text_style.crop,
+            &state_for_text_style.editor,
+        );
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_text_reposition = selection.clone();
+    overlay.on_request_text_reposition(move || {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let is_existing_text = state_for_text_reposition
+            .editor
+            .lock()
+            .expect("annotation editor lock")
+            .as_ref()
+            .and_then(|editor| {
+                editor
+                    .text_draft()
+                    .map(|draft| draft.annotation_id.is_some())
+            })
+            .unwrap_or(false);
+        if !is_existing_text {
+            return;
+        }
+        let mut awaiting = state_for_text_reposition
+            .text_awaiting_position
+            .lock()
+            .expect("text reposition lock");
+        *awaiting = !*awaiting;
+        overlay.set_text_entry_awaiting_position(*awaiting);
+        overlay.set_text_entry_message(if *awaiting {
+            "Click the new text position in the selection.".into()
+        } else {
+            "Text position unchanged.".into()
+        });
+        if *awaiting {
+            overlay.set_text_entry_x(8.0);
+            overlay.set_text_entry_y(8.0);
         }
     });
 
@@ -1742,13 +2234,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
-        overlay.set_text_entry_visible(false);
-        let position = state_for_text
-            .text_position
+        if *state_for_text
+            .text_awaiting_position
             .lock()
-            .expect("text position lock")
-            .take();
-        let Some(position) = position else { return };
+            .expect("text reposition lock")
+        {
+            return;
+        }
+        if text.trim().is_empty() {
+            overlay.set_text_entry_message("Text cannot be empty. Enter text or cancel.".into());
+            return;
+        }
         let dimensions = state_for_text
             .crop
             .lock()
@@ -1756,35 +2252,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|crop| (crop.width(), crop.height()));
         let Some((width, height)) = dimensions else {
+            overlay
+                .set_text_entry_message("The selected screenshot is no longer available.".into());
             return;
         };
-        let result = match state_for_text
-            .editor
-            .lock()
-            .expect("annotation editor lock")
-            .as_mut()
-        {
-            Some(editor) => editor.add_text(position, text.to_string(), width, height),
-            None => Err("annotation editor is no longer available"),
+        let result = {
+            let mut guard = state_for_text
+                .editor
+                .lock()
+                .expect("annotation editor lock");
+            let Some(editor) = guard.as_mut() else {
+                overlay
+                    .set_text_entry_message("The annotation editor is no longer available.".into());
+                return;
+            };
+            let Some(draft) = editor.text_draft().cloned() else {
+                overlay
+                    .set_text_entry_message("The text editor draft is no longer available.".into());
+                return;
+            };
+            if let Err(error) =
+                editor.update_text_draft(text.to_string(), draft.text_style, draft.color)
+            {
+                Err(error)
+            } else {
+                editor.commit_text_draft(width, height)
+            }
         };
         match result {
             Ok(_) => {
-                update_preview_if_possible(&overlay, &state_for_text.crop, &state_for_text.editor)
+                state_for_text.clear_text_interaction();
+                overlay.set_text_entry_visible(false);
+                overlay.set_text_entry_value(String::new().into());
+                overlay.set_text_entry_line_count(1);
+                overlay.set_text_entry_existing(false);
+                overlay.set_text_entry_awaiting_position(false);
+                overlay.set_text_entry_message("".into());
+                update_preview_if_possible(&overlay, &state_for_text.crop, &state_for_text.editor);
+                overlay.invoke_focus_selection();
             }
-            Err(error) => log::warn!("Could not add text annotation: {error}"),
+            Err(error) => {
+                log::warn!("Could not commit text annotation: {error}");
+                overlay.set_text_entry_message(format!("Could not save text: {error}").into());
+            }
         }
     });
 
     let weak_overlay = overlay.as_weak();
     let state_for_cancel_text = selection.clone();
     overlay.on_cancel_text(move || {
-        *state_for_cancel_text
-            .text_position
+        if let Some(editor) = state_for_cancel_text
+            .editor
             .lock()
-            .expect("text position lock") = None;
+            .expect("annotation editor lock")
+            .as_mut()
+        {
+            editor.cancel_text_draft();
+        }
+        state_for_cancel_text.clear_text_interaction();
         if let Some(overlay) = weak_overlay.upgrade() {
             overlay.set_text_entry_visible(false);
             overlay.set_text_entry_value(String::new().into());
+            overlay.set_text_entry_line_count(1);
+            overlay.set_text_entry_existing(false);
+            overlay.set_text_entry_awaiting_position(false);
+            overlay.set_text_entry_message("".into());
+            update_preview_if_possible(
+                &overlay,
+                &state_for_cancel_text.crop,
+                &state_for_cancel_text.editor,
+            );
             overlay.invoke_focus_selection();
         }
     });
@@ -1822,7 +2359,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let weak_overlay = overlay.as_weak();
     let state_for_save = selection.clone();
+    let state_for_save_completion = selection.clone();
     let busy_for_save = export_busy.clone();
+    let notification_owner_for_save = clipboard_owner_hwnd.clone();
     overlay.on_save_png(move || {
         platform::trace_event("export.save_png.callback");
         let Some(overlay) = weak_overlay.upgrade() else {
@@ -1857,10 +2396,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
         };
+        let notification_owner = notification_owner_for_save.load(Ordering::Acquire);
         start_export_operation(
             &overlay,
             busy_for_save.clone(),
             "Saving PNG…",
+            ExportKind::Save,
+            notification_owner,
             move || {
                 let rendered = annotation_render::render_composite(&crop, &annotations)
                     .map_err(str::to_owned)?;
@@ -1871,11 +2413,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| "screenshot.png".into());
                 Ok(format!("Saved {name}"))
             },
+            {
+                let state = state_for_save_completion.clone();
+                move |overlay| close_capture_after_export(overlay, &state, "saved")
+            },
         );
     });
 
     let weak_overlay = overlay.as_weak();
     let state_for_copy = selection.clone();
+    let state_for_copy_completion = selection.clone();
     let busy_for_copy = export_busy.clone();
     let clipboard_owner_for_copy = clipboard_owner_hwnd.clone();
     overlay.on_copy_image(move || {
@@ -1905,154 +2452,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &overlay,
             busy_for_copy.clone(),
             "Copying image to clipboard…",
+            ExportKind::Copy,
+            owner_hwnd,
             move || {
                 let rendered = annotation_render::render_composite(&crop, &annotations)
                     .map_err(str::to_owned)?;
                 platform::copy_image_to_clipboard(&rendered, owner_hwnd)?;
                 Ok("Image copied to clipboard".into())
             },
+            {
+                let state = state_for_copy_completion.clone();
+                move |overlay| close_capture_after_export(overlay, &state, "copied")
+            },
         );
-    });
-
-    let weak_overlay = overlay.as_weak();
-    let state_for_done = selection.clone();
-    let busy_for_done = export_busy.clone();
-    overlay.on_finish_annotations(move || {
-        let action_id = platform::begin_window_action("Done");
-        platform::trace_event("capture.done.requested");
-        if let Some(overlay) = weak_overlay.upgrade() {
-            trace_overlay_state(&overlay, "capture.done.requested");
-        }
-        if busy_for_done.load(Ordering::Acquire) {
-            if let Some(overlay) = weak_overlay.upgrade() {
-                overlay.set_export_status("Wait for the current export before finishing.".into());
-            }
-            platform::finish_window_action(action_id, "rejected_export_busy");
-            return;
-        }
-        let Some(overlay) = weak_overlay.upgrade() else {
-            platform::finish_window_action(action_id, "overlay_unavailable");
-            return;
-        };
-        platform::diagnose_cursor("done before close");
-        if state_for_done
-            .text_position
-            .lock()
-            .expect("pending text position lock")
-            .is_some()
-        {
-            overlay.set_export_status("Add or cancel the current text before finishing.".into());
-            platform::finish_window_action(action_id, "rejected_pending_text");
-            return;
-        }
-        let crop = state_for_done
-            .crop
-            .lock()
-            .expect("selected crop lock")
-            .take();
-        let annotations = state_for_done
-            .editor
-            .lock()
-            .expect("annotation editor lock")
-            .as_ref()
-            .map(|editor| editor.document().annotations().to_vec());
-        let (Some(crop), Some(annotations)) = (crop, annotations) else {
-            log::error!("Cannot finish annotation: crop or editor state is missing");
-            platform::finish_window_action(action_id, "rejected_missing_crop_or_editor");
-            return;
-        };
-        if !state_for_done.session.begin_saving() {
-            *state_for_done.crop.lock().expect("selected crop lock") = Some(crop);
-            log::error!("Could not transition capture session into saving state");
-            platform::finish_window_action(action_id, "rejected_session_transition");
-            return;
-        }
-        platform::trace_event("capture.session.transition=Saving");
-        *state_for_done.frame.lock().expect("capture frame lock") = None;
-        *state_for_done.bounds.lock().expect("selection bounds lock") = None;
-        *state_for_done
-            .geometry
-            .lock()
-            .expect("selection geometry lock") = SelectionGeometry::default();
-        *state_for_done
-            .active_kind
-            .lock()
-            .expect("active gesture lock") = None;
-        *state_for_done.viewport.lock().expect("frame viewport lock") = None;
-        *state_for_done
-            .editor
-            .lock()
-            .expect("annotation editor lock") = None;
-        *state_for_done
-            .text_position
-            .lock()
-            .expect("text position lock") = None;
-        overlay.set_annotation_mode(false);
-        overlay.set_selection_adjustment_mode(false);
-        overlay.set_annotation_image(Image::default());
-        overlay.set_text_entry_visible(false);
-        platform::trace_event("overlay.hide.done.before");
-        trace_overlay_state(&overlay, "overlay.hide.done.before");
-        let hide_result = overlay.hide();
-        platform::trace_event(&format!(
-            "overlay.hide.done.result success={}",
-            hide_result.is_ok()
-        ));
-        trace_overlay_state(&overlay, "overlay.hide.done.after");
-        overlay.window().set_fullscreen(false);
-        platform::trace_slint_native_handle(
-            "Overlay",
-            "done.after_hide_and_fullscreen_exit",
-            overlay.window(),
-        );
-        overlay.set_captured_image(Image::default());
-        platform::diagnose_cursor("done after close");
-
-        let weak_overlay_result = overlay.as_weak();
-        let session_result = state_for_done.session.clone();
-        thread::spawn(move || {
-            platform::trace_event("capture.done.save_worker.begin");
-            let saved = (|| {
-                let output = annotation_render::render_composite(&crop, &annotations)
-                    .map_err(str::to_owned)?;
-                let output_path = crop_output_path();
-                std::fs::create_dir_all(output_path.parent().expect("temp path parent"))
-                    .map_err(|error| error.to_string())?;
-                crate::core::export::write_png(&output_path, &output)?;
-                Ok::<_, String>((output_path, output.width(), output.height()))
-            })();
-            platform::trace_event(&format!(
-                "capture.done.save_worker.end success={}",
-                saved.is_ok()
-            ));
-            let session_for_dispatch = session_result.clone();
-            if let Err(error) = slint::invoke_from_event_loop(move || {
-                platform::trace_event("capture.done.result_dispatch.entered");
-                if let Some(overlay) = weak_overlay_result.upgrade() {
-                    match saved {
-                        Ok((path, width, height)) => set_status(
-                            &overlay,
-                            format!(
-                                "Capture complete. Temporary PNG: {} ({width}×{height})",
-                                path.display()
-                            ),
-                        ),
-                        Err(error) => set_status(
-                            &overlay,
-                            format!("Could not save annotated screenshot: {error}"),
-                        ),
-                    }
-                }
-                finish_capture_session(&session_for_dispatch, "done_result_dispatched");
-                platform::trace_event("capture.done.session_finished");
-            }) {
-                log::error!(
-                    "Could not return annotated screenshot result to the UI thread: {error}"
-                );
-                finish_capture_session(&session_result, "done_result_dispatch_failed");
-            }
-        });
-        platform::finish_window_action(action_id, "save_worker_started");
     });
 
     #[cfg(target_os = "windows")]
@@ -2163,7 +2575,7 @@ mod toolbar_layout_tests {
     }
 
     #[test]
-    fn toolbar_prefers_above_selection_when_it_fits() {
+    fn toolbar_prefers_below_selection_when_it_fits() {
         let layout = calculate_toolbar_layout(
             Some(selection(120.0, 100.0, 240.0, 100.0)),
             viewport(900.0, 700.0),
@@ -2172,7 +2584,7 @@ mod toolbar_layout_tests {
             layout,
             ToolbarLayout {
                 x: 120.0,
-                y: 28.0,
+                y: 208.0,
                 scale: 1.0,
                 forced_inside: false,
             }
@@ -2186,6 +2598,36 @@ mod toolbar_layout_tests {
             viewport(900.0, 700.0),
         );
         assert_eq!(layout.y, 108.0);
+        assert!(!layout.forced_inside);
+    }
+
+    #[test]
+    fn toolbar_uses_above_when_below_does_not_fit() {
+        let layout = calculate_toolbar_layout(
+            Some(selection(120.0, 560.0, 240.0, 100.0)),
+            viewport(900.0, 700.0),
+        );
+        assert_eq!(layout.y, 488.0);
+        assert!(!layout.forced_inside);
+    }
+
+    #[test]
+    fn toolbar_uses_right_side_when_above_and_below_do_not_fit() {
+        let layout = calculate_toolbar_layout(
+            Some(selection(0.0, 0.0, 100.0, 600.0)),
+            viewport(900.0, 600.0),
+        );
+        assert_eq!((layout.x, layout.y), (108.0, 0.0));
+        assert!(!layout.forced_inside);
+    }
+
+    #[test]
+    fn toolbar_uses_left_side_when_right_above_and_below_do_not_fit() {
+        let layout = calculate_toolbar_layout(
+            Some(selection(700.0, 0.0, 100.0, 600.0)),
+            viewport(900.0, 600.0),
+        );
+        assert_eq!((layout.x, layout.y), (220.0, 0.0));
         assert!(!layout.forced_inside);
     }
 
@@ -2210,7 +2652,7 @@ mod toolbar_layout_tests {
             (-50.0, 590.0),
         ] {
             let (x, y) = clamp_toolbar_position(x, y, viewport, 1.0);
-            assert!((0.0..=180.0).contains(&x));
+            assert!((0.0..=328.0).contains(&x));
             assert!((0.0..=536.0).contains(&y));
         }
     }
@@ -2253,5 +2695,21 @@ mod toolbar_layout_tests {
                 forced_inside: false,
             }
         );
+    }
+
+    #[test]
+    fn crop_move_band_is_inside_the_perimeter_and_not_the_drawing_interior() {
+        let crop = selection(20.0, 30.0, 200.0, 120.0);
+        assert!(selection_move_band_contains(crop, 80.0, 35.0));
+        assert!(selection_move_band_contains(crop, 25.0, 90.0));
+        assert!(!selection_move_band_contains(crop, 100.0, 90.0));
+        assert!(!selection_move_band_contains(crop, 10.0, 90.0));
+    }
+
+    #[test]
+    fn text_editor_grows_for_multiline_input_and_caps_its_height() {
+        assert_eq!(text_editor_visual_line_count("one line"), 1);
+        assert_eq!(text_editor_visual_line_count("one\ntwo\nthree"), 3);
+        assert_eq!(text_editor_visual_line_count(&"x\n".repeat(12)), 6);
     }
 }

@@ -392,6 +392,39 @@ pub fn enumerate_displays() -> Result<Vec<crate::core::display::DisplayMetadata>
     Ok(enumeration.displays)
 }
 
+/// Snapshot the display under the physical desktop cursor. This is called on
+/// the UI thread when capture is requested so a later worker-thread delay or
+/// cursor movement cannot silently retarget the screenshot.
+pub fn display_at_cursor() -> Result<crate::core::display::DisplayMetadata, String> {
+    use crate::core::display::{select_display_at_point, PhysicalPoint};
+    use windows::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+
+    let mut cursor = POINT::default();
+    unsafe { GetCursorPos(&mut cursor) }
+        .map_err(|error| format!("Could not read the desktop cursor position: {error}"))?;
+    let displays = enumerate_displays()?;
+    let selected = select_display_at_point(
+        &displays,
+        PhysicalPoint {
+            x: cursor.x,
+            y: cursor.y,
+        },
+    )?
+    .clone();
+    crate::platform::trace_event(&format!(
+        "capture.cursor_display point=({}, {}) id={:?} bounds=({}, {}, {}, {}) dpi={}",
+        cursor.x,
+        cursor.y,
+        selected.id,
+        selected.bounds.left,
+        selected.bounds.top,
+        selected.bounds.right,
+        selected.bounds.bottom,
+        selected.effective_dpi
+    ));
+    Ok(selected)
+}
+
 /// Capture the requested display, defaulting to the primary display.
 /// The process is Per-Monitor-V2 aware before this function is called, so
 /// monitor bounds and BitBlt source coordinates describe physical pixels.
@@ -512,10 +545,6 @@ pub fn capture_display(requested_id: Option<&str>) -> Result<CapturedFrame, Stri
             .with_display_metadata(selected)
             .map_err(str::to_owned)
     }
-}
-
-pub fn capture_primary() -> Result<CapturedFrame, String> {
-    capture_display(None)
 }
 
 /// Synchronize with DWM before the capture worker reads desktop pixels.

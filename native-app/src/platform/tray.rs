@@ -23,8 +23,8 @@ use windows::{
                 RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
             },
             Shell::{
-                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-                NOTIFYICONDATAW, NOTIFYICONDATAW_0,
+                Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD,
+                NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONDATAW_0,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW,
@@ -49,6 +49,47 @@ const COMMAND_EXIT: u32 = 3;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
 const TRAY_STOP_MESSAGE: u32 = WM_APP + 2;
 const CLASS_NAME: PCWSTR = w!("CarambolaNativeTrayHost");
+
+/// Ask Explorer to show a native notification balloon for the existing tray
+/// icon. It does not create or show another application window.
+pub fn show_notification(owner_hwnd: isize, message: &str) -> Result<(), String> {
+    let hwnd = HWND(owner_hwnd as *mut c_void);
+    if hwnd.is_invalid() {
+        return Err("The native tray notification owner is unavailable".into());
+    }
+
+    let mut info = [0u16; 256];
+    let mut title = [0u16; 64];
+    let info_units = message
+        .encode_utf16()
+        .take(info.len() - 1)
+        .collect::<Vec<_>>();
+    info[..info_units.len()].copy_from_slice(&info_units);
+    let title_units = "Carambola"
+        .encode_utf16()
+        .take(title.len() - 1)
+        .collect::<Vec<_>>();
+    title[..title_units.len()].copy_from_slice(&title_units);
+
+    let data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_INFO,
+        szInfo: info,
+        szInfoTitle: title,
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        Ok(())
+    } else {
+        let error = unsafe { GetLastError().0 };
+        Err(format!(
+            "Windows could not show the notification (error {error})"
+        ))
+    }
+}
 
 type CommandCallback = Arc<dyn Fn(TrayCommand) + Send + Sync + 'static>;
 

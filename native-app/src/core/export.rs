@@ -1,7 +1,10 @@
 //! PNG encoding and file output for rendered screenshot frames.
 
 use image::ImageEncoder;
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use super::frame::CapturedFrame;
 
@@ -20,8 +23,12 @@ pub fn encode_png(frame: &CapturedFrame) -> Result<Vec<u8>, String> {
 
 pub fn write_png(path: &Path, frame: &CapturedFrame) -> Result<(), String> {
     let bytes = encode_png(frame)?;
-    std::fs::write(path, bytes)
-        .map_err(|error| format!("Could not write PNG to {}: {error}", path.display()))
+    let mut file = std::fs::File::create(path)
+        .map_err(|error| format!("Could not create PNG at {}: {error}", path.display()))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("Could not write PNG to {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("Could not commit PNG to {}: {error}", path.display()))
 }
 
 pub fn ensure_png_extension(mut path: PathBuf) -> Result<PathBuf, String> {
@@ -72,7 +79,23 @@ mod tests {
         let path = scratch_dir().join("missing").join("image.png");
         let frame = CapturedFrame::new(1, 1, vec![1, 2, 3, 255]).unwrap();
         let error = write_png(&path, &frame).unwrap_err();
-        assert!(error.contains("Could not write PNG"));
+        assert!(error.contains("Could not create PNG"));
+    }
+
+    #[test]
+    fn png_write_returns_after_the_complete_file_is_readable() {
+        let directory = scratch_dir();
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("image.png");
+        let frame = CapturedFrame::new(2, 1, vec![1, 2, 3, 255, 40, 50, 60, 255]).unwrap();
+
+        write_png(&path, &frame).unwrap();
+
+        let decoded = image::open(&path).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 1));
+        assert_eq!(decoded.into_raw(), frame.pixels());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

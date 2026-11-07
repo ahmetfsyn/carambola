@@ -17,6 +17,25 @@ pub enum ClosePolicy {
     KeepShown,
 }
 
+/// A capture may close only after its requested export has completed
+/// successfully. Cancelled dialogs never start an export operation.
+pub fn export_should_close_overlay<T, E>(result: &Result<T, E>) -> bool {
+    result.is_ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportKind {
+    Copy,
+    Save,
+}
+
+pub fn export_notification<T, E>(result: &Result<T, E>, kind: ExportKind) -> Option<&'static str> {
+    result.as_ref().ok().map(|_| match kind {
+        ExportKind::Copy => "Screenshot copied",
+        ExportKind::Save => "Screenshot saved",
+    })
+}
+
 pub const fn overlay_close_policy() -> ClosePolicy {
     ClosePolicy::KeepShown
 }
@@ -104,5 +123,33 @@ mod tests {
     #[test]
     fn overlay_close_does_not_discard_an_active_capture() {
         assert_eq!(overlay_close_policy(), ClosePolicy::KeepShown);
+    }
+
+    #[test]
+    fn only_successful_copy_or_save_completion_closes_the_overlay() {
+        assert!(super::export_should_close_overlay::<(), ()>(&Ok(())));
+        assert!(!super::export_should_close_overlay::<(), _>(&Err(
+            "clipboard or file error"
+        )));
+    }
+
+    #[test]
+    fn native_notification_policy_only_returns_messages_for_successful_exports() {
+        assert_eq!(
+            super::export_notification(&Ok::<_, ()>(()), super::ExportKind::Copy),
+            Some("Screenshot copied")
+        );
+        assert_eq!(
+            super::export_notification(&Ok::<_, ()>(()), super::ExportKind::Save),
+            Some("Screenshot saved")
+        );
+        assert_eq!(
+            super::export_notification(&Err::<(), _>("clipboard failed"), super::ExportKind::Copy),
+            None
+        );
+        assert_eq!(
+            super::export_notification(&Err::<(), _>("save failed"), super::ExportKind::Save),
+            None
+        );
     }
 }

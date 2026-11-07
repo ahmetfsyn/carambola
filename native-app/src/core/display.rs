@@ -41,6 +41,28 @@ impl PhysicalBounds {
     pub fn height(self) -> u32 {
         (i64::from(self.bottom) - i64::from(self.top)) as u32
     }
+
+    pub fn contains(self, point: PhysicalPoint) -> bool {
+        point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
+    }
+
+    fn distance_squared_to(self, point: PhysicalPoint) -> i128 {
+        let dx = if point.x < self.left {
+            i128::from(self.left) - i128::from(point.x)
+        } else if point.x >= self.right {
+            i128::from(point.x) - i128::from(self.right - 1)
+        } else {
+            0
+        };
+        let dy = if point.y < self.top {
+            i128::from(self.top) - i128::from(point.y)
+        } else if point.y >= self.bottom {
+            i128::from(point.y) - i128::from(self.bottom - 1)
+        } else {
+            0
+        };
+        dx * dx + dy * dy
+    }
 }
 
 /// A display device name is stable for the current Windows display topology.
@@ -113,9 +135,33 @@ pub fn select_display<'a>(
         .ok_or_else(|| "Windows did not report a primary display".to_owned())
 }
 
+/// Select the display containing a physical virtual-desktop cursor position.
+/// If Windows reports a cursor point in a gap between displays, choose the
+/// nearest display deterministically rather than silently using the primary.
+pub fn select_display_at_point<'a>(
+    displays: &'a [DisplayMetadata],
+    point: PhysicalPoint,
+) -> Result<&'a DisplayMetadata, String> {
+    displays
+        .iter()
+        .find(|display| display.bounds.contains(point))
+        .or_else(|| {
+            displays.iter().min_by_key(|display| {
+                (
+                    display.bounds.distance_squared_to(point),
+                    !display.is_primary,
+                    display.id.as_str(),
+                )
+            })
+        })
+        .ok_or_else(|| "Windows did not report any connected displays".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{select_display, DisplayMetadata, PhysicalBounds, PhysicalPoint};
+    use super::{
+        select_display, select_display_at_point, DisplayMetadata, PhysicalBounds, PhysicalPoint,
+    };
 
     fn display(id: &str, bounds: PhysicalBounds, is_primary: bool) -> DisplayMetadata {
         DisplayMetadata::new(id.into(), bounds, 120, is_primary).unwrap()
@@ -181,5 +227,63 @@ mod tests {
             Some(PhysicalPoint { x: 0, y: 1080 })
         );
         assert_eq!(display.local_to_desktop(1921, 0), None);
+    }
+
+    #[test]
+    fn cursor_selects_the_containing_monitor_with_negative_and_above_origins() {
+        let displays = [
+            DisplayMetadata::new(
+                "PRIMARY".into(),
+                PhysicalBounds::new(0, 0, 1920, 1080).unwrap(),
+                96,
+                true,
+            )
+            .unwrap(),
+            DisplayMetadata::new(
+                "LEFT_ABOVE".into(),
+                PhysicalBounds::new(-1600, -900, 0, 0).unwrap(),
+                144,
+                false,
+            )
+            .unwrap(),
+        ];
+
+        let selected =
+            select_display_at_point(&displays, PhysicalPoint { x: -800, y: -450 }).unwrap();
+        assert_eq!(selected.id, "LEFT_ABOVE");
+        assert_eq!(selected.scale_factor(), 1.5);
+        assert_eq!(
+            select_display_at_point(&displays, PhysicalPoint { x: 1200, y: 800 })
+                .unwrap()
+                .id,
+            "PRIMARY"
+        );
+        assert_eq!(
+            select_display_at_point(&[], PhysicalPoint { x: -1, y: 0 }).unwrap_err(),
+            "Windows did not report any connected displays"
+        );
+    }
+
+    #[test]
+    fn cursor_in_virtual_desktop_gap_uses_the_nearest_monitor_not_always_primary() {
+        let displays = [
+            display(
+                "PRIMARY",
+                PhysicalBounds::new(0, 0, 1920, 1080).unwrap(),
+                true,
+            ),
+            display(
+                "LEFT",
+                PhysicalBounds::new(-1920, 0, 0, 1080).unwrap(),
+                false,
+            ),
+        ];
+
+        assert_eq!(
+            select_display_at_point(&displays, PhysicalPoint { x: -1900, y: 1200 })
+                .unwrap()
+                .id,
+            "LEFT"
+        );
     }
 }
