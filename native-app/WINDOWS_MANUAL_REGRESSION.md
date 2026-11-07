@@ -7,7 +7,7 @@ monitor arrangement when reporting results.
 ## Display capture and geometry
 
 - [ ] Capture and select a region on a single monitor.
-- [ ] Select a secondary monitor from Settings and confirm the Overlay targets it.
+- [ ] Confirm capture targets the primary monitor and the Overlay matches its bounds.
 - [ ] Put a monitor left of and then above the primary; verify capture, pointer
   selection, crop bounds, and exported pixels across negative desktop origins.
 - [ ] Use displays at different scaling values (including 100%, 125%, and
@@ -22,7 +22,8 @@ monitor arrangement when reporting results.
 ## Lifecycle and regression paths
 
 - [ ] Start capture with `Ctrl+Shift+S` and through the tray menu.
-- [ ] Verify Settings hide/restore behavior and tray availability during capture.
+- [ ] Verify startup creates no auxiliary app window and capture does not show or restore one.
+- [ ] Confirm the tray icon remains available throughout capture.
 - [ ] Finish with Done and cancel with Escape; confirm the Overlay disappears
   without a white flash or visible window-shrinking transition.
 - [ ] Repeat captures and confirm the hotkey, tray, crop, annotation, and export
@@ -30,12 +31,12 @@ monitor arrangement when reporting results.
 
 ## Overlay taskbar regression
 
-- [ ] Start Carambola and confirm the Settings window's taskbar behavior is unchanged.
+- [ ] Start Carambola and confirm no debug/status window or transient application taskbar entry appears.
 - [ ] Trigger a screenshot using the global `Ctrl+Shift+S` hotkey.
 - [ ] On the first capture and on later captures, watch the taskbar while the
   Overlay opens, remains fullscreen, and closes. No iconless Carambola entry
   should appear.
 - [ ] Exit the Overlay using Escape; confirm the iconless taskbar entry does not appear during closure.
 - [ ] Trigger another screenshot and exit using the normal completion action; confirm the entry remains absent.
-- [ ] Repeat both exit paths several times, including after opening and closing Settings.
+- [ ] Repeat both exit paths several times.
 - [ ] Confirm the tray icon remains available and Carambola continues running in the background.

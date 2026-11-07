@@ -80,18 +80,6 @@ impl DisplayMetadata {
         f64::from(self.effective_dpi) / 96.0
     }
 
-    pub fn label(&self) -> String {
-        let scale_percent = (u64::from(self.effective_dpi) * 100 + 48) / 96;
-        format!(
-            "{} — {}×{} at {}%{}",
-            self.id,
-            self.bounds.width(),
-            self.bounds.height(),
-            scale_percent,
-            if self.is_primary { " (Primary)" } else { "" }
-        )
-    }
-
     /// Map a monitor-local pixel edge to its signed virtual-desktop position.
     pub fn local_to_desktop(&self, x: u32, y: u32) -> Option<PhysicalPoint> {
         if x > self.bounds.width() || y > self.bounds.height() {

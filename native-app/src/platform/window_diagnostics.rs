@@ -3,7 +3,7 @@
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{create_dir_all, File, OpenOptions},
     io::Write,
     path::PathBuf,
@@ -14,39 +14,56 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::core::BOOL as WinBool;
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::{
-    Foundation::{COLORREF, HWND, LPARAM},
-    System::{SystemInformation::GetTickCount64, Threading::GetCurrentThreadId},
+    Foundation::{CloseHandle, COLORREF, HWND, LPARAM},
+    System::{
+        SystemInformation::GetTickCount64,
+        Threading::{
+            GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    },
     UI::{
         Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
         Input::KeyboardAndMouse::IsWindowEnabled,
         WindowsAndMessaging::{
-            EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow,
-            GetLayeredWindowAttributes, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
-            GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-            IsWindowVisible, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
-            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
-            LAYERED_WINDOW_ATTRIBUTES_FLAGS, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WS_EX_LAYERED,
+            EnumChildWindows, EnumWindows, FindWindowW, GetClassNameW, GetClientRect,
+            GetForegroundWindow, GetLayeredWindowAttributes, GetParent, GetWindow,
+            GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+            GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, EVENT_OBJECT_CREATE,
+            EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+            EVENT_SYSTEM_MINIMIZESTART, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+            LAYERED_WINDOW_ATTRIBUTES_FLAGS, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WS_EX_APPWINDOW,
+            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
         },
     },
 };
 
-const SETTINGS_TITLE_START: &str = "Carambola";
-const SETTINGS_TITLE_END: &str = "Native Screenshot Annotation";
 const OVERLAY_TITLE: &str = "Carambola screenshot selection";
 const TRAY_HOST_TITLE: &str = "Carambola tray callback";
+const TASKBAR_ROOT_CLASSES: &[&str] = &[
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "NotifyIconOverflowWindow",
+];
 
 static TRACE_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 static TRACE_STARTED: OnceLock<Instant> = OnceLock::new();
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static TRACE_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
+static TASKBAR_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
 static STARTUP_ID: OnceLock<String> = OnceLock::new();
 static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
 static ACTION_ID: AtomicU64 = AtomicU64::new(0);
 // 0 = no action, 1 = in progress, 2 = completed (kept for delayed WinEvents).
 static ACTION_PHASE: AtomicU8 = AtomicU8::new(0);
 static WINDOW_IDENTITIES: OnceLock<Mutex<WindowIdentities>> = OnceLock::new();
+static WINDOW_DESCRIPTIONS: OnceLock<Mutex<HashMap<isize, String>>> = OnceLock::new();
+static PROCESS_IMAGE_CACHE: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+static TASKBAR_ROOTS: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
+static TASKBAR_WINDOW_LAST: OnceLock<Mutex<HashMap<isize, String>>> = OnceLock::new();
 
 #[derive(Default)]
 struct WindowIdentities {
@@ -90,9 +107,25 @@ impl WindowDiagnostics {
 
         trace_event("APP_ENTRY observed_after_dpi_initialization=true");
         trace_event(&format!(
-            "TRACE_START version=5 pid={process_id} executable={:?} log_file={:?} hooks=WinEvent(object-create,destroy,show,hide,location-change;foreground;minimize-start,end) bounds=GetWindowRect,GetClientRect",
+            "TRACE_START version=6 pid={process_id} executable={:?} log_file={:?} hooks=WinEvent(app-object-create,destroy,show,hide,location-change;foreground;minimize-start,end;explorer-taskbar-object-create,destroy,show,hide,location-change) bounds=GetWindowRect,GetClientRect",
             std::env::current_exe().ok(),
             path
+        ));
+
+        let (taskbar_roots, explorer_pid) = discover_taskbar_roots();
+        let _ = TASKBAR_ROOTS.set(Mutex::new(
+            taskbar_roots.iter().map(|hwnd| hwnd.0 as isize).collect(),
+        ));
+        let _ = TASKBAR_WINDOW_LAST.set(Mutex::new(HashMap::new()));
+        TASKBAR_PROCESS_ID.store(explorer_pid, Ordering::Release);
+        trace_event(&format!(
+            "TASKBAR_DISCOVERY explorer_pid={explorer_pid} explorer_image={:?} roots={}",
+            process_image_path(explorer_pid),
+            taskbar_roots
+                .iter()
+                .map(|hwnd| hwnd_text(*hwnd))
+                .collect::<Vec<_>>()
+                .join(",")
         ));
 
         let mut hooks = Vec::new();
@@ -139,7 +172,51 @@ impl WindowDiagnostics {
             }
         }
 
+        if explorer_pid != 0 {
+            for (event_min, event_max, label) in [
+                (
+                    EVENT_OBJECT_CREATE,
+                    EVENT_OBJECT_HIDE,
+                    "explorer-taskbar-lifecycle",
+                ),
+                (
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    "explorer-taskbar-location",
+                ),
+            ] {
+                let hook = unsafe {
+                    SetWinEventHook(
+                        event_min,
+                        event_max,
+                        None,
+                        Some(taskbar_win_event_proc),
+                        explorer_pid,
+                        0,
+                        WINEVENT_OUTOFCONTEXT,
+                    )
+                };
+                if hook.0.is_null() {
+                    let error = unsafe { windows::Win32::Foundation::GetLastError().0 };
+                    trace_event(&format!(
+                        "HOOK_INSTALL_FAILED name={label:?} event_min=0x{event_min:04x} event_max=0x{event_max:04x} process_id={explorer_pid} win32_error={error}"
+                    ));
+                } else {
+                    trace_event(&format!(
+                        "HOOK_INSTALLED name={label:?} event_min=0x{event_min:04x} event_max=0x{event_max:04x} process_id={explorer_pid} hook={}",
+                        hwnd_text(HWND(hook.0))
+                    ));
+                    hooks.push(hook);
+                }
+            }
+        } else {
+            trace_event(
+                "TASKBAR_HOOKS_SKIPPED reason=Explorer taskbar process was not discoverable",
+            );
+        }
+
         trace_process_windows("diagnostics-start");
+        trace_taskbar_windows("diagnostics-start");
         Ok(Some(Self { hooks }))
     }
 }
@@ -215,6 +292,7 @@ pub fn trace_component_state(role: &str, operation: &str, visible: bool, minimiz
         "SLINT_STATE role={role:?} operation={operation:?} visible={visible} minimized={minimized} hwnd={hwnd}"
     ));
     write_window_list(operation, &windows);
+    trace_taskbar_windows(operation);
 }
 
 /// Record a native operation around a known HWND (activation, affinity, or a
@@ -235,6 +313,7 @@ pub fn trace_native_operation(operation: &str, hwnd: HWND) {
         describe_window(hwnd)
     ));
     trace_process_windows(operation);
+    trace_taskbar_windows(operation);
 }
 
 /// Record operations where the HWND is not available (for example, Slint
@@ -249,6 +328,7 @@ pub fn trace_native_event(operation: &str) {
         hwnd_text(foreground)
     ));
     trace_process_windows(operation);
+    trace_taskbar_windows(operation);
 }
 
 /// Use on the tray worker while the UI thread is waiting for startup. A full
@@ -340,6 +420,180 @@ fn open_at(path: &PathBuf) -> Result<File, std::io::Error> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
+unsafe extern "system" fn enum_taskbar_root_proc(hwnd: HWND, parameter: LPARAM) -> WinBool {
+    if hwnd.0.is_null() {
+        return WinBool(1);
+    }
+    let class_name = window_class(hwnd);
+    if TASKBAR_ROOT_CLASSES.contains(&class_name.as_str()) {
+        let roots = unsafe { &mut *(parameter.0 as *mut Vec<HWND>) };
+        roots.push(hwnd);
+    }
+    WinBool(1)
+}
+
+unsafe extern "system" fn enum_any_window_proc(hwnd: HWND, parameter: LPARAM) -> WinBool {
+    if !hwnd.0.is_null() {
+        let windows = unsafe { &mut *(parameter.0 as *mut Vec<HWND>) };
+        windows.push(hwnd);
+    }
+    WinBool(1)
+}
+
+fn discover_taskbar_roots() -> (Vec<HWND>, u32) {
+    let mut roots = Vec::new();
+    if let Err(error) = unsafe {
+        EnumWindows(
+            Some(enum_taskbar_root_proc),
+            LPARAM((&mut roots as *mut Vec<HWND>) as isize),
+        )
+    } {
+        write_line(format!("TASKBAR_ENUMERATION_FAILED error={error:?}"));
+    }
+
+    let mut explorer_pid = 0;
+    match unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) } {
+        Ok(main_taskbar) => {
+            if !roots.contains(&main_taskbar) {
+                roots.push(main_taskbar);
+            }
+            unsafe { GetWindowThreadProcessId(main_taskbar, Some(&mut explorer_pid)) };
+        }
+        Err(error) => write_line(format!(
+            "TASKBAR_MAIN_WINDOW_NOT_FOUND class=Shell_TrayWnd error={error:?}"
+        )),
+    }
+    (roots, explorer_pid)
+}
+
+fn trace_taskbar_windows(reason: &str) {
+    if !TRACE_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let roots = TASKBAR_ROOTS
+        .get()
+        .and_then(|roots| roots.lock().ok().map(|roots| roots.clone()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|hwnd| HWND(hwnd as *mut _))
+        .collect::<Vec<_>>();
+    write_line(format!(
+        "TASKBAR_SNAPSHOT_BEGIN reason={reason:?} explorer_pid={} root_count={}",
+        TASKBAR_PROCESS_ID.load(Ordering::Acquire),
+        roots.len()
+    ));
+    let mut children: Vec<HWND> = Vec::new();
+    for root in &roots {
+        let description = describe_window(*root);
+        remember_taskbar_window(*root, description.clone());
+        write_line(format!("TASKBAR_ROOT {description}"));
+        let result = unsafe {
+            EnumChildWindows(
+                Some(*root),
+                Some(enum_any_window_proc),
+                LPARAM((&mut children as *mut Vec<HWND>) as isize),
+            )
+        };
+        if !result.as_bool() {
+            write_line(format!(
+                "TASKBAR_CHILD_ENUMERATION_FAILED root={}",
+                hwnd_text(*root)
+            ));
+        }
+    }
+    let mut seen = HashSet::new();
+    for hwnd in children {
+        if seen.insert(hwnd.0 as isize) {
+            let description = describe_window(hwnd);
+            remember_taskbar_window(hwnd, description.clone());
+            write_line(format!("TASKBAR_CHILD {description}"));
+        }
+    }
+    write_line(format!("TASKBAR_SNAPSHOT_END reason={reason:?}"));
+}
+
+fn remember_taskbar_window(hwnd: HWND, description: String) {
+    if let Some(windows) = TASKBAR_WINDOW_LAST.get() {
+        if let Ok(mut windows) = windows.lock() {
+            windows.insert(hwnd.0 as isize, description);
+        }
+    }
+}
+
+fn forget_taskbar_window(hwnd: HWND) -> Option<String> {
+    TASKBAR_WINDOW_LAST
+        .get()
+        .and_then(|windows| windows.lock().ok()?.remove(&(hwnd.0 as isize)))
+}
+
+fn is_taskbar_related_window(hwnd: HWND) -> bool {
+    let Some(roots) = TASKBAR_ROOTS
+        .get()
+        .and_then(|roots| roots.lock().ok().map(|roots| roots.clone()))
+    else {
+        return false;
+    };
+    let root_handles = roots.into_iter().collect::<HashSet<_>>();
+    let mut pending = vec![hwnd];
+    let mut seen = HashSet::new();
+    while let Some(candidate) = pending.pop() {
+        if candidate.0.is_null() || !seen.insert(candidate.0 as isize) {
+            continue;
+        }
+        if root_handles.contains(&(candidate.0 as isize)) {
+            return true;
+        }
+        if let Ok(parent) = unsafe { GetParent(candidate) } {
+            pending.push(parent);
+        }
+        if let Ok(owner) = unsafe { GetWindow(candidate, GW_OWNER) } {
+            pending.push(owner);
+        }
+    }
+    false
+}
+
+unsafe extern "system" fn taskbar_win_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    object_id: i32,
+    child_id: i32,
+    event_thread: u32,
+    event_time_ms: u32,
+) {
+    if !TRACE_ENABLED.load(Ordering::Acquire) || hwnd.0.is_null() {
+        return;
+    }
+    if !matches!(
+        event,
+        EVENT_OBJECT_CREATE
+            | EVENT_OBJECT_DESTROY
+            | EVENT_OBJECT_SHOW
+            | EVENT_OBJECT_HIDE
+            | EVENT_OBJECT_LOCATIONCHANGE
+    ) || !is_taskbar_related_window(hwnd)
+    {
+        return;
+    }
+
+    let mut process_id = 0u32;
+    let window_thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    let description = describe_window(hwnd);
+    let last_known = if event == EVENT_OBJECT_DESTROY {
+        forget_taskbar_window(hwnd).unwrap_or_else(|| "unavailable-before-destroy".to_string())
+    } else {
+        remember_taskbar_window(hwnd, description.clone());
+        "not-applicable".to_string()
+    };
+    write_line(format!(
+        "TASKBAR_WIN_EVENT event={} event_id=0x{event:04x} hwnd={} pid={process_id} image={:?} window_thread={window_thread} event_thread={event_thread} event_time_ms={event_time_ms} object_id={object_id} child_id={child_id} current=({description}) last_known=({last_known})",
+        event_name(event),
+        hwnd_text(hwnd),
+        process_image_path(process_id)
+    ));
+}
+
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -368,18 +622,24 @@ unsafe extern "system" fn win_event_proc(
         register_window(hwnd, true, "UnexpectedAppWindow");
     }
 
+    let last_known = if event == EVENT_OBJECT_DESTROY {
+        forget_window_description(hwnd).unwrap_or_else(|| "unavailable-before-destroy".into())
+    } else {
+        "not-applicable".to_string()
+    };
     let foreground = unsafe { GetForegroundWindow() };
     let description = describe_window(hwnd);
     write_line(format!(
-        "WIN_EVENT event={} event_id=0x{event:04x} hwnd={} process_id={process_id} window_thread={window_thread} event_thread={event_thread} event_time_ms={event_time_ms} foreground={} window={}",
+        "WIN_EVENT event={} event_id=0x{event:04x} hwnd={} process_id={process_id} image={:?} window_thread={window_thread} event_thread={event_thread} event_time_ms={event_time_ms} foreground={} window={} last_known=({last_known})",
         event_name(event),
         hwnd_text(hwnd),
+        process_image_path(process_id),
         hwnd_text(foreground),
         description
     ));
     if matches!(event, EVENT_OBJECT_CREATE | EVENT_OBJECT_SHOW) {
         let role = window_role(&window_title(hwnd));
-        if matches!(role, "Settings" | "Overlay") {
+        if role == "Overlay" {
             write_line(format!(
                 "SLINT_NATIVE_WINDOW role={role:?} event={} hwnd={} {description}",
                 event_name(event),
@@ -460,9 +720,6 @@ fn role_hwnd(role: &str, windows: &[HWND]) -> Option<HWND> {
     windows.iter().copied().find(|hwnd| {
         let title = window_title(*hwnd);
         match role {
-            "Settings" => {
-                title.starts_with(SETTINGS_TITLE_START) && title.ends_with(SETTINGS_TITLE_END)
-            }
             "Overlay" => title == OVERLAY_TITLE,
             "TrayHost" => title == TRAY_HOST_TITLE,
             _ => false,
@@ -482,9 +739,17 @@ fn describe_window(hwnd: HWND) -> String {
     } else {
         window_role(&title)
     };
-    let (instance, origin, known_role) = register_window(hwnd, false, role);
+    let app_owned = process_id == TRACE_PROCESS_ID.load(Ordering::Acquire);
+    let (instance, origin, known_role) = if app_owned {
+        register_window(hwnd, false, role)
+    } else if TASKBAR_ROOT_CLASSES.contains(&class_name.as_str()) {
+        (0, "external-window", "ExplorerTaskbar")
+    } else {
+        (0, "external-window", "ExternalWindow")
+    };
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    let ex_style_flags = describe_ex_style(ex_style);
     let parent = unsafe { GetParent(hwnd) }.unwrap_or_default();
     let owner = unsafe { GetWindow(hwnd, GW_OWNER) }.unwrap_or_default();
     let layered = ex_style & WS_EX_LAYERED.0 != 0;
@@ -517,12 +782,107 @@ fn describe_window(hwnd: HWND) -> String {
         "not-layered".into()
     };
 
-    format!(
-        "hwnd={} instance={instance} origin={origin} parent={} owner={} role={known_role:?} pid={process_id} tid={thread_id} title={title:?} class={class_name:?} visible={visible} minimized={minimized} enabled={enabled} window_bounds=({window_bounds}) client_bounds=({client_bounds}) style=0x{style:08x} ex_style=0x{ex_style:08x} layered={layered} layered_attributes=({layered_attributes})",
+    let description = format!(
+        "hwnd={} instance={instance} origin={origin} parent={} owner={} role={known_role:?} pid={process_id} image={:?} tid={thread_id} title={title:?} class={class_name:?} visible={visible} minimized={minimized} enabled={enabled} window_bounds=({window_bounds}) client_bounds=({client_bounds}) style=0x{style:08x} ex_style=0x{ex_style:08x} ex_style_flags={ex_style_flags} layered={layered} layered_attributes=({layered_attributes})",
         hwnd_text(hwnd),
         hwnd_text(parent),
         hwnd_text(owner),
-    )
+        process_image_path(process_id),
+    );
+    if app_owned && unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        let descriptions = WINDOW_DESCRIPTIONS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut descriptions) = descriptions.lock() {
+            descriptions.insert(hwnd.0 as isize, description.clone());
+        }
+    }
+    description
+}
+
+fn forget_window_description(hwnd: HWND) -> Option<String> {
+    WINDOW_DESCRIPTIONS
+        .get()
+        .and_then(|descriptions| descriptions.lock().ok()?.remove(&(hwnd.0 as isize)))
+}
+
+fn describe_ex_style(ex_style: u32) -> String {
+    let mut flags = Vec::new();
+    for (flag, name) in [
+        (WS_EX_APPWINDOW.0, "APPWINDOW"),
+        (WS_EX_TOOLWINDOW.0, "TOOLWINDOW"),
+        (WS_EX_TOPMOST.0, "TOPMOST"),
+        (WS_EX_NOACTIVATE.0, "NOACTIVATE"),
+        (WS_EX_TRANSPARENT.0, "TRANSPARENT"),
+        (WS_EX_LAYERED.0, "LAYERED"),
+    ] {
+        if ex_style & flag != 0 {
+            flags.push(name);
+        }
+    }
+    if flags.is_empty() {
+        "none".into()
+    } else {
+        flags.join("|")
+    }
+}
+
+fn process_image_path(process_id: u32) -> String {
+    if process_id == 0 {
+        return "unavailable(pid-zero)".into();
+    }
+    let cache = PROCESS_IMAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(path) = cache.get(&process_id) {
+            return path.clone();
+        }
+    }
+
+    let path = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) } {
+        Ok(process) => {
+            let mut buffer = vec![0u16; 32_768];
+            let mut length = buffer.len() as u32;
+            let result = unsafe {
+                QueryFullProcessImageNameW(
+                    process,
+                    PROCESS_NAME_FORMAT(0),
+                    PWSTR(buffer.as_mut_ptr()),
+                    &mut length,
+                )
+            };
+            let _ = unsafe { CloseHandle(process) };
+            match result {
+                Ok(()) => redact_user_profile(String::from_utf16_lossy(
+                    &buffer[..(length as usize).min(buffer.len())],
+                )),
+                Err(error) => format!("unavailable({error:?})"),
+            }
+        }
+        Err(error) => format!("unavailable({error:?})"),
+    };
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(process_id, path.clone());
+    }
+    path
+}
+
+fn redact_user_profile(path: String) -> String {
+    let Some(profile) = std::env::var_os("USERPROFILE") else {
+        return path;
+    };
+    let profile = profile.to_string_lossy();
+    if path
+        .get(..profile.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&profile))
+    {
+        format!("%USERPROFILE%{}", &path[profile.len()..])
+    } else {
+        path
+    }
+}
+
+fn window_class(hwnd: HWND) -> String {
+    let mut class_name = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class_name) }.max(0) as usize;
+    String::from_utf16_lossy(&class_name[..class_len.min(class_name.len())])
 }
 
 fn register_window(
@@ -605,9 +965,6 @@ fn window_title(hwnd: HWND) -> String {
 
 fn window_role(title: &str) -> &'static str {
     match title {
-        _ if title.starts_with(SETTINGS_TITLE_START) && title.ends_with(SETTINGS_TITLE_END) => {
-            "Settings"
-        }
         OVERLAY_TITLE => "Overlay",
         TRAY_HOST_TITLE => "TrayHost",
         _ => "UnexpectedAppWindow",
@@ -646,6 +1003,8 @@ fn write_line(line: String) {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let elapsed_us = elapsed_ns / 1_000;
+    let epoch_ms = epoch_ns / 1_000_000;
+    let elapsed_ms = elapsed_ns / 1_000_000;
     let thread_id = unsafe { GetCurrentThreadId() };
     let tick_ms = unsafe { GetTickCount64() };
     let tick_ms_low32 = tick_ms as u32;
@@ -659,7 +1018,7 @@ fn write_line(line: String) {
         if let Ok(mut file) = file.lock() {
             let _ = writeln!(
                 file,
-                "unix_ns={epoch_ns} elapsed_ns={elapsed_ns} elapsed_us={elapsed_us} tick_ms={tick_ms} tick_ms_low32={tick_ms_low32} startup_id={} pid={} thread_id={thread_id} action_id={action_id} action_phase={action_phase} {line}",
+                "unix_ms={epoch_ms} elapsed_ms={elapsed_ms} unix_ns={epoch_ns} elapsed_ns={elapsed_ns} elapsed_us={elapsed_us} tick_ms={tick_ms} tick_ms_low32={tick_ms_low32} startup_id={} pid={} thread_id={thread_id} action_id={action_id} action_phase={action_phase} {line}",
                 STARTUP_ID.get().map(String::as_str).unwrap_or("uninitialized"),
                 TRACE_PROCESS_ID.load(Ordering::Acquire)
             );

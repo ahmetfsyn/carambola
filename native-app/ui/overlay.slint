@@ -1,5 +1,24 @@
 import { LineEdit } from "std-widgets.slint";
 
+component SelectionHandle inherits Rectangle {
+    in property <MouseCursor> handle-cursor: MouseCursor.default;
+    callback gesture-pointer-event(PointerEventKind, float, float);
+    width: 10px;
+    height: 10px;
+    background: #f8fafc;
+    border-color: #0284c7;
+    border-width: 2px;
+    border-radius: 2px;
+    TouchArea {
+        mouse-cursor: root.handle-cursor;
+        pointer-event(event) => {
+            if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                root.gesture-pointer-event(event.kind, (root.x + self.mouse-x) / 1px, (root.y + self.mouse-y) / 1px);
+            }
+        }
+    }
+}
+
 export component OverlayPrototype inherits Window {
     title: "Carambola screenshot selection";
     in property <length> frame-viewport-width: 1280px;
@@ -16,6 +35,21 @@ export component OverlayPrototype inherits Window {
     in property <length> selection-width: 0px;
     in property <length> selection-height: 0px;
     in property <bool> annotation-mode: false;
+    in property <bool> selection-adjustment-mode: false;
+    in property <length> toolbar-auto-x: 0px;
+    in property <length> toolbar-auto-y: 0px;
+    in property <float> toolbar-scale: 1.0;
+    in property <bool> toolbar-forced-inside: false;
+    in property <bool> toolbar-manual-position: false;
+    in property <length> toolbar-manual-x: 0px;
+    in property <length> toolbar-manual-y: 0px;
+    out property <length> toolbar-effective-width: 620px * root.toolbar-scale;
+    out property <length> toolbar-effective-height: 64px * root.toolbar-scale;
+    out property <length> toolbar-position-x: max(0px, min(root.toolbar-manual-position ? root.toolbar-manual-x : root.toolbar-auto-x, root.width - root.toolbar-effective-width));
+    out property <length> toolbar-position-y: max(0px, min(root.toolbar-manual-position ? root.toolbar-manual-y : root.toolbar-auto-y, root.height - root.toolbar-effective-height));
+    out property <bool> toolbar-drag-enabled: root.toolbar-forced-inside || root.toolbar-manual-position;
+    in property <bool> confirm-selection-action-visible: false;
+    in property <string> confirm-selection-action-message: "";
     in property <image> annotation-image;
     in property <int> selected-tool: 0;
     in property <bool> text-entry-visible: false;
@@ -30,6 +64,12 @@ export component OverlayPrototype inherits Window {
     callback pointer-down(float, float, float, float);
     callback pointer-move(float, float, float, float);
     callback pointer-up(float, float, float, float);
+    callback pointer-cancel();
+    callback adjustment-pointer-event(PointerEventKind, float, float, float, float);
+    callback toolbar-pointer-event(PointerEventKind, float, float, float, float);
+    callback request-adjustment-mode(bool);
+    callback confirm-selection-action();
+    callback cancel-selection-action();
     callback cancel-selection();
     callback focus-selection();
     callback tool-selected(int);
@@ -40,6 +80,8 @@ export component OverlayPrototype inherits Window {
     callback redo-annotation();
     callback save-png();
     callback copy-image();
+    callback request-new-selection();
+    callback request-capture();
 
     focus-selection => { escape-scope.focus(); }
 
@@ -84,7 +126,7 @@ export component OverlayPrototype inherits Window {
         width: root.selection-width;
         height: root.selection-height;
         background: transparent;
-        border-color: #ffffff;
+        border-color: root.selection-adjustment-mode ? #38bdf8 : #ffffff;
         border-width: 1px;
     }
 
@@ -94,30 +136,110 @@ export component OverlayPrototype inherits Window {
         // Keep the fullscreen capture surface's cursor explicit and visible
         // across the hidden-window -> overlay focus transition.
         mouse-cursor: crosshair;
-        changed pressed => {
-            if (self.pressed) {
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                 root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px);
-            } else {
+            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
                 root.pointer-up(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px);
+            } else if (event.kind == PointerEventKind.cancel) {
+                root.pointer-cancel();
+            } else if (event.kind == PointerEventKind.move) {
+                root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px);
             }
         }
-        moved => { root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px); }
+    }
+
+    // The frame is not a parent of these handles, so their outer halves stay
+    // visible outside the selection border. Phase 8.3 will wire gestures.
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        visible: root.annotation-mode && root.selection-adjustment-mode
+            && root.selection-width > 0px && root.selection-height > 0px;
+
+        TouchArea {
+            x: root.selection-x;
+            y: root.selection-y;
+            width: root.selection-width;
+            height: root.selection-height;
+            mouse-cursor: move;
+            pointer-event(event) => {
+                if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                    root.adjustment-pointer-event(event.kind, (self.x + self.mouse-x) / 1px, (self.y + self.mouse-y) / 1px, root.width / 1px, root.height / 1px);
+                }
+            }
+        }
+
+        // Edge handles precede corners so corner cursors win if hit areas overlap.
+        SelectionHandle {
+            x: root.selection-x + root.selection-width / 2 - 5px;
+            y: root.selection-y - 5px;
+            handle-cursor: ns-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width - 5px;
+            y: root.selection-y + root.selection-height / 2 - 5px;
+            handle-cursor: ew-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width / 2 - 5px;
+            y: root.selection-y + root.selection-height - 5px;
+            handle-cursor: ns-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x - 5px;
+            y: root.selection-y + root.selection-height / 2 - 5px;
+            handle-cursor: ew-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x - 5px;
+            y: root.selection-y - 5px;
+            handle-cursor: nwse-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width - 5px;
+            y: root.selection-y - 5px;
+            handle-cursor: nesw-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width - 5px;
+            y: root.selection-y + root.selection-height - 5px;
+            handle-cursor: nwse-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x - 5px;
+            y: root.selection-y + root.selection-height - 5px;
+            handle-cursor: nesw-resize;
+            gesture-pointer-event(kind, x, y) => { root.adjustment-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
     }
 
     // Compact annotation toolbar. It is placed after the full-window touch
     // area so the buttons receive clicks without starting a drawing stroke.
     Rectangle {
-        x: min(root.selection-x, parent.width - 620px);
-        y: root.selection-y > 72px
-            ? root.selection-y - 72px
-            : root.selection-y + root.selection-height + 8px;
+        x: root.toolbar-position-x;
+        y: root.toolbar-position-y;
         width: 620px;
         height: 64px;
+        transform-scale-x: root.toolbar-scale * 100%;
+        transform-scale-y: root.toolbar-scale * 100%;
+        transform-origin: { x: 0px, y: 0px };
         visible: root.annotation-mode;
         background: #111827ee;
-        border-color: #64748b;
+        border-color: root.selection-adjustment-mode ? #38bdf8 : #64748b;
         border-width: 1px;
         border-radius: 5px;
+
+        // Absorb presses in toolbar gaps instead of forwarding them to the canvas.
+        TouchArea { }
 
         for tool[i] in ["Pen", "Arrow", "Rect", "Triangle", "Ellipse", "Text", "Mosaic"]: Rectangle {
             Rectangle {
@@ -125,16 +247,17 @@ export component OverlayPrototype inherits Window {
                 y: 4px;
                 width: 50px;
                 height: 32px;
-                background: root.selected-tool == i ? #2563eb : #334155;
+                background: root.selection-adjustment-mode ? #1f2937 : root.selected-tool == i ? #2563eb : #334155;
                 border-radius: 3px;
                 Text {
                     text: tool;
-                    color: white;
+                    color: root.selection-adjustment-mode ? #64748b : white;
                     font-size: 11px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
                 TouchArea {
+                    enabled: !root.selection-adjustment-mode;
                     mouse-cursor: pointer;
                     clicked => { root.tool-selected(i); }
                 }
@@ -214,16 +337,91 @@ export component OverlayPrototype inherits Window {
             }
         }
 
+        Rectangle {
+            x: 4px;
+            y: 40px;
+            width: 90px;
+            height: 20px;
+            background: root.selection-adjustment-mode ? #0284c7 : #334155;
+            border-radius: 3px;
+            Text {
+                text: root.selection-adjustment-mode ? "Annotate" : "Adjust";
+                color: white;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.request-adjustment-mode(!root.selection-adjustment-mode); }
+            }
+        }
+
+        Rectangle {
+            x: 98px;
+            y: 40px;
+            width: 130px;
+            height: 20px;
+            background: #334155;
+            border-radius: 3px;
+            Text {
+                text: "New Selection";
+                color: white;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.request-new-selection(); }
+            }
+        }
+
         Text {
-            x: 8px;
+            x: 236px;
             y: 42px;
-            width: 604px;
+            width: 142px;
+            height: 18px;
+            visible: root.selection-adjustment-mode;
+            text: "Adjust selection";
+            color: #38bdf8;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+
+        Text {
+            x: root.selection-adjustment-mode ? 360px : 236px;
+            y: 42px;
+            width: root.selection-adjustment-mode ? 252px : 376px;
             height: 18px;
             text: root.export-status;
             color: #cbd5e1;
             font-size: 10px;
             vertical-alignment: center;
             overflow: elide;
+        }
+
+        // The status row is the non-action drag surface when the toolbar is
+        // forced over the selection. Its coordinates are mapped back through
+        // the toolbar scale into the Overlay's logical viewport.
+        TouchArea {
+            x: 236px;
+            y: 40px;
+            width: 376px;
+            height: 20px;
+            enabled: root.toolbar-drag-enabled;
+            mouse-cursor: move;
+            pointer-event(event) => {
+                if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                    root.toolbar-pointer-event(
+                        event.kind,
+                        (root.toolbar-position-x + (self.x + self.mouse-x) * root.toolbar-scale) / 1px,
+                        (root.toolbar-position-y + (self.y + self.mouse-y) * root.toolbar-scale) / 1px,
+                        root.width / 1px,
+                        root.height / 1px
+                    );
+                }
+            }
         }
     }
 
@@ -254,6 +452,46 @@ export component OverlayPrototype inherits Window {
             background: #334155; border-radius: 3px;
             Text { text: "Cancel"; color: white; font-size: 9px; horizontal-alignment: center; vertical-alignment: center; }
             TouchArea { mouse-cursor: pointer; clicked => { root.cancel-text(); } }
+        }
+    }
+
+    Rectangle {
+        visible: root.confirm-selection-action-visible;
+        width: parent.width;
+        height: parent.height;
+        background: #07101dcc;
+        TouchArea { }
+        Rectangle {
+            x: (parent.width - 360px) / 2;
+            y: (parent.height - 128px) / 2;
+            width: 360px;
+            height: 128px;
+            background: #111827;
+            border-color: #64748b;
+            border-width: 1px;
+            border-radius: 6px;
+            Text {
+                x: 16px;
+                y: 12px;
+                width: 328px;
+                height: 64px;
+                text: root.confirm-selection-action-message;
+                color: white;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                x: 164px; y: 84px; width: 86px; height: 32px;
+                background: #334155; border-radius: 3px;
+                Text { text: "Keep"; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { mouse-cursor: pointer; clicked => { root.cancel-selection-action(); } }
+            }
+            Rectangle {
+                x: 258px; y: 84px; width: 86px; height: 32px;
+                background: #dc2626; border-radius: 3px;
+                Text { text: "Discard"; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { mouse-cursor: pointer; clicked => { root.confirm-selection-action(); } }
+            }
         }
     }
 

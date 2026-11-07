@@ -34,43 +34,9 @@ pub fn enumerate_displays() -> Result<Vec<crate::core::display::DisplayMetadata>
     Ok(Vec::new())
 }
 
-/// Capture a display selected by its current device ID, or the primary display
-/// when `display_id` is `None`.
-pub fn capture_display(
-    display_id: Option<&str>,
-) -> Result<crate::core::frame::CapturedFrame, String> {
-    #[cfg(target_os = "windows")]
-    return windows::capture_display(display_id);
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = display_id;
-        Err("macOS screen capture is not implemented yet".into())
-    }
-
-    #[allow(unreachable_code)]
-    Err("Native screen capture is not implemented on this platform".into())
-}
-
 pub fn prepare_capture() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     return windows::prepare_capture();
-
-    #[allow(unreachable_code)]
-    Ok(())
-}
-
-pub fn reset_capture_affinity() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    return windows::reset_capture_affinity();
-
-    #[allow(unreachable_code)]
-    Ok(())
-}
-
-pub fn activate_settings() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    return windows::activate_settings();
 
     #[allow(unreachable_code)]
     Ok(())
@@ -94,13 +60,16 @@ pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
 }
 
 /// Transfer an opaque screenshot image to the platform image clipboard.
-pub fn copy_image_to_clipboard(frame: &crate::core::frame::CapturedFrame) -> Result<(), String> {
+pub fn copy_image_to_clipboard(
+    frame: &crate::core::frame::CapturedFrame,
+    owner_hwnd: isize,
+) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    return windows::copy_image_to_clipboard(frame);
+    return windows::copy_image_to_clipboard(frame, owner_hwnd);
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = frame;
+        let _ = (frame, owner_hwnd);
         Err("Image clipboard support is not implemented on this platform".into())
     }
 }

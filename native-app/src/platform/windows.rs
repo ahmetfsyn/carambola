@@ -134,15 +134,28 @@ impl Drop for ClipboardLock {
 }
 
 /// Place an owned CF_DIBV5 block on the Windows clipboard.
-pub fn copy_image_to_clipboard(frame: &CapturedFrame) -> Result<(), String> {
+pub fn copy_image_to_clipboard(frame: &CapturedFrame, owner_hwnd: isize) -> Result<(), String> {
     use std::ptr::copy_nonoverlapping;
-    use windows::core::w;
     use windows::Win32::{
-        Foundation::HANDLE,
+        Foundation::{HANDLE, HWND},
         System::{DataExchange::EmptyClipboard, Memory::GlobalAlloc, Memory::GlobalLock},
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
     };
 
     const CF_DIBV5: u32 = 17;
+    if owner_hwnd == 0 {
+        return Err("Clipboard owner window is unavailable".into());
+    }
+    let owner = HWND(owner_hwnd as *mut std::ffi::c_void);
+    if !unsafe { IsWindow(Some(owner)) }.as_bool() {
+        return Err("Clipboard owner HWND is no longer valid".into());
+    }
+    let mut owner_process_id = 0u32;
+    unsafe { GetWindowThreadProcessId(owner, Some(&mut owner_process_id)) };
+    if owner_process_id != std::process::id() {
+        return Err("Clipboard owner HWND belongs to another process".into());
+    }
+
     let dib = crate::core::clipboard::dib_v5_bytes(frame)?;
     let allocation =
         unsafe { GlobalAlloc(windows::Win32::System::Memory::GMEM_MOVEABLE, dib.len()) }
@@ -155,7 +168,6 @@ pub fn copy_image_to_clipboard(frame: &CapturedFrame) -> Result<(), String> {
     unsafe { copy_nonoverlapping(dib.as_ptr(), destination.cast::<u8>(), dib.len()) };
     let _ = unsafe { windows::Win32::System::Memory::GlobalUnlock(allocation.handle()) };
 
-    let owner = find_app_window(w!("Carambola — Native Screenshot Annotation"))?;
     let clipboard = ClipboardLock::open(owner)?;
     unsafe { EmptyClipboard() }
         .map_err(|error| format!("Could not clear the Windows clipboard: {error}"))?;
@@ -506,101 +518,11 @@ pub fn capture_primary() -> Result<CapturedFrame, String> {
     capture_display(None)
 }
 
-/// Exclude the already-hidden settings HWND from capture and synchronize with
-/// DWM before the capture worker reads desktop pixels. Slint owns visibility.
+/// Synchronize with DWM before the capture worker reads desktop pixels.
 pub fn prepare_capture() -> Result<(), String> {
-    use windows::core::w;
-    use windows::Win32::{
-        Foundation::HWND,
-        Graphics::Dwm::DwmFlush,
-        UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowThreadProcessId, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
-        },
-    };
+    use windows::Win32::Graphics::Dwm::DwmFlush;
 
-    let window: HWND = unsafe {
-        FindWindowW(None, w!("Carambola — Native Screenshot Annotation"))
-            .map_err(|error| format!("Could not locate the native settings window: {error}"))?
-    };
-    let mut process_id = 0u32;
-    unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
-    if process_id != std::process::id() {
-        return Err("The located settings window belongs to a different process".into());
-    }
-    crate::platform::window_diagnostics::trace_native_operation(
-        "SetWindowDisplayAffinity(EXCLUDEFROMCAPTURE).before",
-        window,
-    );
-    unsafe { SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) }
-        .map_err(|error| format!("Could not exclude the settings window from capture: {error}"))?;
-    crate::platform::window_diagnostics::trace_native_operation(
-        "SetWindowDisplayAffinity(EXCLUDEFROMCAPTURE).after",
-        window,
-    );
-    let flush =
-        unsafe { DwmFlush() }.map_err(|error| format!("DwmFlush failed before capture: {error}"));
-    crate::platform::window_diagnostics::trace_native_operation("DwmFlush.after", window);
-    flush
-}
-
-/// Reset capture affinity. Slint owns all settings-window visibility changes.
-pub fn reset_capture_affinity() -> Result<(), String> {
-    use windows::core::w;
-    use windows::Win32::{
-        Foundation::HWND,
-        UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowThreadProcessId, SetWindowDisplayAffinity, WDA_NONE,
-        },
-    };
-
-    let window: HWND = unsafe {
-        FindWindowW(None, w!("Carambola — Native Screenshot Annotation"))
-            .map_err(|error| format!("Could not locate the native settings window: {error}"))?
-    };
-    let mut process_id = 0u32;
-    unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
-    if process_id != std::process::id() {
-        return Err("The located settings window belongs to a different process".into());
-    }
-    crate::platform::window_diagnostics::trace_native_operation(
-        "SetWindowDisplayAffinity(NONE).before",
-        window,
-    );
-    let result = unsafe { SetWindowDisplayAffinity(window, WDA_NONE) }
-        .map_err(|error| format!("Could not reset settings-window capture affinity: {error}"));
-    crate::platform::window_diagnostics::trace_native_operation(
-        "SetWindowDisplayAffinity(NONE).after",
-        window,
-    );
-    result
-}
-
-pub fn activate_settings() -> Result<(), String> {
-    use windows::core::w;
-    use windows::Win32::{
-        Foundation::HWND,
-        UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, SetForegroundWindow},
-    };
-
-    let window: HWND = unsafe {
-        FindWindowW(None, w!("Carambola — Native Screenshot Annotation"))
-            .map_err(|error| format!("Could not locate the native settings window: {error}"))?
-    };
-    let mut process_id = 0u32;
-    unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
-    if process_id != std::process::id() {
-        return Err("The located settings window belongs to a different process".into());
-    }
-    crate::platform::window_diagnostics::trace_native_operation(
-        "SetForegroundWindow(Settings).before",
-        window,
-    );
-    let _ = unsafe { SetForegroundWindow(window) };
-    crate::platform::window_diagnostics::trace_native_operation(
-        "SetForegroundWindow(Settings).after",
-        window,
-    );
-    Ok(())
+    unsafe { DwmFlush() }.map_err(|error| format!("DwmFlush failed before capture: {error}"))
 }
 
 pub fn activate_overlay() -> Result<(), String> {
