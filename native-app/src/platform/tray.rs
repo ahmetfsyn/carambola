@@ -45,13 +45,16 @@ use windows::{
 const HOTKEY_ID: i32 = 1;
 const TRAY_ICON_ID: u32 = 1;
 const COMMAND_NEW_SCREENSHOT: u32 = 1;
-const COMMAND_OPEN_CARAMBOLA: u32 = 2;
 const COMMAND_EXIT: u32 = 3;
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
 const TRAY_STOP_MESSAGE: u32 = WM_APP + 2;
 const CLASS_NAME: PCWSTR = w!("CarambolaNativeTrayHost");
 
 type CommandCallback = Arc<dyn Fn(TrayCommand) + Send + Sync + 'static>;
+
+fn native_window_handle_value(window: HWND) -> isize {
+    window.0 as isize
+}
 
 pub struct TrayService {
     window: HWND,
@@ -111,6 +114,10 @@ impl TrayService {
 
     pub fn hotkey_state(&self) -> RegistrationState {
         self.hotkey_state
+    }
+
+    pub fn native_window_handle(&self) -> isize {
+        native_window_handle_value(self.window)
     }
 }
 
@@ -578,7 +585,7 @@ unsafe extern "system" fn tray_window_proc(
         TRAY_CALLBACK_MESSAGE => {
             match lparam.0 as u32 {
                 WM_CONTEXTMENU | WM_RBUTTONUP => show_tray_menu(window, state),
-                WM_LBUTTONDBLCLK => state.dispatch(TrayCommand::OpenCarambola),
+                WM_LBUTTONDBLCLK => state.dispatch(TrayCommand::NewScreenshot),
                 _ => {}
             }
             LRESULT(0)
@@ -596,10 +603,7 @@ fn show_tray_menu(window: HWND, state: &TrayState) {
             return;
         }
     };
-    let items = [
-        (COMMAND_NEW_SCREENSHOT, w!("New Screenshot\tCtrl+Shift+S")),
-        (COMMAND_OPEN_CARAMBOLA, w!("Open Carambola")),
-    ];
+    let items = [(COMMAND_NEW_SCREENSHOT, w!("New Screenshot\tCtrl+Shift+S"))];
     for (id, label) in items {
         if let Err(error) = unsafe { AppendMenuW(menu.0, MF_STRING, id as usize, label) } {
             log::warn!("Could not populate the tray context menu: {error}");
@@ -646,7 +650,6 @@ fn show_tray_menu(window: HWND, state: &TrayState) {
     crate::platform::window_diagnostics::trace_native_operation("tray_menu.close", window);
     match selected {
         COMMAND_NEW_SCREENSHOT => state.dispatch(TrayCommand::NewScreenshot),
-        COMMAND_OPEN_CARAMBOLA => state.dispatch(TrayCommand::OpenCarambola),
         COMMAND_EXIT => state.dispatch(TrayCommand::Exit),
         _ => {}
     }
@@ -664,7 +667,14 @@ impl Drop for PopupMenu {
 
 #[cfg(test)]
 mod tests {
-    use super::embedded_carambola_icon_image;
+    use super::{embedded_carambola_icon_image, native_window_handle_value};
+    use windows::Win32::Foundation::HWND;
+
+    #[test]
+    fn clipboard_owner_handle_preserves_the_tray_host_hwnd() {
+        let hwnd = HWND(0x1234usize as *mut std::ffi::c_void);
+        assert_eq!(native_window_handle_value(hwnd), 0x1234);
+    }
 
     #[test]
     fn embedded_carambola_ico_directory_resolves_to_image_data() {

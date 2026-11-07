@@ -3,9 +3,6 @@
 mod core;
 mod platform;
 
-mod settings_ui {
-    include!(concat!(env!("OUT_DIR"), "/windows.rs"));
-}
 mod overlay_ui {
     include!(concat!(env!("OUT_DIR"), "/overlay.rs"));
 }
@@ -15,45 +12,34 @@ use core::{
     annotations::{
         Annotation, AnnotationEditor, AnnotationTool, ImagePoint, StrokeStyle, ViewportToImage,
     },
-    display::DisplayMetadata,
     frame::{CapturedFrame, PixelRect},
-    geometry::{FrameViewport, ViewportToFrame},
-    lifecycle::{
-        overlay_close_policy, settings_close_policy, AppAction, ClosePolicy, SettingsRestoreAction,
-        SettingsVisibility, TrayCommand,
-    },
-    selection::{LogicalRect, Selection},
+    geometry::{FrameViewport, LogicalViewport, ViewportToFrame},
+    lifecycle::{overlay_close_policy, AppAction, ClosePolicy, TrayCommand},
+    selection::{hit_test_selection, GestureKind, LogicalRect, SelectionGeometry, SelectionHit},
     session::CaptureSession,
 };
 use overlay_ui::OverlayPrototype;
-use settings_ui::SettingsWindow;
+use slint::private_unstable_api::re_exports::PointerEventKind;
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
-use slint::{ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         Arc, Mutex,
     },
     thread,
 };
 
-fn set_status(settings: &SettingsWindow, message: impl Into<slint::SharedString>) {
-    settings.set_status(message.into());
+fn set_status(overlay: &OverlayPrototype, message: impl Into<slint::SharedString>) {
+    let message = message.into();
+    overlay.set_export_status(message.clone());
+    log::info!("{message}");
 }
 
 fn finish_capture_session(session: &CaptureSession, reason: &str) {
     platform::trace_event(&format!("capture.session.finish reason={reason:?}"));
     session.finish();
-}
-
-fn trace_settings_state(settings: &SettingsWindow, operation: &str) {
-    platform::trace_component_state(
-        "Settings",
-        operation,
-        settings.window().is_visible(),
-        settings.window().is_minimized(),
-    );
 }
 
 fn trace_overlay_state(overlay: &OverlayPrototype, operation: &str) {
@@ -65,67 +51,8 @@ fn trace_overlay_state(overlay: &OverlayPrototype, operation: &str) {
     );
 }
 
-fn settings_visibility(settings: &SettingsWindow) -> SettingsVisibility {
-    SettingsVisibility::from_window_state(
-        settings.window().is_visible(),
-        settings.window().is_minimized(),
-    )
-}
-
-fn restore_capture_settings(settings: Option<&SettingsWindow>, visibility: SettingsVisibility) {
-    platform::trace_event(&format!(
-        "capture.restore.begin saved_visibility={visibility:?}"
-    ));
-    if let Err(error) = platform::reset_capture_affinity() {
-        log::warn!("Could not reset settings-window capture affinity: {error}");
-    }
-
-    let Some(settings) = settings else {
-        platform::trace_event("capture.restore.settings_component_unavailable");
-        return;
-    };
-
-    match visibility.restore_action() {
-        SettingsRestoreAction::Hide => {
-            trace_settings_state(settings, "capture.restore.hide.before");
-            if let Err(error) = settings.hide() {
-                log::warn!("Could not keep the settings window hidden: {error}");
-            }
-            trace_settings_state(settings, "capture.restore.hide.after");
-        }
-        SettingsRestoreAction::Show => {
-            platform::trace_event("capture.restore.settings_show_minimized_false");
-            trace_settings_state(settings, "capture.restore.unminimize.before");
-            settings.window().set_minimized(false);
-            trace_settings_state(settings, "capture.restore.unminimize.after");
-            trace_settings_state(settings, "capture.restore.show.before");
-            if let Err(error) = settings.show() {
-                log::warn!("Could not show the settings window after capture: {error}");
-                return;
-            }
-            trace_settings_state(settings, "capture.restore.show.after");
-            if let Err(error) = platform::activate_settings() {
-                log::warn!("Could not activate the settings window after capture: {error}");
-            }
-        }
-        SettingsRestoreAction::ShowMinimized => {
-            trace_settings_state(settings, "capture.restore.show_minimized.before");
-            if let Err(error) = settings.show() {
-                log::warn!("Could not restore the minimized settings window: {error}");
-                return;
-            }
-            trace_settings_state(settings, "capture.restore.show_minimized.show_after");
-            platform::trace_event("capture.restore.settings_set_minimized_true");
-            settings.window().set_minimized(true);
-            trace_settings_state(settings, "capture.restore.show_minimized.after");
-        }
-    }
-    platform::trace_event("capture.restore.end");
-}
-
 fn close_request_response(policy: ClosePolicy) -> slint::CloseRequestResponse {
     match policy {
-        ClosePolicy::Hide => slint::CloseRequestResponse::HideWindow,
         ClosePolicy::KeepShown => slint::CloseRequestResponse::KeepWindowShown,
     }
 }
@@ -156,7 +83,6 @@ fn annotation_snapshot(
 
 fn start_export_operation(
     overlay: &OverlayPrototype,
-    settings: slint::Weak<SettingsWindow>,
     busy: Arc<AtomicBool>,
     status: &'static str,
     operation: impl FnOnce() -> Result<String, String> + Send + 'static,
@@ -193,9 +119,6 @@ fn start_export_operation(
                 overlay.set_export_busy(false);
                 overlay.set_export_status(message.clone().into());
                 trace_overlay_state(&overlay, "export.completed");
-            }
-            if let Some(settings) = settings.upgrade() {
-                set_status(&settings, message);
             }
         });
         if let Err(error) = dispatched {
@@ -247,15 +170,688 @@ fn clear_selection_preview(overlay: &OverlayPrototype) {
     overlay.set_selection_height(0.0);
 }
 
-fn install_overlay_scale_factor_handler(
+#[derive(Clone)]
+struct SelectionState {
+    frame: Arc<Mutex<Option<CapturedFrame>>>,
+    crop: Arc<Mutex<Option<CapturedFrame>>>,
+    bounds: Arc<Mutex<Option<LogicalRect>>>,
+    geometry: Arc<Mutex<SelectionGeometry>>,
+    active_kind: Arc<Mutex<Option<GestureKind>>>,
+    viewport: Arc<Mutex<Option<FrameViewport>>>,
+    editor: Arc<Mutex<Option<AnnotationEditor>>>,
+    text_position: Arc<Mutex<Option<ImagePoint>>>,
+    session: Arc<CaptureSession>,
+    toolbar_snapshot: Arc<Mutex<Option<ToolbarPositionSnapshot>>>,
+    toolbar_drag: Arc<Mutex<Option<ToolbarDrag>>>,
+}
+
+const TOOLBAR_DESIGN_WIDTH: f64 = 620.0;
+const TOOLBAR_DESIGN_HEIGHT: f64 = 64.0;
+const TOOLBAR_GAP: f64 = 8.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ToolbarLayout {
+    x: f64,
+    y: f64,
+    scale: f64,
+    forced_inside: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ToolbarPositionSnapshot {
+    manual: bool,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ToolbarDrag {
+    pointer_x: f64,
+    pointer_y: f64,
+    toolbar_x: f64,
+    toolbar_y: f64,
+    initial: ToolbarPositionSnapshot,
+    moved: bool,
+}
+
+impl SelectionState {
+    fn new() -> Self {
+        Self {
+            frame: Arc::new(Mutex::new(None)),
+            crop: Arc::new(Mutex::new(None)),
+            bounds: Arc::new(Mutex::new(None)),
+            geometry: Arc::new(Mutex::new(SelectionGeometry::default())),
+            active_kind: Arc::new(Mutex::new(None)),
+            viewport: Arc::new(Mutex::new(None)),
+            editor: Arc::new(Mutex::new(None)),
+            text_position: Arc::new(Mutex::new(None)),
+            session: Arc::new(CaptureSession::default()),
+            toolbar_snapshot: Arc::new(Mutex::new(None)),
+            toolbar_drag: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn current_transform(&self, width: f64, height: f64) -> Option<ViewportToFrame> {
+        current_frame_transform(&self.viewport, width, height)
+    }
+}
+
+fn present_pixel_rect(
     overlay: &OverlayPrototype,
-    viewport_slot: Arc<Mutex<Option<FrameViewport>>>,
-    selection_slot: Arc<Mutex<Selection>>,
-    selection_pixels_slot: Arc<Mutex<Option<PixelRect>>>,
-    selection_bounds_slot: Arc<Mutex<Option<LogicalRect>>>,
-    crop_slot: Arc<Mutex<Option<CapturedFrame>>>,
-    text_position_slot: Arc<Mutex<Option<ImagePoint>>>,
+    rect: Option<PixelRect>,
+    transform: ViewportToFrame,
+) -> Result<Option<LogicalRect>, &'static str> {
+    let viewport = LogicalViewport {
+        width: transform.viewport_width,
+        height: transform.viewport_height,
+    };
+    let Some(rect) = rect else {
+        clear_selection_preview(overlay);
+        apply_toolbar_layout(overlay, None, viewport);
+        return Ok(None);
+    };
+    let logical = transform.logical_rect_for_pixels(rect)?;
+    overlay.set_selection_x(logical.x as f32);
+    overlay.set_selection_y(logical.y as f32);
+    overlay.set_selection_width(logical.width as f32);
+    overlay.set_selection_height(logical.height as f32);
+    apply_toolbar_layout(overlay, Some(logical), viewport);
+    Ok(Some(logical))
+}
+
+fn present_gesture_preview(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    transform: ViewportToFrame,
+) -> Result<(), &'static str> {
+    let preview = state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .preview();
+    present_pixel_rect(overlay, preview, transform)?;
+    Ok(())
+}
+
+fn toolbar_scale_for_viewport(viewport: LogicalViewport) -> f64 {
+    if !viewport.width.is_finite()
+        || !viewport.height.is_finite()
+        || viewport.width <= 0.0
+        || viewport.height <= 0.0
+    {
+        return 0.0;
+    }
+    (viewport.width / TOOLBAR_DESIGN_WIDTH)
+        .min(viewport.height / TOOLBAR_DESIGN_HEIGHT)
+        .min(1.0)
+}
+
+fn clamp_toolbar_position(x: f64, y: f64, viewport: LogicalViewport, scale: f64) -> (f64, f64) {
+    let width = TOOLBAR_DESIGN_WIDTH * scale;
+    let height = TOOLBAR_DESIGN_HEIGHT * scale;
+    let x = if x.is_finite() { x } else { 0.0 };
+    let y = if y.is_finite() { y } else { 0.0 };
+    (
+        x.clamp(0.0, (viewport.width - width).max(0.0)),
+        y.clamp(0.0, (viewport.height - height).max(0.0)),
+    )
+}
+
+fn rebase_toolbar_position(
+    position: ToolbarPositionSnapshot,
+    old_viewport: LogicalViewport,
+    new_viewport: LogicalViewport,
+) -> (f64, f64) {
+    clamp_toolbar_position(
+        position.x * old_viewport.width / new_viewport.width,
+        position.y * old_viewport.height / new_viewport.height,
+        new_viewport,
+        toolbar_scale_for_viewport(new_viewport),
+    )
+}
+
+fn calculate_toolbar_layout(
+    selection: Option<LogicalRect>,
+    viewport: LogicalViewport,
+) -> ToolbarLayout {
+    let scale = toolbar_scale_for_viewport(viewport);
+    let width = TOOLBAR_DESIGN_WIDTH * scale;
+    let height = TOOLBAR_DESIGN_HEIGHT * scale;
+    let (Some(selection), true) = (selection, scale > 0.0) else {
+        return ToolbarLayout {
+            x: 0.0,
+            y: 0.0,
+            scale,
+            forced_inside: false,
+        };
+    };
+    let (x, _) = clamp_toolbar_position(selection.x, 0.0, viewport, scale);
+    let above_y = selection.y - height - TOOLBAR_GAP;
+    if above_y >= 0.0 {
+        return ToolbarLayout {
+            x,
+            y: above_y,
+            scale,
+            forced_inside: false,
+        };
+    }
+    let below_y = selection.y + selection.height + TOOLBAR_GAP;
+    if below_y + height <= viewport.height {
+        return ToolbarLayout {
+            x,
+            y: below_y,
+            scale,
+            forced_inside: false,
+        };
+    }
+    let max_x = (viewport.width - width).max(0.0);
+    let max_y = (viewport.height - height).max(0.0);
+    let x = if selection.width >= width {
+        selection
+            .x
+            .clamp(0.0, (selection.x + selection.width - width).min(max_x))
+    } else {
+        selection.x.clamp(0.0, max_x)
+    };
+    let y = if selection.height >= height {
+        selection
+            .y
+            .clamp(0.0, (selection.y + selection.height - height).min(max_y))
+    } else {
+        selection.y.clamp(0.0, max_y)
+    };
+    ToolbarLayout {
+        x,
+        y,
+        scale,
+        forced_inside: true,
+    }
+}
+
+fn apply_toolbar_layout(
+    overlay: &OverlayPrototype,
+    selection: Option<LogicalRect>,
+    viewport: LogicalViewport,
 ) {
+    let layout = calculate_toolbar_layout(selection, viewport);
+    overlay.set_toolbar_auto_x(layout.x as f32);
+    overlay.set_toolbar_auto_y(layout.y as f32);
+    overlay.set_toolbar_scale(layout.scale as f32);
+    overlay.set_toolbar_forced_inside(layout.forced_inside);
+}
+
+fn toolbar_snapshot(overlay: &OverlayPrototype) -> ToolbarPositionSnapshot {
+    ToolbarPositionSnapshot {
+        manual: overlay.get_toolbar_manual_position(),
+        x: f64::from(overlay.get_toolbar_manual_x()),
+        y: f64::from(overlay.get_toolbar_manual_y()),
+    }
+}
+
+fn restore_toolbar_snapshot(overlay: &OverlayPrototype, state: &SelectionState) {
+    if let Some(snapshot) = state
+        .toolbar_snapshot
+        .lock()
+        .expect("toolbar position snapshot lock")
+        .take()
+    {
+        overlay.set_toolbar_manual_x(snapshot.x as f32);
+        overlay.set_toolbar_manual_y(snapshot.y as f32);
+        overlay.set_toolbar_manual_position(snapshot.manual);
+    }
+}
+
+fn cancel_toolbar_drag(overlay: &OverlayPrototype, state: &SelectionState) {
+    if let Some(active) = state.toolbar_drag.lock().expect("toolbar drag lock").take() {
+        overlay.set_toolbar_manual_x(active.initial.x as f32);
+        overlay.set_toolbar_manual_y(active.initial.y as f32);
+        overlay.set_toolbar_manual_position(active.initial.manual);
+    }
+}
+
+fn toolbar_contains(overlay: &OverlayPrototype, x: f64, y: f64) -> bool {
+    if !overlay.get_annotation_mode() {
+        return false;
+    }
+    let left = f64::from(overlay.get_toolbar_position_x());
+    let top = f64::from(overlay.get_toolbar_position_y());
+    let right = left + f64::from(overlay.get_toolbar_effective_width());
+    let bottom = top + f64::from(overlay.get_toolbar_effective_height());
+    x >= left && x <= right && y >= top && y <= bottom
+}
+
+fn handle_toolbar_pointer_event(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    kind: PointerEventKind,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) {
+    let viewport = LogicalViewport { width, height };
+    let scale = f64::from(overlay.get_toolbar_scale());
+    match kind {
+        PointerEventKind::Down => {
+            if !overlay.get_toolbar_drag_enabled() {
+                return;
+            }
+            let mut drag = state.toolbar_drag.lock().expect("toolbar drag lock");
+            if drag.is_some() {
+                return;
+            }
+            *drag = Some(ToolbarDrag {
+                pointer_x: x,
+                pointer_y: y,
+                toolbar_x: f64::from(overlay.get_toolbar_position_x()),
+                toolbar_y: f64::from(overlay.get_toolbar_position_y()),
+                initial: toolbar_snapshot(overlay),
+                moved: false,
+            });
+        }
+        PointerEventKind::Move | PointerEventKind::Up => {
+            let mut drag = state.toolbar_drag.lock().expect("toolbar drag lock");
+            let Some(active) = drag.as_mut() else { return };
+            let dx = x - active.pointer_x;
+            let dy = y - active.pointer_y;
+            if active.moved || dx.abs() >= 2.0 || dy.abs() >= 2.0 {
+                let (x, y) = clamp_toolbar_position(
+                    active.toolbar_x + dx,
+                    active.toolbar_y + dy,
+                    viewport,
+                    scale,
+                );
+                overlay.set_toolbar_manual_x(x as f32);
+                overlay.set_toolbar_manual_y(y as f32);
+                overlay.set_toolbar_manual_position(true);
+                active.moved = true;
+            }
+            if kind == PointerEventKind::Up {
+                drag.take();
+            }
+        }
+        PointerEventKind::Cancel => {
+            if let Some(active) = state.toolbar_drag.lock().expect("toolbar drag lock").take() {
+                overlay.set_toolbar_manual_x(active.initial.x as f32);
+                overlay.set_toolbar_manual_y(active.initial.y as f32);
+                overlay.set_toolbar_manual_position(active.initial.manual);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn selection_has_pending_edits(state: &SelectionState) -> bool {
+    state
+        .editor
+        .lock()
+        .expect("annotation editor lock")
+        .as_ref()
+        .is_some_and(|editor| editor.document().len() > 0 || editor.is_drawing())
+        || state
+            .text_position
+            .lock()
+            .expect("text position lock")
+            .is_some()
+}
+
+fn request_selection_reset(overlay: &OverlayPrototype, state: &SelectionState) {
+    if selection_has_pending_edits(state) {
+        overlay.set_confirm_selection_action_message(
+            "Discard the current selection and its annotations?".into(),
+        );
+        overlay.set_confirm_selection_action_visible(true);
+    } else if let Err(error) = reset_to_new_selection(overlay, state) {
+        log::warn!("Could not start a new selection: {error}");
+        set_status(overlay, format!("Could not start a new selection: {error}"));
+    }
+}
+
+fn reset_to_new_selection(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+) -> Result<(), &'static str> {
+    let viewport = state
+        .viewport
+        .lock()
+        .expect("frame viewport lock")
+        .as_ref()
+        .copied()
+        .ok_or("captured frame viewport is unavailable")?;
+    let logical_size = viewport.logical_size();
+    let transform = viewport.transform_for(logical_size.width, logical_size.height)?;
+    let editor_was_present = state
+        .editor
+        .lock()
+        .expect("annotation editor lock")
+        .is_some();
+    if editor_was_present && !state.session.restart_selection() {
+        return Err("capture session could not return to selection mode");
+    }
+    if editor_was_present {
+        state.editor.lock().expect("annotation editor lock").take();
+    }
+    *state.geometry.lock().expect("selection geometry lock") =
+        SelectionGeometry::new(None, transform)?;
+    *state.active_kind.lock().expect("active gesture lock") = None;
+    *state.crop.lock().expect("selected crop lock") = None;
+    *state.bounds.lock().expect("selection bounds lock") = None;
+    *state.text_position.lock().expect("text position lock") = None;
+    *state
+        .toolbar_snapshot
+        .lock()
+        .expect("toolbar position snapshot lock") = None;
+    cancel_toolbar_drag(overlay, state);
+    overlay.set_toolbar_manual_position(false);
+    overlay.set_annotation_mode(false);
+    overlay.set_selection_adjustment_mode(false);
+    overlay.set_confirm_selection_action_visible(false);
+    overlay.set_annotation_image(Image::default());
+    overlay.set_text_entry_visible(false);
+    overlay.set_text_entry_value(String::new().into());
+    overlay.set_can_undo(false);
+    overlay.set_can_redo(false);
+    clear_selection_preview(overlay);
+    overlay.invoke_focus_selection();
+    Ok(())
+}
+
+fn begin_selection_gesture(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<bool, &'static str> {
+    if toolbar_contains(overlay, x, y)
+        || state
+            .toolbar_drag
+            .lock()
+            .expect("toolbar drag lock")
+            .is_some()
+        || state
+            .text_position
+            .lock()
+            .expect("text position lock")
+            .is_some()
+    {
+        return Ok(false);
+    }
+    let transform = state
+        .current_transform(width, height)
+        .ok_or("selection viewport is unavailable or out of sync")?;
+    let committed = state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .committed();
+    let kind = if let Some(rect) = committed {
+        if !overlay.get_selection_adjustment_mode() {
+            return Ok(false);
+        }
+        match hit_test_selection(rect, x, y, 5.0, transform)? {
+            SelectionHit::Outside => GestureKind::Create,
+            SelectionHit::Move => GestureKind::Move,
+            SelectionHit::Resize(handle) => GestureKind::Resize(handle),
+        }
+    } else {
+        GestureKind::Create
+    };
+    if kind == GestureKind::Create && selection_has_pending_edits(state) {
+        overlay.set_confirm_selection_action_message(
+            "Creating a new selection discards the current annotations.".into(),
+        );
+        overlay.set_confirm_selection_action_visible(true);
+        return Ok(false);
+    }
+    *state
+        .toolbar_snapshot
+        .lock()
+        .expect("toolbar position snapshot lock") = Some(toolbar_snapshot(overlay));
+    state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .begin(kind, x, y, transform)?;
+    *state.active_kind.lock().expect("active gesture lock") = Some(kind);
+    // The committed annotation image belongs to the old crop. The frozen
+    // capture beneath it tracks the live geometry until a new crop is committed.
+    overlay.set_annotation_image(Image::default());
+    platform::trace_event(&format!(
+        "selection.gesture.begin kind={kind:?} x={x} y={y}"
+    ));
+    present_gesture_preview(overlay, state, transform)?;
+    Ok(true)
+}
+
+fn update_selection_gesture(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<bool, &'static str> {
+    if !state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .is_active()
+    {
+        return Ok(false);
+    }
+    let transform = state
+        .current_transform(width, height)
+        .ok_or("selection viewport is unavailable or out of sync")?;
+    state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .update(x, y, transform)?;
+    let (committed, preview) = {
+        let geometry = state.geometry.lock().expect("selection geometry lock");
+        (geometry.committed(), geometry.preview())
+    };
+    if preview != committed {
+        // A manual toolbar position belongs to the old selection geometry.
+        // Follow the new geometry automatically while the gesture is active;
+        // cancellation restores the snapshot captured at pointer-down.
+        overlay.set_toolbar_manual_position(false);
+    }
+    present_gesture_preview(overlay, state, transform)?;
+    Ok(true)
+}
+
+fn cancel_selection_gesture(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    width: f64,
+    height: f64,
+) {
+    let was_active = state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .is_active();
+    if !was_active {
+        return;
+    }
+    state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .cancel();
+    *state.active_kind.lock().expect("active gesture lock") = None;
+    if let Some(transform) = state.current_transform(width, height) {
+        let committed = state
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .committed();
+        if let Ok(bounds) = present_pixel_rect(overlay, committed, transform) {
+            *state.bounds.lock().expect("selection bounds lock") = bounds;
+        }
+    }
+    restore_toolbar_snapshot(overlay, state);
+    cancel_toolbar_drag(overlay, state);
+    update_preview_if_possible(overlay, &state.crop, &state.editor);
+    platform::trace_event("selection.gesture.cancel restored_committed_geometry=true");
+}
+
+fn finish_selection_gesture(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) {
+    let active = state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .is_active();
+    if !active {
+        return;
+    }
+    let Some(transform) = state.current_transform(width, height) else {
+        cancel_selection_gesture(overlay, state, width, height);
+        return;
+    };
+    if let Err(error) = update_selection_gesture(overlay, state, x, y, width, height) {
+        log::warn!("Could not update selection gesture: {error}");
+        cancel_selection_gesture(overlay, state, width, height);
+        return;
+    }
+    let (original, candidate) = {
+        let geometry = state.geometry.lock().expect("selection geometry lock");
+        (geometry.committed(), geometry.preview())
+    };
+    let kind = state
+        .active_kind
+        .lock()
+        .expect("active gesture lock")
+        .take();
+    let Some(candidate) = candidate else {
+        state
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .commit();
+        if let Ok(bounds) = present_pixel_rect(overlay, original, transform) {
+            *state.bounds.lock().expect("selection bounds lock") = bounds;
+        }
+        update_preview_if_possible(overlay, &state.crop, &state.editor);
+        restore_toolbar_snapshot(overlay, state);
+        platform::trace_event("selection.gesture.commit ignored_empty_preview=true");
+        return;
+    };
+    if Some(candidate) == original {
+        state
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .commit();
+        if let Ok(bounds) = present_pixel_rect(overlay, Some(candidate), transform) {
+            *state.bounds.lock().expect("selection bounds lock") = bounds;
+        }
+        update_preview_if_possible(overlay, &state.crop, &state.editor);
+        restore_toolbar_snapshot(overlay, state);
+        platform::trace_event("selection.gesture.commit changed=false");
+        return;
+    }
+    let crop = state
+        .frame
+        .lock()
+        .expect("capture frame lock")
+        .as_ref()
+        .and_then(|frame| frame.crop(candidate).ok());
+    let Some(crop) = crop else {
+        state
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .cancel();
+        if let Ok(bounds) = present_pixel_rect(overlay, original, transform) {
+            *state.bounds.lock().expect("selection bounds lock") = bounds;
+        }
+        restore_toolbar_snapshot(overlay, state);
+        log::error!("Selected crop could not be copied from the captured frame");
+        update_preview_if_possible(overlay, &state.crop, &state.editor);
+        set_status(overlay, "Could not copy selected screenshot region.");
+        return;
+    };
+    let committed = state
+        .geometry
+        .lock()
+        .expect("selection geometry lock")
+        .commit();
+    if committed != Some(candidate) {
+        log::error!("Selection geometry commit did not retain its preview rectangle");
+        return;
+    }
+    let logical = match transform.logical_rect_for_pixels(candidate) {
+        Ok(logical) => logical,
+        Err(error) => {
+            log::error!("Committed selection geometry is invalid: {error}");
+            return;
+        }
+    };
+    *state.bounds.lock().expect("selection bounds lock") = Some(logical);
+    *state.crop.lock().expect("selected crop lock") = Some(crop);
+    *state
+        .toolbar_snapshot
+        .lock()
+        .expect("toolbar position snapshot lock") = None;
+    cancel_toolbar_drag(overlay, state);
+    overlay.set_toolbar_manual_position(false);
+    apply_toolbar_layout(
+        overlay,
+        Some(logical),
+        LogicalViewport {
+            width: transform.viewport_width,
+            height: transform.viewport_height,
+        },
+    );
+    let kind = kind.unwrap_or(GestureKind::Create);
+    if kind == GestureKind::Create {
+        *state.editor.lock().expect("annotation editor lock") = Some(AnnotationEditor::default());
+        *state.text_position.lock().expect("text position lock") = None;
+        overlay.set_text_entry_visible(false);
+        overlay.set_text_entry_value(String::new().into());
+        overlay.set_annotation_image(Image::default());
+        if !state.session.is_active() {
+            log::warn!("Selection was committed after its capture session ended");
+        } else if state
+            .editor
+            .lock()
+            .expect("annotation editor lock")
+            .is_some()
+            && original.is_none()
+            && !state.session.begin_annotation()
+        {
+            log::error!("Could not transition capture session into annotation state");
+        }
+    }
+    overlay.set_selection_x(logical.x as f32);
+    overlay.set_selection_y(logical.y as f32);
+    overlay.set_selection_width(logical.width as f32);
+    overlay.set_selection_height(logical.height as f32);
+    overlay.set_selected_tool(AnnotationTool::Pen.ui_index());
+    overlay.set_annotation_mode(true);
+    overlay.set_confirm_selection_action_visible(false);
+    platform::trace_event(&format!(
+        "selection.gesture.commit kind={kind:?} pixels=({}, {}, {}, {})",
+        candidate.x, candidate.y, candidate.width, candidate.height
+    ));
+    if let Err(error) = refresh_annotation_preview(overlay, &state.crop, &state.editor) {
+        log::warn!("Could not refresh annotation preview after selection update: {error}");
+    }
+    overlay.invoke_focus_selection();
+}
+
+fn install_overlay_scale_factor_handler(overlay: &OverlayPrototype, state: SelectionState) {
     let weak_overlay = overlay.as_weak();
     overlay.window().on_winit_window_event(move |_, event| {
         let winit::event::WindowEvent::ScaleFactorChanged { scale_factor, .. } = event else {
@@ -268,16 +864,28 @@ fn install_overlay_scale_factor_handler(
         platform::trace_event(&format!(
             "overlay.scale_factor_changed.begin scale_factor={effective_scale_factor}"
         ));
-        selection_slot.lock().expect("selection lock").cancel();
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return EventResult::Propagate;
+        };
+        state
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .cancel();
+        *state.active_kind.lock().expect("active gesture lock") = None;
+        restore_toolbar_snapshot(&overlay, &state);
+        cancel_toolbar_drag(&overlay, &state);
+        let toolbar_before_scale = toolbar_snapshot(&overlay);
 
         let synchronized = {
-            let mut viewport_guard = viewport_slot.lock().expect("frame viewport lock");
+            let mut viewport_guard = state.viewport.lock().expect("frame viewport lock");
             let Some(viewport) = viewport_guard.as_mut() else {
                 platform::trace_event("overlay.scale_factor_changed.ignored no_captured_frame");
                 return EventResult::Propagate;
             };
+            let old_logical_size = viewport.logical_size();
             match viewport.synchronize_scale_factor(effective_scale_factor) {
-                Ok(logical_size) => Ok((*viewport, logical_size)),
+                Ok(logical_size) => Ok((*viewport, old_logical_size, logical_size)),
                 Err(error) => {
                     *viewport_guard = None;
                     Err(error)
@@ -285,7 +893,7 @@ fn install_overlay_scale_factor_handler(
             }
         };
 
-        let (viewport, logical_size) = match synchronized {
+        let (viewport, old_logical_size, logical_size) = match synchronized {
             Ok(viewport) => viewport,
             Err(error) => {
                 log::warn!("Rejected Overlay scale-factor change: {error}");
@@ -296,17 +904,19 @@ fn install_overlay_scale_factor_handler(
             }
         };
 
-        let selected_pixels = *selection_pixels_slot
+        let selected_pixels = state
+            .geometry
             .lock()
-            .expect("selection pixel rectangle lock");
+            .expect("selection geometry lock")
+            .committed();
         let logical_selection = selected_pixels
             .map(|pixels| viewport.project_pixels(pixels))
             .transpose();
         let logical_selection = match logical_selection {
             Ok(selection) => selection,
             Err(error) => {
-                *viewport_slot.lock().expect("frame viewport lock") = None;
-                *selection_bounds_slot.lock().expect("selection bounds lock") = None;
+                *state.viewport.lock().expect("frame viewport lock") = None;
+                *state.bounds.lock().expect("selection bounds lock") = None;
                 log::warn!("Rejected Overlay selection geometry after DPI change: {error}");
                 platform::trace_event(&format!(
                     "overlay.scale_factor_changed.selection_invalid error={error}"
@@ -314,13 +924,16 @@ fn install_overlay_scale_factor_handler(
                 return EventResult::Propagate;
             }
         };
-        *selection_bounds_slot.lock().expect("selection bounds lock") = logical_selection;
+        *state.bounds.lock().expect("selection bounds lock") = logical_selection;
 
-        let Some(overlay) = weak_overlay.upgrade() else {
-            return EventResult::Propagate;
-        };
         overlay.set_frame_viewport_width(logical_size.width as f32);
         overlay.set_frame_viewport_height(logical_size.height as f32);
+        if toolbar_before_scale.manual {
+            let (x, y) =
+                rebase_toolbar_position(toolbar_before_scale, old_logical_size, logical_size);
+            overlay.set_toolbar_manual_x(x as f32);
+            overlay.set_toolbar_manual_y(y as f32);
+        }
         if let Some(rect) = logical_selection {
             overlay.set_selection_x(rect.x as f32);
             overlay.set_selection_y(rect.y as f32);
@@ -329,11 +942,13 @@ fn install_overlay_scale_factor_handler(
         } else {
             clear_selection_preview(&overlay);
         }
+        apply_toolbar_layout(&overlay, logical_selection, logical_size);
 
         if let (Some(point), Some(bounds), Some(crop)) = (
-            *text_position_slot.lock().expect("text position lock"),
+            *state.text_position.lock().expect("text position lock"),
             logical_selection,
-            crop_slot
+            state
+                .crop
                 .lock()
                 .expect("selected crop lock")
                 .as_ref()
@@ -358,10 +973,6 @@ fn install_overlay_scale_factor_handler(
         ));
         EventResult::Propagate
     });
-}
-
-fn contains(bounds: LogicalRect, x: f64, y: f64) -> bool {
-    x >= bounds.x && y >= bounds.y && x <= bounds.x + bounds.width && y <= bounds.y + bounds.height
 }
 
 fn refresh_annotation_preview(
@@ -397,6 +1008,14 @@ fn update_preview_if_possible(
     crop_slot: &Arc<Mutex<Option<CapturedFrame>>>,
     editor_slot: &Arc<Mutex<Option<AnnotationEditor>>>,
 ) {
+    if crop_slot.lock().expect("selected crop lock").is_none()
+        || editor_slot
+            .lock()
+            .expect("annotation editor lock")
+            .is_none()
+    {
+        return;
+    }
     if let Err(error) = refresh_annotation_preview(overlay, crop_slot, editor_slot) {
         log::warn!("Could not render annotation preview: {error}");
     }
@@ -414,539 +1033,257 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     platform::trace_event("main.entry dpi_initialized=true");
-    platform::trace_event("backend.select.before");
-    // The default FemtoVG/OpenGL path leaves the native cursor physically
-    // invisible over the fullscreen overlay on the affected Windows display.
-    // Slint's software renderer preserves the Win32 cursor there.
     #[cfg(target_os = "windows")]
-    let backend_result = slint::BackendSelector::new()
-        .backend_name("winit".into())
-        .renderer_name("software".into())
-        .select();
-    #[cfg(target_os = "windows")]
-    platform::trace_event(&format!(
-        "backend.select.after success={}",
-        backend_result.is_ok()
-    ));
-    #[cfg(target_os = "windows")]
-    backend_result?;
-    log::info!("Native capture prototype started");
+    {
+        let backend_result = slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .renderer_name("software".into())
+            .select();
+        platform::trace_event(&format!(
+            "backend.select.after success={}",
+            backend_result.is_ok()
+        ));
+        backend_result?;
+    }
+    log::info!("Carambola native capture app started");
 
-    #[cfg(target_os = "windows")]
-    let displays = platform::enumerate_displays().map_err(std::io::Error::other)?;
-    #[cfg(not(target_os = "windows"))]
-    let displays = Vec::<DisplayMetadata>::new();
-    let default_display_index = displays
-        .iter()
-        .position(|display| display.is_primary)
-        .unwrap_or(0);
-    let display_options = displays
-        .iter()
-        .map(|display| display.label().into())
-        .collect::<Vec<slint::SharedString>>();
-    let displays = Arc::new(displays);
-
-    platform::trace_event("main.before_settings_create");
-
-    let settings = SettingsWindow::new().map_err(|error| {
-        platform::trace_event(&format!("main.settings_create.failed error={error}"));
-        error
-    })?;
-    settings.set_display_options(ModelRc::new(VecModel::from(display_options)));
-    settings.set_selected_display_index(default_display_index as i32);
-    platform::trace_event("main.after_settings_create");
-    platform::trace_slint_native_handle("Settings", "after_component_create", settings.window());
+    platform::trace_event("main.before_overlay_create");
     let overlay = OverlayPrototype::new().map_err(|error| {
         platform::trace_event(&format!("main.overlay_create.failed error={error}"));
         error
     })?;
     platform::trace_event("main.after_overlay_create");
     platform::trace_slint_native_handle("Overlay", "after_component_create", overlay.window());
-    trace_settings_state(&settings, "main.after_windows_created");
-    trace_overlay_state(&overlay, "main.after_windows_created");
-    platform::diagnose_cursor("windows created");
-    let captured_frame = Arc::new(Mutex::new(None::<CapturedFrame>));
-    let selected_crop = Arc::new(Mutex::new(None::<CapturedFrame>));
-    let selection_bounds = Arc::new(Mutex::new(None::<LogicalRect>));
-    let selection_pixels = Arc::new(Mutex::new(None::<PixelRect>));
-    let annotation_editor = Arc::new(Mutex::new(None::<AnnotationEditor>));
-    let pending_text_position = Arc::new(Mutex::new(None::<ImagePoint>));
-    let selection = Arc::new(Mutex::new(Selection::default()));
-    let frame_viewport = Arc::new(Mutex::new(None::<FrameViewport>));
-    let capture_session = Arc::new(CaptureSession::default());
+    trace_overlay_state(&overlay, "main.after_overlay_create");
+    platform::diagnose_cursor("overlay component created");
+
+    let selection = SelectionState::new();
     let export_busy = Arc::new(AtomicBool::new(false));
-    let selected_display_id = Arc::new(Mutex::new(None::<String>));
+    let clipboard_owner_hwnd = Arc::new(AtomicIsize::new(0));
+    install_overlay_scale_factor_handler(&overlay, selection.clone());
 
-    install_overlay_scale_factor_handler(
-        &overlay,
-        frame_viewport.clone(),
-        selection.clone(),
-        selection_pixels.clone(),
-        selection_bounds.clone(),
-        selected_crop.clone(),
-        pending_text_position.clone(),
-    );
-
-    {
-        let displays = displays.clone();
-        let selected_display_id = selected_display_id.clone();
-        settings.on_display_selected(move |index| {
-            let display_id = usize::try_from(index)
-                .ok()
-                .and_then(|index| displays.get(index))
-                .map(|display| display.id.clone());
-            if let Some(display_id) = display_id {
-                *selected_display_id.lock().expect("selected display lock") = Some(display_id);
-            }
-        });
-    }
-
-    let weak_settings = settings.as_weak();
     let weak_overlay = overlay.as_weak();
-    let frame_slot = captured_frame.clone();
-    let crop_slot = selected_crop.clone();
-    let bounds_slot = selection_bounds.clone();
-    let selection_pixels_slot = selection_pixels.clone();
-    let editor_slot = annotation_editor.clone();
-    let text_position_slot = pending_text_position.clone();
-    let selection_slot = selection.clone();
-    let frame_viewport_slot = frame_viewport.clone();
-    let active_flag = capture_session.clone();
-    let export_busy_flag = export_busy.clone();
-    let selected_display_slot = selected_display_id.clone();
-    let displays_for_capture = displays.clone();
-    let capture_restore_state = Arc::new(AtomicU8::new(SettingsVisibility::Hidden as u8));
-    let restore_state_slot = capture_restore_state.clone();
-    settings.on_open_overlay(move || {
+    let state_for_capture = selection.clone();
+    let busy_for_capture = export_busy.clone();
+    overlay.on_request_capture(move || {
         platform::clear_window_action("new_capture_requested");
         platform::trace_event("capture.start.requested");
-        if let Some(settings) = weak_settings.upgrade() {
-            trace_settings_state(&settings, "capture.start.requested");
-        }
-        log::info!("Capture requested");
         platform::diagnose_cursor("capture requested");
-        if export_busy_flag.load(Ordering::Acquire) {
-            if let Some(settings) = weak_settings.upgrade() {
-                set_status(&settings, "Please wait for the current export to finish.");
+        if busy_for_capture.load(Ordering::Acquire) {
+            if let Some(overlay) = weak_overlay.upgrade() {
+                set_status(&overlay, "Please wait for the current export to finish.");
             }
             return;
         }
-        if !active_flag.begin_capture() {
+        if !state_for_capture.session.begin_capture() {
             platform::trace_event("capture.start.rejected_session_already_active");
             return;
         }
         platform::trace_event("capture.session.transition=Capturing");
-        let return_visibility = weak_settings
-            .upgrade()
-            .map(|settings| settings_visibility(&settings))
-            .unwrap_or(SettingsVisibility::Hidden);
-        restore_state_slot.store(return_visibility as u8, Ordering::Release);
-        platform::trace_event(&format!(
-            "capture.start.accepted saved_visibility={return_visibility:?}"
-        ));
-        frame_slot.lock().expect("capture frame lock").take();
-        crop_slot.lock().expect("selected crop lock").take();
-        *bounds_slot.lock().expect("selection bounds lock") = None;
-        *selection_pixels_slot
-            .lock()
-            .expect("selection pixel rectangle lock") = None;
-        *frame_viewport_slot
-            .lock()
-            .expect("frame viewport lock") = None;
-        *editor_slot.lock().expect("annotation editor lock") = None;
-        *text_position_slot.lock().expect("text position lock") = None;
-        *selection_slot.lock().expect("selection lock") = Selection::default();
-        let requested_display = selected_display_slot
-            .lock()
-            .expect("selected display lock")
-            .clone();
-        let display_label = requested_display
-            .as_deref()
-            .and_then(|id| displays_for_capture.iter().find(|display| display.id == id))
-            .or_else(|| displays_for_capture.iter().find(|display| display.is_primary))
-            .map(DisplayMetadata::label)
-            .unwrap_or_else(|| "selected display".to_owned());
-        if let Some(overlay) = weak_overlay.upgrade() {
-            overlay.set_annotation_mode(false);
-            overlay.set_annotation_image(Image::default());
-            overlay.set_text_entry_visible(false);
-            overlay.set_text_entry_value(String::new().into());
-            overlay.set_can_undo(false);
-            overlay.set_can_redo(false);
-            overlay.set_export_busy(false);
-            overlay.set_export_status(String::new().into());
-            overlay.set_selection_x(0.0);
-            overlay.set_selection_y(0.0);
-            overlay.set_selection_width(0.0);
-            overlay.set_selection_height(0.0);
-        }
-        if let Some(settings) = weak_settings.upgrade() {
-            set_status(&settings, format!("Capturing {display_label}…"));
-        }
+        *state_for_capture.frame.lock().expect("capture frame lock") = None;
+        *state_for_capture.crop.lock().expect("selected crop lock") = None;
+        *state_for_capture.bounds.lock().expect("selection bounds lock") = None;
+        *state_for_capture.geometry.lock().expect("selection geometry lock") = SelectionGeometry::default();
+        *state_for_capture.active_kind.lock().expect("active gesture lock") = None;
+        *state_for_capture.viewport.lock().expect("frame viewport lock") = None;
+        *state_for_capture.editor.lock().expect("annotation editor lock") = None;
+        *state_for_capture.text_position.lock().expect("text position lock") = None;
 
-        let weak_settings = weak_settings.clone();
-        let weak_overlay = weak_overlay.clone();
-        let frame_slot = frame_slot.clone();
-        let selection_slot = selection_slot.clone();
-        let frame_viewport_slot = frame_viewport_slot.clone();
-        let active_flag = active_flag.clone();
-        let restore_state_slot = restore_state_slot.clone();
-        let requested_display = requested_display.clone();
-        if weak_overlay.upgrade().is_none() {
-            finish_capture_session(&active_flag, "overlay_unavailable_before_capture");
-            return;
-        }
-        let Some(settings) = weak_settings.upgrade() else {
-            finish_capture_session(&active_flag, "settings_unavailable_before_capture");
+        let Some(overlay) = weak_overlay.upgrade() else {
+            finish_capture_session(&state_for_capture.session, "overlay_unavailable_before_capture");
             return;
         };
-        trace_settings_state(&settings, "capture.start.hide_settings.before");
-        platform::trace_event("settings.hide.capture_start.begin");
-        if let Err(error) = settings.hide() {
-            log::error!("Could not hide the settings window through Slint: {error}");
-            set_status(
-                &settings,
-                format!("Could not prepare the desktop for capture: {error}"),
-            );
-            restore_capture_settings(Some(&settings), return_visibility);
-            finish_capture_session(&active_flag, "settings_hide_failed");
-            return;
-        }
-        platform::trace_event("settings.hide.capture_start.end");
-        trace_settings_state(&settings, "capture.start.hide_settings.after");
+        overlay.set_annotation_mode(false);
+        overlay.set_selection_adjustment_mode(false);
+        overlay.set_confirm_selection_action_visible(false);
+        overlay.set_annotation_image(Image::default());
+        overlay.set_text_entry_visible(false);
+        overlay.set_text_entry_value(String::new().into());
+        overlay.set_can_undo(false);
+        overlay.set_can_redo(false);
+        overlay.set_export_busy(false);
+        overlay.set_export_status("Capturing desktop…".into());
+        clear_selection_preview(&overlay);
+
         platform::trace_event("capture.start.prepare_capture.begin");
         if let Err(error) = platform::prepare_capture() {
-            log::error!("Could not synchronize hidden settings window before capture: {error}");
-            set_status(
-                &settings,
-                format!("Could not prepare the desktop for capture: {error}"),
-            );
-            restore_capture_settings(Some(&settings), return_visibility);
-            finish_capture_session(&active_flag, "prepare_capture_failed");
+            set_status(&overlay, format!("Could not prepare the desktop for capture: {error}"));
+            finish_capture_session(&state_for_capture.session, "prepare_capture_failed");
             return;
         }
         platform::trace_event("capture.start.prepare_capture.complete");
-        platform::diagnose_cursor("settings hidden");
+        platform::diagnose_cursor("capture prepared");
 
-        // Capture before showing the transparent overlay so GDI cannot include
-        // the overlay itself in the desktop pixels. Capture work stays off the
-        // UI thread; the frozen frame is shown after the worker completes.
-        let bounds_for_result = bounds_slot.clone();
-        let selection_pixels_for_result = selection_pixels_slot.clone();
-        std::thread::spawn(move || {
-            platform::trace_event(&format!(
-                "capture.capture_display.worker_begin requested_id={requested_display:?}"
-            ));
-            let captured = match requested_display.as_deref() {
-                Some(display_id) => platform::capture_display(Some(display_id)),
-                None => platform::capture_primary(),
-            };
-            platform::trace_event(&format!(
-                "capture.capture_display.worker_end success={}",
-                captured.is_ok()
-            ));
-            log::info!(
-                "Selected-display capture completed: success={}",
-                captured.is_ok()
-            );
-            let session_for_dispatch = active_flag.clone();
-            let return_visibility =
-                SettingsVisibility::from_code(restore_state_slot.load(Ordering::Acquire));
-            platform::trace_event(&format!(
-                "capture.capture_result.dispatch_queued saved_visibility={return_visibility:?}"
-            ));
+        let weak_overlay = overlay.as_weak();
+        let state_for_result = state_for_capture.clone();
+        thread::spawn(move || {
+            platform::trace_event("capture.capture_primary.worker_begin");
+            let captured = platform::capture_primary();
+            platform::trace_event(&format!("capture.capture_primary.worker_end success={}", captured.is_ok()));
+            let session_for_dispatch = state_for_result.session.clone();
+            let session_for_queue_error = state_for_result.session.clone();
             let dispatched = slint::invoke_from_event_loop(move || {
                 platform::trace_event("capture.capture_result.dispatch_entered");
-                let Some(settings) = weak_settings.upgrade() else {
-                    restore_capture_settings(None, return_visibility);
-                    finish_capture_session(&active_flag, "settings_dropped_during_capture");
-                    return;
-                };
                 let Some(overlay) = weak_overlay.upgrade() else {
-                    restore_capture_settings(Some(&settings), return_visibility);
-                    finish_capture_session(&active_flag, "overlay_dropped_during_capture");
+                    finish_capture_session(&session_for_dispatch, "overlay_dropped_during_capture");
                     return;
                 };
-                match captured {
-                    Ok(frame) => {
-                        let Some(display) = frame.display_metadata().cloned() else {
-                            set_status(&settings, "The captured frame has no display metadata.");
-                            restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(&active_flag, "capture_metadata_missing");
-                            return;
-                        };
-                        let current_displays = match platform::enumerate_displays() {
-                            Ok(displays) => displays,
-                            Err(error) => {
-                                set_status(
-                                    &settings,
-                                    format!("Could not verify the captured display: {error}"),
-                                );
-                                restore_capture_settings(Some(&settings), return_visibility);
-                                finish_capture_session(&active_flag, "display_verification_failed");
-                                return;
-                            }
-                        };
-                        if !current_displays.iter().any(|current| current == &display) {
-                            set_status(
-                                &settings,
-                                format!("Display {} changed or disconnected before the overlay opened.", display.id),
-                            );
-                            restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(&active_flag, "display_changed_before_overlay");
-                            return;
-                        }
-
-                        let (Some(frame_origin), Some(frame_bottom_right)) = (
-                            frame.desktop_origin(),
-                            frame.local_to_desktop(frame.width(), frame.height()),
-                        ) else {
-                            set_status(&settings, "The captured frame has invalid desktop bounds.");
-                            restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(&active_flag, "frame_desktop_bounds_invalid");
-                            return;
-                        };
-                        if frame_bottom_right.x != display.bounds.right
-                            || frame_bottom_right.y != display.bounds.bottom
-                        {
-                            set_status(&settings, "The captured frame dimensions do not match the selected display.");
-                            restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(&active_flag, "frame_display_bounds_mismatch");
-                            return;
-                        }
-
-                        let scale_factor = display.scale_factor() as f32;
-                        if scale_factor <= 0.0 || !scale_factor.is_finite() {
-                            set_status(
-                                &settings,
-                                "The selected display reported an invalid scale factor.",
-                            );
-                            restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(&active_flag, "invalid_display_scale");
-                            return;
-                        }
-                        let frame_viewport = match FrameViewport::new(
-                            frame.width(),
-                            frame.height(),
-                            f64::from(scale_factor),
-                        ) {
-                            Ok(viewport) => viewport,
-                            Err(error) => {
-                                set_status(
-                                    &settings,
-                                    format!("The selected display has invalid Overlay geometry: {error}"),
-                                );
-                                restore_capture_settings(Some(&settings), return_visibility);
-                                finish_capture_session(&active_flag, "invalid_frame_viewport");
-                                return;
-                            }
-                        };
-                        let logical_viewport = frame_viewport.logical_size();
-                        platform::trace_event(&format!(
-                            "overlay.target_display id={:?} bounds=({}, {}, {}, {}) dpi={} scale_factor={}",
-                            display.id,
-                            display.bounds.left,
-                            display.bounds.top,
-                            display.bounds.right,
-                            display.bounds.bottom,
-                            display.effective_dpi,
-                            scale_factor
-                        ));
-                        platform::trace_event(&format!(
-                            "capture.frame_desktop_geometry monitor_id={:?} origin=({}, {}) end=({}, {})",
-                            display.id,
-                            frame_origin.x,
-                            frame_origin.y,
-                            frame_bottom_right.x,
-                            frame_bottom_right.y
-                        ));
-                        // Slint's fullscreen boolean maps to winit Borderless(None),
-                        // which chooses the monitor containing the HWND. Set both
-                        // physical bounds first so this session's target is
-                        // independent of the Overlay's previous placement/size.
-                        overlay
-                            .window()
-                            .set_position(slint::PhysicalPosition::new(frame_origin.x, frame_origin.y));
-                        overlay.window().set_size(slint::PhysicalSize::new(
-                            frame.width(),
-                            frame.height(),
-                        ));
-                        *frame_viewport_slot
-                            .lock()
-                            .expect("frame viewport lock") = Some(frame_viewport);
-                        overlay.set_frame_viewport_width(logical_viewport.width as f32);
-                        overlay.set_frame_viewport_height(logical_viewport.height as f32);
-                        log::info!(
-                            "Capture geometry: frame={}x{} logical_viewport={}x{} scale_factor={}",
-                            frame.width(),
-                            frame.height(),
-                            logical_viewport.width,
-                            logical_viewport.height,
-                            scale_factor
-                        );
-                        overlay.set_captured_image(image_from_rgba(
-                            frame.pixels(),
-                            frame.width(),
-                            frame.height(),
-                        ));
-                        overlay.invoke_focus_selection();
-                        overlay.set_selection_x(0.0);
-                        overlay.set_selection_y(0.0);
-                        overlay.set_selection_width(0.0);
-                        overlay.set_selection_height(0.0);
-                        overlay.set_annotation_mode(false);
-                        overlay.set_annotation_image(Image::default());
-                        *selection_pixels_for_result
-                            .lock()
-                            .expect("selection pixel rectangle lock") = None;
-                        *bounds_for_result
-                            .lock()
-                            .expect("selection bounds lock") = None;
-                        *frame_slot.lock().expect("capture frame lock") = Some(frame);
-                        *selection_slot.lock().expect("selection lock") = Selection::default();
-                        #[cfg(target_os = "windows")]
-                        let taskbar_window_pending =
-                            !platform::taskbar::ensure_overlay_removed(
-                                overlay.window(),
-                                settings.window(),
-                            );
-                        platform::trace_event("overlay.set_fullscreen_true.before");
-                        trace_overlay_state(&overlay, "overlay.set_fullscreen_true.before");
-                        overlay.window().set_fullscreen(true);
-                        trace_overlay_state(&overlay, "overlay.set_fullscreen_true.after");
-                        platform::trace_event("overlay.show.before");
-                        trace_overlay_state(&overlay, "overlay.show.before");
-                        if let Err(error) = overlay.show() {
-                            set_status(
-                                &settings,
-                                format!("Could not show selection overlay: {error}"),
-                            );
-                            platform::trace_event(
-                                "overlay.set_fullscreen_false.show_failed.before",
-                            );
-                            trace_overlay_state(
-                                &overlay,
-                                "overlay.set_fullscreen_false.show_failed.before",
-                            );
-                            overlay.window().set_fullscreen(false);
-                            trace_overlay_state(
-                                &overlay,
-                                "overlay.set_fullscreen_false.show_failed.after",
-                            );
-                            restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(&active_flag, "overlay_show_failed");
-                            return;
-                        }
-                        trace_overlay_state(&overlay, "overlay.show.after");
-                        platform::trace_slint_native_handle(
-                            "Overlay",
-                            "after_show",
-                            overlay.window(),
-                        );
-                        #[cfg(target_os = "windows")]
-                        if taskbar_window_pending
-                            && !platform::taskbar::ensure_overlay_removed(
-                                overlay.window(),
-                                settings.window(),
-                            )
-                        {
-                            let weak_overlay = overlay.as_weak();
-                            let weak_settings = settings.as_weak();
-                            if let Err(error) = slint::spawn_local(async move {
-                                let Some(overlay) = weak_overlay.upgrade() else {
-                                    return;
-                                };
-                                let native_window = match overlay.window().winit_window().await {
-                                    Ok(window) => window,
-                                    Err(error) => {
-                                        log::warn!("Overlay HWND unavailable for taskbar removal: {error}");
-                                        return;
-                                    }
-                                };
-                                drop(native_window);
-                                if overlay.window().is_visible() {
-                                    if let Some(settings) = weak_settings.upgrade() {
-                                        platform::taskbar::ensure_overlay_removed(
-                                            overlay.window(),
-                                            settings.window(),
-                                        );
-                                    }
-                                }
-                            }) {
-                                log::warn!("Could not wait for Overlay HWND to remove its taskbar tab: {error}");
-                            }
-                        }
-                        platform::diagnose_cursor("overlay shown");
-                        if !active_flag.capture_ready() {
-                            set_status(
-                                &settings,
-                                "Capture session state changed before selection.",
-                            );
-                            platform::trace_event(
-                                "overlay.set_fullscreen_false.capture_not_ready.before",
-                            );
-                            trace_overlay_state(
-                                &overlay,
-                                "overlay.set_fullscreen_false.capture_not_ready.before",
-                            );
-                            overlay.window().set_fullscreen(false);
-                            trace_overlay_state(
-                                &overlay,
-                                "overlay.set_fullscreen_false.capture_not_ready.after",
-                            );
-                            platform::trace_event("overlay.hide.capture_not_ready.before");
-                            trace_overlay_state(&overlay, "overlay.hide.capture_not_ready.before");
-                            let _ = overlay.hide();
-                            trace_overlay_state(&overlay, "overlay.hide.capture_not_ready.after");
-                            platform::trace_event("overlay.hide.capture_not_ready.after");
-                            overlay.set_captured_image(Image::default());
-                            restore_capture_settings(Some(&settings), return_visibility);
-                            finish_capture_session(
-                                &active_flag,
-                                "capture_not_ready_after_overlay_show",
-                            );
-                            return;
-                        }
-                        platform::trace_event("capture.session.transition=Selecting");
-                        platform::trace_event("overlay.activate.begin");
-                        if let Err(error) = platform::activate_overlay() {
-                            log::warn!("Could not activate the native selection overlay: {error}");
-                        }
-                        platform::trace_event("overlay.activate.end");
-                        platform::diagnose_cursor("overlay activated");
-                        overlay.invoke_focus_selection();
-                        log::info!("Selection overlay shown with frozen capture frame");
-                    }
+                let frame = match captured {
+                    Ok(frame) => frame,
                     Err(error) => {
-                        platform::trace_event(&format!(
-                            "capture.capture_primary.failed error={error:?}"
-                        ));
-                        set_status(&settings, format!("Screen capture failed: {error}"));
-                        restore_capture_settings(Some(&settings), return_visibility);
-                        finish_capture_session(&active_flag, "screen_capture_failed");
+                        set_status(&overlay, format!("Screen capture failed: {error}"));
+                        finish_capture_session(&state_for_result.session, "screen_capture_failed");
+                        return;
+                    }
+                };
+
+                if let Some(display) = frame.display_metadata().cloned() {
+                    let current_displays = match platform::enumerate_displays() {
+                        Ok(displays) => displays,
+                        Err(error) => {
+                            set_status(&overlay, format!("Could not verify the captured display: {error}"));
+                            finish_capture_session(&state_for_result.session, "display_verification_failed");
+                            return;
+                        }
+                    };
+                    if !current_displays.iter().any(|current| current == &display) {
+                        set_status(&overlay, format!("Display {} changed or disconnected before the overlay opened.", display.id));
+                        finish_capture_session(&state_for_result.session, "display_changed_before_overlay");
+                        return;
+                    }
+                    let Some((origin, bottom_right)) = frame.desktop_origin()
+                        .zip(frame.local_to_desktop(frame.width(), frame.height()))
+                    else {
+                        set_status(&overlay, "The captured frame has invalid desktop bounds.");
+                        finish_capture_session(&state_for_result.session, "frame_desktop_bounds_invalid");
+                        return;
+                    };
+                    if bottom_right.x != display.bounds.right || bottom_right.y != display.bounds.bottom {
+                        set_status(&overlay, "The captured frame dimensions do not match the primary display.");
+                        finish_capture_session(&state_for_result.session, "frame_display_bounds_mismatch");
+                        return;
+                    }
+                    platform::trace_event(&format!(
+                        "capture.frame_desktop_geometry display={:?} origin=({}, {}) end=({}, {})",
+                        display.id, origin.x, origin.y, bottom_right.x, bottom_right.y
+                    ));
+                    overlay.window().set_position(slint::PhysicalPosition::new(origin.x, origin.y));
+                }
+
+                let scale = frame.display_metadata().map(|display| display.scale_factor())
+                    .unwrap_or_else(|| f64::from(overlay.window().scale_factor()));
+                if !scale.is_finite() || scale <= 0.0 {
+                    set_status(&overlay, "The captured display reported an invalid scale factor.");
+                    finish_capture_session(&state_for_result.session, "invalid_display_scale");
+                    return;
+                }
+                let viewport = match FrameViewport::new(frame.width(), frame.height(), f64::from(scale as f32)) {
+                    Ok(viewport) => viewport,
+                    Err(error) => {
+                        set_status(&overlay, format!("The captured frame has invalid Overlay geometry: {error}"));
+                        finish_capture_session(&state_for_result.session, "invalid_frame_viewport");
+                        return;
+                    }
+                };
+                let logical_size = viewport.logical_size();
+                let transform = match viewport.transform_for(logical_size.width, logical_size.height) {
+                    Ok(transform) => transform,
+                    Err(error) => {
+                        set_status(&overlay, format!("The Overlay viewport is invalid: {error}"));
+                        finish_capture_session(&state_for_result.session, "invalid_initial_transform");
+                        return;
+                    }
+                };
+                platform::trace_event(&format!(
+                    "capture.geometry frame={}x{} viewport={}x{} scale_factor={}",
+                    frame.width(), frame.height(), logical_size.width, logical_size.height, viewport.scale_factor()
+                ));
+                overlay.window().set_size(slint::PhysicalSize::new(frame.width(), frame.height()));
+                *state_for_result.viewport.lock().expect("frame viewport lock") = Some(viewport);
+                *state_for_result.geometry.lock().expect("selection geometry lock") =
+                    match SelectionGeometry::new(None, transform) {
+                        Ok(geometry) => geometry,
+                        Err(error) => {
+                            set_status(&overlay, format!("Could not initialize selection geometry: {error}"));
+                            finish_capture_session(&state_for_result.session, "selection_geometry_initialization_failed");
+                            return;
+                        }
+                    };
+                overlay.set_frame_viewport_width(logical_size.width as f32);
+                overlay.set_frame_viewport_height(logical_size.height as f32);
+                overlay.set_captured_image(image_from_rgba(frame.pixels(), frame.width(), frame.height()));
+                overlay.set_annotation_mode(false);
+                overlay.set_selection_adjustment_mode(false);
+                overlay.set_annotation_image(Image::default());
+                clear_selection_preview(&overlay);
+                *state_for_result.frame.lock().expect("capture frame lock") = Some(frame);
+
+                #[cfg(target_os = "windows")]
+                let taskbar_window_pending = !platform::taskbar::ensure_overlay_removed(
+                    overlay.window(), "capture.before_fullscreen_and_show", false, false,
+                );
+                platform::trace_event("overlay.set_fullscreen_true.before");
+                trace_overlay_state(&overlay, "overlay.set_fullscreen_true.before");
+                overlay.window().set_fullscreen(true);
+                trace_overlay_state(&overlay, "overlay.set_fullscreen_true.after");
+                platform::trace_event("overlay.show.before");
+                if let Err(error) = overlay.show() {
+                    set_status(&overlay, format!("Could not show selection overlay: {error}"));
+                    overlay.window().set_fullscreen(false);
+                    overlay.set_captured_image(Image::default());
+                    finish_capture_session(&state_for_result.session, "overlay_show_failed");
+                    return;
+                }
+                trace_overlay_state(&overlay, "overlay.show.after");
+                platform::trace_slint_native_handle("Overlay", "after_show", overlay.window());
+
+                #[cfg(target_os = "windows")]
+                if taskbar_window_pending {
+                    let weak_overlay_retry = overlay.as_weak();
+                    if let Err(error) = slint::spawn_local(async move {
+                        let Some(overlay) = weak_overlay_retry.upgrade() else { return };
+                        let native_window = match overlay.window().winit_window().await {
+                            Ok(window) => window,
+                            Err(error) => {
+                                log::warn!("Overlay HWND unavailable for deferred taskbar removal: {error}");
+                                return;
+                            }
+                        };
+                        drop(native_window);
+                        if overlay.window().is_visible() {
+                            platform::taskbar::ensure_overlay_removed(
+                                overlay.window(), "capture.deferred_after_show", true, true,
+                            );
+                        }
+                    }) {
+                        log::warn!("Could not wait for Overlay HWND to remove its taskbar tab: {error}");
                     }
                 }
+                platform::diagnose_cursor("overlay shown");
+                if !state_for_result.session.capture_ready() {
+                    set_status(&overlay, "Capture session state changed before selection.");
+                    overlay.window().set_fullscreen(false);
+                    let _ = overlay.hide();
+                    overlay.set_captured_image(Image::default());
+                    finish_capture_session(&state_for_result.session, "capture_not_ready_after_overlay_show");
+                    return;
+                }
+                platform::trace_event("capture.session.transition=Selecting");
+                if let Err(error) = platform::activate_overlay() {
+                    log::warn!("Could not activate the native selection overlay: {error}");
+                }
+                overlay.invoke_focus_selection();
+                overlay.set_export_status("Drag across the screenshot to select a region.".into());
+                platform::diagnose_cursor("overlay activated");
             });
             if let Err(error) = dispatched {
                 log::error!("Could not return capture result to the UI thread: {error}");
-                restore_capture_settings(None, return_visibility);
-                finish_capture_session(&session_for_dispatch, "capture_result_dispatch_failed");
+                finish_capture_session(&session_for_queue_error, "capture_result_dispatch_failed");
             }
         });
     });
-
     let weak_overlay = overlay.as_weak();
-    let weak_settings = settings.as_weak();
-    let frame_slot = captured_frame.clone();
-    let crop_slot = selected_crop.clone();
-    let bounds_slot = selection_bounds.clone();
-    let selection_pixels_slot = selection_pixels.clone();
-    let editor_slot = annotation_editor.clone();
-    let text_position_slot = pending_text_position.clone();
-    let selection_slot = selection.clone();
-    let frame_viewport_slot = frame_viewport.clone();
-    let active_flag = capture_session.clone();
-    let restore_state_slot = capture_restore_state.clone();
+    let state_for_cancel = selection.clone();
     overlay.on_cancel_selection(move || {
         let action_id = platform::begin_window_action("Escape");
         platform::trace_event("capture.cancel_selection.requested");
@@ -954,52 +1291,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             trace_overlay_state(&overlay, "capture.cancel_selection.requested");
         }
         platform::diagnose_cursor("escape before close");
-        if !active_flag.cancel() {
+        if !state_for_cancel.session.cancel() {
             platform::trace_event("capture.cancel_selection.rejected_no_active_session");
             platform::finish_window_action(action_id, "rejected_no_active_session");
             return;
         }
-        platform::trace_event("capture.cancel_selection.accepted");
-        let return_visibility =
-            SettingsVisibility::from_code(restore_state_slot.load(Ordering::Acquire));
-        frame_slot.lock().expect("capture frame lock").take();
-        crop_slot.lock().expect("selected crop lock").take();
-        *bounds_slot.lock().expect("selection bounds lock") = None;
-        *selection_pixels_slot
+        *state_for_cancel.frame.lock().expect("capture frame lock") = None;
+        *state_for_cancel.crop.lock().expect("selected crop lock") = None;
+        *state_for_cancel
+            .bounds
             .lock()
-            .expect("selection pixel rectangle lock") = None;
-        *frame_viewport_slot.lock().expect("frame viewport lock") = None;
-        *editor_slot.lock().expect("annotation editor lock") = None;
-        *text_position_slot.lock().expect("text position lock") = None;
-        selection_slot.lock().expect("selection lock").cancel();
-        let settings = weak_settings.upgrade();
-        if let Some(settings) = settings.as_ref() {
-            set_status(&settings, "Capture cancelled. Ready for another capture.");
-        }
-        restore_capture_settings(settings.as_ref(), return_visibility);
+            .expect("selection bounds lock") = None;
+        *state_for_cancel
+            .geometry
+            .lock()
+            .expect("selection geometry lock") = SelectionGeometry::default();
+        *state_for_cancel
+            .active_kind
+            .lock()
+            .expect("active gesture lock") = None;
+        *state_for_cancel
+            .viewport
+            .lock()
+            .expect("frame viewport lock") = None;
+        *state_for_cancel
+            .editor
+            .lock()
+            .expect("annotation editor lock") = None;
+        *state_for_cancel
+            .text_position
+            .lock()
+            .expect("text position lock") = None;
         if let Some(overlay) = weak_overlay.upgrade() {
-            trace_overlay_state(&overlay, "capture.cancel_selection.hide_overlay.before");
             overlay.set_annotation_mode(false);
+            overlay.set_selection_adjustment_mode(false);
             overlay.set_annotation_image(Image::default());
             overlay.set_text_entry_visible(false);
+            overlay.set_confirm_selection_action_visible(false);
             platform::trace_event("overlay.hide.cancel.before");
             trace_overlay_state(&overlay, "overlay.hide.cancel.before");
-            let hide_result = overlay.hide();
+            let result = overlay.hide();
             platform::trace_event(&format!(
                 "overlay.hide.cancel.result success={}",
-                hide_result.is_ok()
+                result.is_ok()
             ));
             trace_overlay_state(&overlay, "overlay.hide.cancel.after");
-            platform::trace_event("overlay.set_fullscreen_false.cancel.before");
-            trace_overlay_state(&overlay, "overlay.set_fullscreen_false.cancel.before");
             overlay.window().set_fullscreen(false);
-            trace_overlay_state(&overlay, "overlay.set_fullscreen_false.cancel.after");
             platform::trace_slint_native_handle(
                 "Overlay",
                 "cancel.after_hide_and_fullscreen_exit",
                 overlay.window(),
             );
-            platform::trace_event("overlay.hide.cancel.after");
             overlay.set_captured_image(Image::default());
             platform::diagnose_cursor("escape after close");
         }
@@ -1007,274 +1349,378 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
-    let selection_slot = selection.clone();
-    let editor_slot = annotation_editor.clone();
-    let text_position_slot = pending_text_position.clone();
-    let bounds_slot = selection_bounds.clone();
-    let crop_slot = selected_crop.clone();
-    let frame_viewport_slot = frame_viewport.clone();
-    let active_flag = capture_session.clone();
+    let state_for_down = selection.clone();
     overlay.on_pointer_down(move |x, y, width, height| {
-        if !active_flag.is_active() {
-            return;
-        }
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
-        if current_frame_transform(&frame_viewport_slot, width as f64, height as f64).is_none() {
-            selection_slot.lock().expect("selection lock").cancel();
-            if editor_slot
+        if !state_for_down.session.is_active()
+            || state_for_down
+                .geometry
                 .lock()
-                .expect("annotation editor lock")
-                .is_none()
-            {
-                clear_selection_preview(&overlay);
-            }
+                .expect("selection geometry lock")
+                .is_active()
+        {
             return;
         }
-        if editor_slot
-            .lock()
-            .expect("annotation editor lock")
-            .is_some()
-        {
-            let bounds = *bounds_slot.lock().expect("selection bounds lock");
-            let crop_guard = crop_slot.lock().expect("selected crop lock");
-            let (Some(bounds), Some(crop)) = (bounds, crop_guard.as_ref()) else {
-                return;
-            };
-            if !contains(bounds, x as f64, y as f64) {
+        if overlay.get_annotation_mode() && !overlay.get_selection_adjustment_mode() {
+            if state_for_down
+                .current_transform(width as f64, height as f64)
+                .is_none()
+            {
                 return;
             }
-            let point = annotation_point(x as f64, y as f64, bounds, crop);
-            drop(crop_guard);
-            let Ok(Some(point)) = point else {
+            if toolbar_contains(&overlay, x as f64, y as f64)
+                || state_for_down
+                    .toolbar_drag
+                    .lock()
+                    .expect("toolbar drag lock")
+                    .is_some()
+                || state_for_down
+                    .text_position
+                    .lock()
+                    .expect("text position lock")
+                    .is_some()
+            {
+                return;
+            }
+            let bounds = *state_for_down.bounds.lock().expect("selection bounds lock");
+            let crop = state_for_down
+                .crop
+                .lock()
+                .expect("selected crop lock")
+                .clone();
+            let (Some(bounds), Some(crop)) = (bounds, crop) else {
                 return;
             };
-            if editor_slot
+            let Ok(Some(point)) = annotation_point(x as f64, y as f64, bounds, &crop) else {
+                return;
+            };
+            if state_for_down
+                .editor
                 .lock()
                 .expect("annotation editor lock")
                 .as_ref()
                 .is_some_and(|editor| editor.active_tool() == AnnotationTool::Text)
             {
-                *text_position_slot.lock().expect("text position lock") = Some(point);
+                *state_for_down
+                    .text_position
+                    .lock()
+                    .expect("text position lock") = Some(point);
                 overlay.set_text_entry_value(String::new().into());
-                overlay.set_text_entry_x((x + 8.0).max(0.0) as f32);
-                overlay.set_text_entry_y((y + 8.0).min(height - 52.0).max(0.0) as f32);
+                overlay.set_text_entry_x((x + 8.0).max(0.0));
+                overlay.set_text_entry_y((y + 8.0).min((height - 52.0).max(0.0)));
                 overlay.set_text_entry_visible(true);
                 return;
             }
-            if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
+            if let Some(editor) = state_for_down
+                .editor
+                .lock()
+                .expect("annotation editor lock")
+                .as_mut()
+            {
                 editor.begin(point);
             }
-            if let Err(error) = refresh_annotation_preview(&overlay, &crop_slot, &editor_slot) {
+            if let Err(error) =
+                refresh_annotation_preview(&overlay, &state_for_down.crop, &state_for_down.editor)
+            {
                 log::warn!("Could not render annotation preview: {error}");
             }
             return;
         }
-        selection_slot.lock().expect("selection lock").begin(
+        if let Err(error) = begin_selection_gesture(
+            &overlay,
+            &state_for_down,
             x as f64,
             y as f64,
             width as f64,
             height as f64,
-        );
-        overlay.set_selection_width(0.0);
-        overlay.set_selection_height(0.0);
+        ) {
+            log::warn!("Could not begin selection gesture: {error}");
+        }
     });
 
     let weak_overlay = overlay.as_weak();
-    let selection_slot = selection.clone();
-    let frame_viewport_slot = frame_viewport.clone();
-    let bounds_slot = selection_bounds.clone();
-    let crop_slot = selected_crop.clone();
-    let editor_slot = annotation_editor.clone();
+    let state_for_move = selection.clone();
     overlay.on_pointer_move(move |x, y, width, height| {
         platform::diagnose_cursor_motion();
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
-        let Some(transform) =
-            current_frame_transform(&frame_viewport_slot, width as f64, height as f64)
-        else {
-            selection_slot.lock().expect("selection lock").cancel();
-            if editor_slot
-                .lock()
-                .expect("annotation editor lock")
-                .is_none()
-            {
-                clear_selection_preview(&overlay);
+        if state_for_move
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .is_active()
+        {
+            if let Err(error) = update_selection_gesture(
+                &overlay,
+                &state_for_move,
+                x as f64,
+                y as f64,
+                width as f64,
+                height as f64,
+            ) {
+                log::warn!("Could not update selection gesture: {error}");
+                cancel_selection_gesture(&overlay, &state_for_move, width as f64, height as f64);
             }
+            return;
+        }
+        if state_for_move
+            .current_transform(width as f64, height as f64)
+            .is_none()
+        {
+            return;
+        }
+        let crop = state_for_move
+            .crop
+            .lock()
+            .expect("selected crop lock")
+            .clone();
+        let bounds = *state_for_move.bounds.lock().expect("selection bounds lock");
+        let (Some(crop), Some(bounds)) = (crop, bounds) else {
             return;
         };
-        if editor_slot
-            .lock()
-            .expect("annotation editor lock")
-            .as_ref()
-            .is_some_and(AnnotationEditor::is_drawing)
-        {
-            let bounds = *bounds_slot.lock().expect("selection bounds lock");
-            let crop_guard = crop_slot.lock().expect("selected crop lock");
-            let (Some(bounds), Some(crop)) = (bounds, crop_guard.as_ref()) else {
-                return;
+        let mapped = annotation_point(x as f64, y as f64, bounds, &crop);
+        if let Ok(Some(point)) = mapped {
+            let drawing = {
+                let mut guard = state_for_move
+                    .editor
+                    .lock()
+                    .expect("annotation editor lock");
+                if let Some(editor) = guard.as_mut().filter(|editor| editor.is_drawing()) {
+                    editor.update(point);
+                    true
+                } else {
+                    false
+                }
             };
-            let point = annotation_point(x as f64, y as f64, bounds, crop);
-            drop(crop_guard);
-            let Ok(Some(point)) = point else {
-                return;
-            };
-            if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
-                editor.update(point);
+            if drawing {
+                if let Err(error) = refresh_annotation_preview(
+                    &overlay,
+                    &state_for_move.crop,
+                    &state_for_move.editor,
+                ) {
+                    log::warn!("Could not render annotation preview: {error}");
+                }
             }
-            if let Err(error) = refresh_annotation_preview(&overlay, &crop_slot, &editor_slot) {
-                log::warn!("Could not render annotation preview: {error}");
-            }
-            return;
-        }
-
-        let mut state = selection_slot.lock().expect("selection lock");
-        if !state.is_dragging() {
-            return;
-        }
-        state.update(
-            x as f64,
-            y as f64,
-            transform.viewport_width,
-            transform.viewport_height,
-        );
-        if let Ok(Some((_, rect))) = state.preview(transform) {
-            overlay.set_selection_x(rect.x as f32);
-            overlay.set_selection_y(rect.y as f32);
-            overlay.set_selection_width(rect.width as f32);
-            overlay.set_selection_height(rect.height as f32);
         }
     });
 
     let weak_overlay = overlay.as_weak();
-    let weak_settings = settings.as_weak();
-    let frame_slot = captured_frame.clone();
-    let crop_slot = selected_crop.clone();
-    let bounds_slot = selection_bounds.clone();
-    let selection_slot = selection.clone();
-    let selection_pixels_slot = selection_pixels.clone();
-    let frame_viewport_slot = frame_viewport.clone();
-    let editor_slot = annotation_editor.clone();
-    let text_position_slot = pending_text_position.clone();
-    let active_flag = capture_session.clone();
+    let state_for_up = selection.clone();
     overlay.on_pointer_up(move |x, y, width, height| {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
-        let Some(transform) =
-            current_frame_transform(&frame_viewport_slot, width as f64, height as f64)
-        else {
-            selection_slot.lock().expect("selection lock").cancel();
-            if editor_slot
-                .lock()
-                .expect("annotation editor lock")
-                .is_none()
-            {
-                clear_selection_preview(&overlay);
-            }
+        if state_for_up
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .is_active()
+        {
+            finish_selection_gesture(
+                &overlay,
+                &state_for_up,
+                x as f64,
+                y as f64,
+                width as f64,
+                height as f64,
+            );
             return;
-        };
-        if text_position_slot
+        }
+        if state_for_up
+            .current_transform(width as f64, height as f64)
+            .is_none()
+        {
+            return;
+        }
+        if state_for_up
+            .text_position
             .lock()
             .expect("text position lock")
             .is_some()
         {
             return;
         }
-        if editor_slot
+        let crop = state_for_up
+            .crop
             .lock()
-            .expect("annotation editor lock")
-            .as_ref()
-            .is_some_and(AnnotationEditor::is_drawing)
+            .expect("selected crop lock")
+            .clone();
+        let bounds = *state_for_up.bounds.lock().expect("selection bounds lock");
+        let (Some(crop), Some(bounds)) = (crop, bounds) else {
+            return;
+        };
+        let Ok(Some(point)) = annotation_point(x as f64, y as f64, bounds, &crop) else {
+            return;
+        };
         {
-            let bounds = *bounds_slot.lock().expect("selection bounds lock");
-            let crop_guard = crop_slot.lock().expect("selected crop lock");
-            let (Some(bounds), Some(crop)) = (bounds, crop_guard.as_ref()) else {
+            let mut guard = state_for_up.editor.lock().expect("annotation editor lock");
+            if let Some(editor) = guard.as_mut().filter(|editor| editor.is_drawing()) {
+                editor.update(point);
+                if let Err(error) =
+                    editor.finish(StrokeStyle::default(), crop.width(), crop.height())
+                {
+                    log::warn!("Could not finish annotation: {error}");
+                }
+            } else {
                 return;
-            };
-            let mapped = annotation_point(x as f64, y as f64, bounds, crop);
-            let crop_width = crop.width();
-            let crop_height = crop.height();
-            drop(crop_guard);
-            if let Ok(Some(point)) = mapped {
-                if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
-                    editor.update(point);
-                    if let Err(error) =
-                        editor.finish(StrokeStyle::default(), crop_width, crop_height)
-                    {
-                        log::warn!("Could not finish annotation: {error}");
-                    }
-                }
-                if let Err(error) = refresh_annotation_preview(&overlay, &crop_slot, &editor_slot) {
-                    log::warn!("Could not render annotation preview: {error}");
-                }
-            }
-            return;
-        }
-
-        selection_slot.lock().expect("selection lock").update(
-            x as f64,
-            y as f64,
-            transform.viewport_width,
-            transform.viewport_height,
-        );
-        let result = selection_slot
-            .lock()
-            .expect("selection lock")
-            .finish(transform);
-        let Ok(Some((pixels, logical))) = result else {
-            if let Err(error) = result {
-                log::error!("Selection geometry rejected: {error}");
-            }
-            // A click has no area; leave the frozen frame ready for another drag.
-            return;
-        };
-        let crop = {
-            let frame = frame_slot.lock().expect("capture frame lock");
-            frame.as_ref().and_then(|frame| frame.crop(pixels).ok())
-        };
-        let Some(crop) = crop else {
-            log::error!("Selected crop could not be copied from the captured frame");
-            if let Some(settings) = weak_settings.upgrade() {
-                set_status(&settings, "Could not copy selected screenshot region.");
-            }
-            return;
-        };
-        if !active_flag.begin_annotation() {
-            log::error!("Could not transition capture session into annotation state");
-            return;
-        }
-        *selection_pixels_slot
-            .lock()
-            .expect("selection pixel rectangle lock") = Some(pixels);
-        *bounds_slot.lock().expect("selection bounds lock") = Some(logical);
-        platform::trace_event("capture.session.transition=Annotating");
-        overlay.set_selection_x(logical.x as f32);
-        overlay.set_selection_y(logical.y as f32);
-        overlay.set_selection_width(logical.width as f32);
-        overlay.set_selection_height(logical.height as f32);
-        overlay.set_selected_tool(AnnotationTool::Pen.ui_index());
-        *crop_slot.lock().expect("selected crop lock") = Some(crop);
-        *editor_slot.lock().expect("annotation editor lock") = Some(AnnotationEditor::default());
-        overlay.set_annotation_mode(true);
-        if let Err(error) = refresh_annotation_preview(&overlay, &crop_slot, &editor_slot) {
-            log::error!("Could not initialize annotation preview: {error}");
-            if let Some(settings) = weak_settings.upgrade() {
-                set_status(
-                    &settings,
-                    format!("Could not initialize annotation preview: {error}"),
-                );
             }
         }
-        overlay.invoke_focus_selection();
-        if let Some(settings) = weak_settings.upgrade() {
-            set_status(&settings, "Choose a drawing tool. Press Escape to cancel.");
+        if let Err(error) =
+            refresh_annotation_preview(&overlay, &state_for_up.crop, &state_for_up.editor)
+        {
+            log::warn!("Could not render annotation preview: {error}");
         }
     });
 
-    let editor_slot = annotation_editor.clone();
+    let weak_overlay = overlay.as_weak();
+    let state_for_pointer_cancel = selection.clone();
+    overlay.on_pointer_cancel(move || {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let width = f64::from(overlay.get_frame_viewport_width());
+        let height = f64::from(overlay.get_frame_viewport_height());
+        cancel_selection_gesture(&overlay, &state_for_pointer_cancel, width, height);
+        let cancelled = {
+            let mut guard = state_for_pointer_cancel
+                .editor
+                .lock()
+                .expect("annotation editor lock");
+            if let Some(editor) = guard.as_mut().filter(|editor| editor.is_drawing()) {
+                editor.cancel_draft();
+                true
+            } else {
+                false
+            }
+        };
+        if cancelled {
+            if let Err(error) = refresh_annotation_preview(
+                &overlay,
+                &state_for_pointer_cancel.crop,
+                &state_for_pointer_cancel.editor,
+            ) {
+                log::warn!(
+                    "Could not restore annotation preview after pointer cancellation: {error}"
+                );
+            }
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_adjustment = selection.clone();
+    overlay.on_adjustment_pointer_event(move |kind, x, y, width, height| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let (x, y, width, height) = (x as f64, y as f64, width as f64, height as f64);
+        match kind {
+            PointerEventKind::Down => {
+                if let Err(error) =
+                    begin_selection_gesture(&overlay, &state_for_adjustment, x, y, width, height)
+                {
+                    log::warn!("Could not begin adjustment gesture: {error}");
+                }
+            }
+            PointerEventKind::Move => {
+                if let Err(error) =
+                    update_selection_gesture(&overlay, &state_for_adjustment, x, y, width, height)
+                {
+                    log::warn!("Could not update adjustment gesture: {error}");
+                    cancel_selection_gesture(&overlay, &state_for_adjustment, width, height);
+                }
+            }
+            PointerEventKind::Up => {
+                finish_selection_gesture(&overlay, &state_for_adjustment, x, y, width, height);
+            }
+            PointerEventKind::Cancel => {
+                cancel_selection_gesture(&overlay, &state_for_adjustment, width, height);
+            }
+            _ => {}
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_toolbar_drag = selection.clone();
+    overlay.on_toolbar_pointer_event(move |kind, x, y, width, height| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        handle_toolbar_pointer_event(
+            &overlay,
+            &state_for_toolbar_drag,
+            kind,
+            x as f64,
+            y as f64,
+            width as f64,
+            height as f64,
+        );
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_adjustment_mode = selection.clone();
+    overlay.on_request_adjustment_mode(move |enabled| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        let has_selection = state_for_adjustment_mode
+            .geometry
+            .lock()
+            .expect("selection geometry lock")
+            .committed()
+            .is_some();
+        if enabled && !has_selection {
+            overlay.set_selection_adjustment_mode(false);
+            return;
+        }
+        if !enabled {
+            cancel_selection_gesture(
+                &overlay,
+                &state_for_adjustment_mode,
+                f64::from(overlay.get_frame_viewport_width()),
+                f64::from(overlay.get_frame_viewport_height()),
+            );
+        }
+        overlay.set_selection_adjustment_mode(enabled);
+        overlay.invoke_focus_selection();
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_new_selection = selection.clone();
+    overlay.on_request_new_selection(move || {
+        if let Some(overlay) = weak_overlay.upgrade() {
+            request_selection_reset(&overlay, &state_for_new_selection);
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_confirm = selection.clone();
+    overlay.on_confirm_selection_action(move || {
+        if let Some(overlay) = weak_overlay.upgrade() {
+            match reset_to_new_selection(&overlay, &state_for_confirm) {
+                Ok(()) => set_status(&overlay, "Drag to create a new selection."),
+                Err(error) => {
+                    log::warn!("Could not discard the current selection: {error}");
+                    set_status(
+                        &overlay,
+                        format!("Could not start a new selection: {error}"),
+                    );
+                }
+            }
+        }
+    });
+
+    let weak_overlay = overlay.as_weak();
+    overlay.on_cancel_selection_action(move || {
+        if let Some(overlay) = weak_overlay.upgrade() {
+            overlay.set_confirm_selection_action_visible(false);
+            overlay.invoke_focus_selection();
+        }
+    });
+
+    let editor_slot = selection.editor.clone();
     let weak_overlay = overlay.as_weak();
     overlay.on_tool_selected(move |index| {
         platform::diagnose_cursor("tool selected");
@@ -1291,22 +1737,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
-    let crop_slot = selected_crop.clone();
-    let editor_slot = annotation_editor.clone();
-    let text_position_slot = pending_text_position.clone();
+    let state_for_text = selection.clone();
     overlay.on_submit_text(move |text| {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
         overlay.set_text_entry_visible(false);
-        let position = text_position_slot
+        let position = state_for_text
+            .text_position
             .lock()
             .expect("text position lock")
             .take();
-        let Some(position) = position else {
-            return;
-        };
-        let dimensions = crop_slot
+        let Some(position) = position else { return };
+        let dimensions = state_for_text
+            .crop
             .lock()
             .expect("selected crop lock")
             .as_ref()
@@ -1314,20 +1758,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some((width, height)) = dimensions else {
             return;
         };
-        let result = match editor_slot.lock().expect("annotation editor lock").as_mut() {
+        let result = match state_for_text
+            .editor
+            .lock()
+            .expect("annotation editor lock")
+            .as_mut()
+        {
             Some(editor) => editor.add_text(position, text.to_string(), width, height),
             None => Err("annotation editor is no longer available"),
         };
         match result {
-            Ok(_) => update_preview_if_possible(&overlay, &crop_slot, &editor_slot),
+            Ok(_) => {
+                update_preview_if_possible(&overlay, &state_for_text.crop, &state_for_text.editor)
+            }
             Err(error) => log::warn!("Could not add text annotation: {error}"),
         }
     });
 
     let weak_overlay = overlay.as_weak();
-    let text_position_slot = pending_text_position.clone();
+    let state_for_cancel_text = selection.clone();
     overlay.on_cancel_text(move || {
-        *text_position_slot.lock().expect("text position lock") = None;
+        *state_for_cancel_text
+            .text_position
+            .lock()
+            .expect("text position lock") = None;
         if let Some(overlay) = weak_overlay.upgrade() {
             overlay.set_text_entry_visible(false);
             overlay.set_text_entry_value(String::new().into());
@@ -1336,41 +1790,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
-    let crop_slot = selected_crop.clone();
-    let editor_slot = annotation_editor.clone();
+    let state_for_undo = selection.clone();
     overlay.on_undo_annotation(move || {
-        if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
+        if let Some(editor) = state_for_undo
+            .editor
+            .lock()
+            .expect("annotation editor lock")
+            .as_mut()
+        {
             editor.undo();
         }
         if let Some(overlay) = weak_overlay.upgrade() {
-            update_preview_if_possible(&overlay, &crop_slot, &editor_slot);
+            update_preview_if_possible(&overlay, &state_for_undo.crop, &state_for_undo.editor);
         }
     });
 
     let weak_overlay = overlay.as_weak();
-    let crop_slot = selected_crop.clone();
-    let editor_slot = annotation_editor.clone();
+    let state_for_redo = selection.clone();
     overlay.on_redo_annotation(move || {
-        if let Some(editor) = editor_slot.lock().expect("annotation editor lock").as_mut() {
+        if let Some(editor) = state_for_redo
+            .editor
+            .lock()
+            .expect("annotation editor lock")
+            .as_mut()
+        {
             editor.redo();
         }
         if let Some(overlay) = weak_overlay.upgrade() {
-            update_preview_if_possible(&overlay, &crop_slot, &editor_slot);
+            update_preview_if_possible(&overlay, &state_for_redo.crop, &state_for_redo.editor);
         }
     });
-
     let weak_overlay = overlay.as_weak();
-    let weak_settings = settings.as_weak();
-    let crop_slot = selected_crop.clone();
-    let editor_slot = annotation_editor.clone();
-    let text_position_slot = pending_text_position.clone();
-    let busy = export_busy.clone();
+    let state_for_save = selection.clone();
+    let busy_for_save = export_busy.clone();
     overlay.on_save_png(move || {
         platform::trace_event("export.save_png.callback");
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
-        if text_position_slot
+        if state_for_save
+            .text_position
             .lock()
             .expect("pending text position lock")
             .is_some()
@@ -1378,13 +1837,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             overlay.set_export_status("Add or cancel the current text before saving.".into());
             return;
         }
-        let (crop, annotations) = match annotation_snapshot(&crop_slot, &editor_slot) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                overlay.set_export_status(format!("Could not save screenshot: {error}").into());
-                return;
-            }
-        };
+        let (crop, annotations) =
+            match annotation_snapshot(&state_for_save.crop, &state_for_save.editor) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    overlay.set_export_status(format!("Could not save screenshot: {error}").into());
+                    return;
+                }
+            };
         let path = match platform::save_png_dialog() {
             Ok(Some(path)) => path,
             Ok(None) => {
@@ -1399,8 +1859,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         start_export_operation(
             &overlay,
-            weak_settings.clone(),
-            busy.clone(),
+            busy_for_save.clone(),
             "Saving PNG…",
             move || {
                 let rendered = annotation_render::render_composite(&crop, &annotations)
@@ -1416,17 +1875,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
-    let weak_settings = settings.as_weak();
-    let crop_slot = selected_crop.clone();
-    let editor_slot = annotation_editor.clone();
-    let text_position_slot = pending_text_position.clone();
-    let busy = export_busy.clone();
+    let state_for_copy = selection.clone();
+    let busy_for_copy = export_busy.clone();
+    let clipboard_owner_for_copy = clipboard_owner_hwnd.clone();
     overlay.on_copy_image(move || {
         platform::trace_event("export.copy_image.callback");
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
-        if text_position_slot
+        if state_for_copy
+            .text_position
             .lock()
             .expect("pending text position lock")
             .is_some()
@@ -1434,55 +1892,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             overlay.set_export_status("Add or cancel the current text before copying.".into());
             return;
         }
-        let (crop, annotations) = match annotation_snapshot(&crop_slot, &editor_slot) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                overlay.set_export_status(format!("Could not copy screenshot: {error}").into());
-                return;
-            }
-        };
+        let (crop, annotations) =
+            match annotation_snapshot(&state_for_copy.crop, &state_for_copy.editor) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    overlay.set_export_status(format!("Could not copy screenshot: {error}").into());
+                    return;
+                }
+            };
+        let owner_hwnd = clipboard_owner_for_copy.load(Ordering::Acquire);
         start_export_operation(
             &overlay,
-            weak_settings.clone(),
-            busy.clone(),
+            busy_for_copy.clone(),
             "Copying image to clipboard…",
             move || {
                 let rendered = annotation_render::render_composite(&crop, &annotations)
                     .map_err(str::to_owned)?;
-                platform::copy_image_to_clipboard(&rendered)?;
+                platform::copy_image_to_clipboard(&rendered, owner_hwnd)?;
                 Ok("Image copied to clipboard".into())
             },
         );
     });
 
     let weak_overlay = overlay.as_weak();
-    let weak_settings = settings.as_weak();
-    let frame_slot = captured_frame.clone();
-    let crop_slot = selected_crop.clone();
-    let bounds_slot = selection_bounds.clone();
-    let selection_pixels_slot = selection_pixels.clone();
-    let frame_viewport_slot = frame_viewport.clone();
-    let editor_slot = annotation_editor.clone();
-    let active_flag = capture_session.clone();
-    let busy = export_busy.clone();
-    let restore_state_slot = capture_restore_state.clone();
+    let state_for_done = selection.clone();
+    let busy_for_done = export_busy.clone();
     overlay.on_finish_annotations(move || {
         let action_id = platform::begin_window_action("Done");
         platform::trace_event("capture.done.requested");
         if let Some(overlay) = weak_overlay.upgrade() {
             trace_overlay_state(&overlay, "capture.done.requested");
         }
-        if busy.load(Ordering::Acquire) {
-            platform::trace_event("capture.done.rejected_export_busy");
+        if busy_for_done.load(Ordering::Acquire) {
             if let Some(overlay) = weak_overlay.upgrade() {
                 overlay.set_export_status("Wait for the current export before finishing.".into());
             }
             platform::finish_window_action(action_id, "rejected_export_busy");
             return;
         }
+        let Some(overlay) = weak_overlay.upgrade() else {
+            platform::finish_window_action(action_id, "overlay_unavailable");
+            return;
+        };
         platform::diagnose_cursor("done before close");
-        let crop = crop_slot.lock().expect("selected crop lock").take();
-        let annotations = editor_slot
+        if state_for_done
+            .text_position
+            .lock()
+            .expect("pending text position lock")
+            .is_some()
+        {
+            overlay.set_export_status("Add or cancel the current text before finishing.".into());
+            platform::finish_window_action(action_id, "rejected_pending_text");
+            return;
+        }
+        let crop = state_for_done
+            .crop
+            .lock()
+            .expect("selected crop lock")
+            .take();
+        let annotations = state_for_done
+            .editor
             .lock()
             .expect("annotation editor lock")
             .as_ref()
@@ -1492,59 +1961,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             platform::finish_window_action(action_id, "rejected_missing_crop_or_editor");
             return;
         };
-        if !active_flag.begin_saving() {
-            platform::trace_event("capture.done.rejected_session_transition");
-            *crop_slot.lock().expect("selected crop lock") = Some(crop);
+        if !state_for_done.session.begin_saving() {
+            *state_for_done.crop.lock().expect("selected crop lock") = Some(crop);
             log::error!("Could not transition capture session into saving state");
             platform::finish_window_action(action_id, "rejected_session_transition");
             return;
         }
         platform::trace_event("capture.session.transition=Saving");
-        let return_visibility =
-            SettingsVisibility::from_code(restore_state_slot.load(Ordering::Acquire));
-        platform::trace_event(&format!(
-            "capture.done.accepted saved_visibility={return_visibility:?}"
-        ));
-        frame_slot.lock().expect("capture frame lock").take();
-        *bounds_slot.lock().expect("selection bounds lock") = None;
-        *selection_pixels_slot
+        *state_for_done.frame.lock().expect("capture frame lock") = None;
+        *state_for_done.bounds.lock().expect("selection bounds lock") = None;
+        *state_for_done
+            .geometry
             .lock()
-            .expect("selection pixel rectangle lock") = None;
-        *frame_viewport_slot.lock().expect("frame viewport lock") = None;
-        *editor_slot.lock().expect("annotation editor lock") = None;
-        if let Some(overlay) = weak_overlay.upgrade() {
-            trace_overlay_state(&overlay, "capture.done.hide_overlay.before");
-            overlay.set_annotation_mode(false);
-            overlay.set_annotation_image(Image::default());
-            overlay.set_text_entry_visible(false);
-            platform::trace_event("overlay.hide.done.before");
-            trace_overlay_state(&overlay, "overlay.hide.done.before");
-            let hide_result = overlay.hide();
-            platform::trace_event(&format!(
-                "overlay.hide.done.result success={}",
-                hide_result.is_ok()
-            ));
-            trace_overlay_state(&overlay, "overlay.hide.done.after");
-            platform::trace_event("overlay.set_fullscreen_false.done.before");
-            trace_overlay_state(&overlay, "overlay.set_fullscreen_false.done.before");
-            overlay.window().set_fullscreen(false);
-            trace_overlay_state(&overlay, "overlay.set_fullscreen_false.done.after");
-            platform::trace_slint_native_handle(
-                "Overlay",
-                "done.after_hide_and_fullscreen_exit",
-                overlay.window(),
-            );
-            platform::trace_event("overlay.hide.done.after");
-            platform::diagnose_cursor("done after close");
-        }
-        platform::trace_event("capture.done.save_worker.queued");
-        if let Some(settings) = weak_settings.upgrade() {
-            set_status(&settings, "Saving annotated screenshot…");
-        }
-        let weak_settings = weak_settings.clone();
-        let active_for_dispatch = active_flag.clone();
-        let session_for_dispatch = active_flag.clone();
-        std::thread::spawn(move || {
+            .expect("selection geometry lock") = SelectionGeometry::default();
+        *state_for_done
+            .active_kind
+            .lock()
+            .expect("active gesture lock") = None;
+        *state_for_done.viewport.lock().expect("frame viewport lock") = None;
+        *state_for_done
+            .editor
+            .lock()
+            .expect("annotation editor lock") = None;
+        *state_for_done
+            .text_position
+            .lock()
+            .expect("text position lock") = None;
+        overlay.set_annotation_mode(false);
+        overlay.set_selection_adjustment_mode(false);
+        overlay.set_annotation_image(Image::default());
+        overlay.set_text_entry_visible(false);
+        platform::trace_event("overlay.hide.done.before");
+        trace_overlay_state(&overlay, "overlay.hide.done.before");
+        let hide_result = overlay.hide();
+        platform::trace_event(&format!(
+            "overlay.hide.done.result success={}",
+            hide_result.is_ok()
+        ));
+        trace_overlay_state(&overlay, "overlay.hide.done.after");
+        overlay.window().set_fullscreen(false);
+        platform::trace_slint_native_handle(
+            "Overlay",
+            "done.after_hide_and_fullscreen_exit",
+            overlay.window(),
+        );
+        overlay.set_captured_image(Image::default());
+        platform::diagnose_cursor("done after close");
+
+        let weak_overlay_result = overlay.as_weak();
+        let session_result = state_for_done.session.clone();
+        thread::spawn(move || {
             platform::trace_event("capture.done.save_worker.begin");
             let saved = (|| {
                 let output = annotation_render::render_composite(&crop, &annotations)
@@ -1559,66 +2025,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "capture.done.save_worker.end success={}",
                 saved.is_ok()
             ));
-            let dispatched = slint::invoke_from_event_loop(move || {
+            let session_for_dispatch = session_result.clone();
+            if let Err(error) = slint::invoke_from_event_loop(move || {
                 platform::trace_event("capture.done.result_dispatch.entered");
-                let settings = weak_settings.upgrade();
-                if let Some(settings) = settings.as_ref() {
+                if let Some(overlay) = weak_overlay_result.upgrade() {
                     match saved {
                         Ok((path, width, height)) => set_status(
-                            &settings,
+                            &overlay,
                             format!(
                                 "Capture complete. Temporary PNG: {} ({width}×{height})",
                                 path.display()
                             ),
                         ),
                         Err(error) => set_status(
-                            &settings,
+                            &overlay,
                             format!("Could not save annotated screenshot: {error}"),
                         ),
                     }
                 }
-                restore_capture_settings(settings.as_ref(), return_visibility);
-                finish_capture_session(&active_for_dispatch, "done_result_dispatched");
+                finish_capture_session(&session_for_dispatch, "done_result_dispatched");
                 platform::trace_event("capture.done.session_finished");
-                platform::finish_window_action(action_id, "result_dispatched");
-            });
-            if let Err(error) = dispatched {
+            }) {
                 log::error!(
                     "Could not return annotated screenshot result to the UI thread: {error}"
                 );
-                restore_capture_settings(None, return_visibility);
-                finish_capture_session(&session_for_dispatch, "done_result_dispatch_failed");
-                platform::finish_window_action(action_id, "result_dispatch_failed");
+                finish_capture_session(&session_result, "done_result_dispatch_failed");
             }
         });
+        platform::finish_window_action(action_id, "save_worker_started");
     });
 
     #[cfg(target_os = "windows")]
-    {
-        let overlay_close_policy = overlay_close_policy();
-        let weak_overlay = overlay.as_weak();
-        overlay.window().on_close_requested(move || {
-            platform::trace_event("overlay.close_requested");
-            if let Some(overlay) = weak_overlay.upgrade() {
-                trace_overlay_state(&overlay, "overlay.close_requested");
-            }
-            platform::trace_event(&format!("overlay.close_policy={overlay_close_policy:?}"));
-            close_request_response(overlay_close_policy)
-        });
-    }
+    overlay.window().on_close_requested(|| {
+        platform::trace_event("overlay.close_requested");
+        close_request_response(overlay_close_policy())
+    });
     #[cfg(not(target_os = "windows"))]
     overlay
         .window()
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     #[cfg(target_os = "windows")]
-    let tray_ready = Arc::new(AtomicBool::new(false));
-    #[cfg(target_os = "windows")]
     let tray_service = {
-        let weak_settings = settings.as_weak();
+        let weak_overlay = overlay.as_weak();
         platform::trace_event("main.tray_start.before");
         let service = platform::tray::TrayService::start(move |command: TrayCommand| {
-            let weak_settings = weak_settings.clone();
+            let weak_overlay = weak_overlay.clone();
             platform::trace_event(&format!(
                 "tray.command.dispatch_to_slint command={command:?}"
             ));
@@ -1627,32 +2079,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match command.action() {
                     AppAction::StartCapture => {
                         platform::trace_event("tray.action.start_capture");
-                        if let Some(settings) = weak_settings.upgrade() {
-                            trace_settings_state(&settings, "tray.start_capture.before_callback");
-                            settings.invoke_open_overlay();
-                            trace_settings_state(&settings, "tray.start_capture.after_callback");
-                        }
-                    }
-                    AppAction::ShowSettings => {
-                        if let Some(settings) = weak_settings.upgrade() {
-                            trace_settings_state(&settings, "tray.open_settings.before_unminimize");
-                            settings.window().set_minimized(false);
-                            trace_settings_state(&settings, "tray.open_settings.after_unminimize");
-                            trace_settings_state(&settings, "tray.open_settings.before_show");
-                            if let Err(error) = settings.show() {
-                                set_status(
-                                    &settings,
-                                    format!("Could not show the settings window: {error}"),
-                                );
-                                return;
-                            }
-                            trace_settings_state(&settings, "tray.open_settings.after_show");
-                            if let Err(error) = platform::activate_settings() {
-                                set_status(
-                                    &settings,
-                                    format!("Could not activate the settings window: {error}"),
-                                );
-                            }
+                        if let Some(overlay) = weak_overlay.upgrade() {
+                            overlay.invoke_request_capture();
                         }
                     }
                     AppAction::Quit => {
@@ -1663,87 +2091,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }) {
                 log::error!("Could not dispatch tray command {command:?}: {error}");
             }
-        });
-
-        match service {
-            Ok(service) => {
-                platform::trace_event("main.tray_start.after success=true");
-                tray_ready.store(true, Ordering::Release);
-                settings.set_tray_available(true);
-                match service.hotkey_state() {
-                    core::hotkey::RegistrationState::Registered => set_status(
-                        &settings,
-                        "Ready — Ctrl + Shift + S starts a capture. Carambola is in the notification area.",
-                    ),
-                    core::hotkey::RegistrationState::Conflict => set_status(
-                        &settings,
-                        "The tray is active, but Ctrl + Shift + S is already registered by another application.",
-                    ),
-                    core::hotkey::RegistrationState::Failed(code) => set_status(
-                        &settings,
-                        format!("The tray is active, but Ctrl + Shift + S could not register (Windows error {code})."),
-                    ),
-                }
-                Some(service)
+        })
+        .map_err(std::io::Error::other)?;
+        clipboard_owner_hwnd.store(service.native_window_handle(), Ordering::Release);
+        match service.hotkey_state() {
+            core::hotkey::RegistrationState::Registered => {
+                log::info!("Tray ready; Ctrl+Shift+S starts a capture")
             }
-            Err(error) => {
-                platform::trace_event(&format!(
-                    "main.tray_start.after success=false error={error}"
-                ));
-                log::error!("Native system tray initialization failed: {error}");
-                set_status(
-                    &settings,
-                    format!("The system tray could not start: {error}. Use Exit Carambola below to close the app."),
-                );
-                None
+            core::hotkey::RegistrationState::Conflict => {
+                log::warn!("Tray ready, but Ctrl+Shift+S is registered by another application")
             }
+            core::hotkey::RegistrationState::Failed(code) => log::warn!(
+                "Tray ready, but Ctrl+Shift+S registration failed with Windows error {code}"
+            ),
         }
+        platform::trace_event(&format!(
+            "main.tray_start.after hwnd=0x{:X}",
+            service.native_window_handle() as usize
+        ));
+        Some(service)
     };
 
-    settings.on_exit_app(|| {
-        platform::trace_event("settings.exit_app.callback");
-        let _ = slint::quit_event_loop();
-    });
-
-    #[cfg(target_os = "windows")]
-    {
-        let tray_ready = tray_ready.clone();
-        let weak_settings = settings.as_weak();
-        settings.window().on_close_requested(move || {
-            platform::trace_event("settings.close_requested");
-            if let Some(settings) = weak_settings.upgrade() {
-                trace_settings_state(&settings, "settings.close_requested");
-            }
-            let policy = settings_close_policy(tray_ready.load(Ordering::Acquire));
-            platform::trace_event(&format!("settings.close_policy={policy:?}"));
-            close_request_response(policy)
-        });
-    }
-
-    trace_settings_state(&settings, "startup.show.before");
-    platform::trace_slint_native_handle("Settings", "before_show", settings.window());
-    platform::trace_event("settings.startup_show.begin");
-    settings.show().map_err(|error| {
-        platform::trace_event(&format!("settings.startup_show.failed error={error}"));
-        error
-    })?;
-    platform::trace_event("settings.startup_show.end");
-    trace_settings_state(&settings, "startup.show.after");
-    platform::trace_slint_native_handle("Settings", "after_show", settings.window());
     platform::trace_event("event_loop.first_callback.queue.before");
-    let weak_settings_for_startup = settings.as_weak();
-    let weak_overlay_for_startup = overlay.as_weak();
+    let weak_overlay_startup = overlay.as_weak();
     let first_callback_result = slint::invoke_from_event_loop(move || {
-        platform::trace_event("event_loop.first_callback.entered");
         platform::trace_event("event_loop.initialized");
-        if let Some(settings) = weak_settings_for_startup.upgrade() {
-            platform::trace_slint_native_handle(
-                "Settings",
-                "first_event_loop_callback",
-                settings.window(),
-            );
-        }
-        if let Some(overlay) = weak_overlay_for_startup.upgrade() {
+        if let Some(overlay) = weak_overlay_startup.upgrade() {
             platform::trace_slint_native_handle(
                 "Overlay",
                 "first_event_loop_callback",
@@ -1768,6 +2141,117 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     drop(tray_service);
     platform::trace_event("main.after_event_loop");
-    platform::trace_event("main.before_window_component_drop");
+    platform::trace_event("main.before_overlay_component_drop");
     Ok(())
+}
+
+#[cfg(test)]
+mod toolbar_layout_tests {
+    use super::*;
+
+    fn viewport(width: f64, height: f64) -> LogicalViewport {
+        LogicalViewport { width, height }
+    }
+
+    fn selection(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
+        LogicalRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn toolbar_prefers_above_selection_when_it_fits() {
+        let layout = calculate_toolbar_layout(
+            Some(selection(120.0, 100.0, 240.0, 100.0)),
+            viewport(900.0, 700.0),
+        );
+        assert_eq!(
+            layout,
+            ToolbarLayout {
+                x: 120.0,
+                y: 28.0,
+                scale: 1.0,
+                forced_inside: false,
+            }
+        );
+    }
+
+    #[test]
+    fn toolbar_uses_below_when_above_does_not_fit() {
+        let layout = calculate_toolbar_layout(
+            Some(selection(40.0, 20.0, 300.0, 80.0)),
+            viewport(900.0, 700.0),
+        );
+        assert_eq!(layout.y, 108.0);
+        assert!(!layout.forced_inside);
+    }
+
+    #[test]
+    fn toolbar_moves_inside_when_above_and_below_do_not_fit() {
+        let layout = calculate_toolbar_layout(
+            Some(selection(12.0, 10.0, 760.0, 580.0)),
+            viewport(800.0, 600.0),
+        );
+        assert_eq!(layout.x, 12.0);
+        assert_eq!(layout.y, 10.0);
+        assert!(layout.forced_inside);
+    }
+
+    #[test]
+    fn toolbar_is_clamped_at_each_viewport_edge() {
+        let viewport = viewport(800.0, 600.0);
+        for (x, y) in [
+            (-50.0, -20.0),
+            (790.0, 590.0),
+            (790.0, -20.0),
+            (-50.0, 590.0),
+        ] {
+            let (x, y) = clamp_toolbar_position(x, y, viewport, 1.0);
+            assert!((0.0..=180.0).contains(&x));
+            assert!((0.0..=536.0).contains(&y));
+        }
+    }
+
+    #[test]
+    fn toolbar_scales_to_fit_small_logical_viewports() {
+        let viewport = viewport(320.0, 180.0);
+        let layout = calculate_toolbar_layout(Some(selection(0.0, 0.0, 200.0, 100.0)), viewport);
+        assert!((layout.scale - 320.0 / TOOLBAR_DESIGN_WIDTH).abs() < f64::EPSILON);
+        assert!(layout.x >= 0.0);
+        assert!(layout.y >= 0.0);
+        assert!(layout.x + TOOLBAR_DESIGN_WIDTH * layout.scale <= viewport.width);
+        assert!(layout.y + TOOLBAR_DESIGN_HEIGHT * layout.scale <= viewport.height);
+    }
+
+    #[test]
+    fn manual_position_tracks_the_same_physical_location_after_dpi_change() {
+        let (x, y) = rebase_toolbar_position(
+            ToolbarPositionSnapshot {
+                manual: true,
+                x: 100.0,
+                y: 50.0,
+            },
+            viewport(1000.0, 750.0),
+            viewport(800.0, 600.0),
+        );
+        assert_eq!((x, y), (125.0, 62.5));
+    }
+
+    #[test]
+    fn zero_or_invalid_viewport_produces_a_safe_hidden_size() {
+        assert_eq!(toolbar_scale_for_viewport(viewport(0.0, 400.0)), 0.0);
+        assert_eq!(toolbar_scale_for_viewport(viewport(f64::NAN, 400.0)), 0.0);
+        assert_eq!(
+            calculate_toolbar_layout(Some(selection(2.0, 2.0, 10.0, 10.0)), viewport(0.0, 0.0)),
+            ToolbarLayout {
+                x: 0.0,
+                y: 0.0,
+                scale: 0.0,
+                forced_inside: false,
+            }
+        );
+    }
 }

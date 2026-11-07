@@ -38,6 +38,13 @@ impl CaptureSession {
             .is_ok()
     }
 
+    /// Reuse the frozen capture for another selection without ending the session.
+    pub fn restart_selection(&self) -> bool {
+        self.phase
+            .compare_exchange(ANNOTATING, SELECTING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Reset the gate on success or failure, allowing the next capture.
     pub fn finish(&self) {
         self.phase.store(IDLE, Ordering::Release);
@@ -118,5 +125,18 @@ mod tests {
         assert!(session.begin_capture());
         assert!(!session.begin_capture());
         assert!(!session.begin_annotation());
+        assert!(!session.restart_selection());
+    }
+
+    #[test]
+    fn new_selection_reuses_the_active_capture() {
+        let session = CaptureSession::default();
+        assert!(session.begin_capture());
+        assert!(session.capture_ready());
+        assert!(session.begin_annotation());
+        assert!(session.restart_selection());
+        assert!(!session.restart_selection());
+        assert!(session.begin_annotation());
+        assert!(session.begin_saving());
     }
 }
