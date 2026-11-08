@@ -3,12 +3,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayCommand {
     NewScreenshot,
+    Settings,
     Exit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppAction {
     StartCapture,
+    OpenSettings,
     Quit,
 }
 
@@ -27,6 +29,32 @@ pub fn export_should_close_overlay<T, E>(result: &Result<T, E>) -> bool {
 pub enum ExportKind {
     Copy,
     Save,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayShortcut {
+    Copy,
+    SaveDefault,
+    SaveAs,
+}
+
+/// Resolve the overlay's Ctrl shortcuts. Text entry owns every key while the
+/// text editor has focus, and Ctrl+Shift+S is deliberately checked first.
+pub fn overlay_shortcut(
+    key: &str,
+    control: bool,
+    shift: bool,
+    text_editor_active: bool,
+) -> Option<OverlayShortcut> {
+    if !control || text_editor_active {
+        return None;
+    }
+    match (key.to_ascii_lowercase().as_str(), shift) {
+        ("s", true) => Some(OverlayShortcut::SaveAs),
+        ("s", false) => Some(OverlayShortcut::SaveDefault),
+        ("c", false) => Some(OverlayShortcut::Copy),
+        _ => None,
+    }
 }
 
 pub fn export_notification<T, E>(result: &Result<T, E>, kind: ExportKind) -> Option<&'static str> {
@@ -76,6 +104,7 @@ impl TrayCommand {
     pub fn action(self) -> AppAction {
         match self {
             Self::NewScreenshot => AppAction::StartCapture,
+            Self::Settings => AppAction::OpenSettings,
             Self::Exit => AppAction::Quit,
         }
     }
@@ -83,11 +112,15 @@ impl TrayCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{overlay_close_policy, AppAction, ClosePolicy, TrayCommand, TrayResourceOwnership};
+    use super::{
+        overlay_close_policy, overlay_shortcut, AppAction, ClosePolicy, OverlayShortcut,
+        TrayCommand, TrayResourceOwnership,
+    };
 
     #[test]
     fn tray_commands_map_to_the_application_actions() {
         assert_eq!(TrayCommand::NewScreenshot.action(), AppAction::StartCapture);
+        assert_eq!(TrayCommand::Settings.action(), AppAction::OpenSettings);
         assert_eq!(TrayCommand::Exit.action(), AppAction::Quit);
     }
 
@@ -151,5 +184,24 @@ mod tests {
             super::export_notification(&Err::<(), _>("save failed"), super::ExportKind::Save),
             None
         );
+    }
+
+    #[test]
+    fn overlay_export_shortcuts_respect_precedence_and_text_editor_focus() {
+        assert_eq!(
+            overlay_shortcut("s", true, true, false),
+            Some(OverlayShortcut::SaveAs)
+        );
+        assert_eq!(
+            overlay_shortcut("S", true, false, false),
+            Some(OverlayShortcut::SaveDefault)
+        );
+        assert_eq!(
+            overlay_shortcut("c", true, false, false),
+            Some(OverlayShortcut::Copy)
+        );
+        assert_eq!(overlay_shortcut("c", true, true, false), None);
+        assert_eq!(overlay_shortcut("c", false, false, false), None);
+        assert_eq!(overlay_shortcut("s", true, true, true), None);
     }
 }

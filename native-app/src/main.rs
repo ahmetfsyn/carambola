@@ -10,29 +10,66 @@ mod overlay_ui {
 use core::{
     annotation_render,
     annotations::{
-        Annotation, AnnotationEditor, AnnotationTool, ImagePoint, StrokeColor, TextAlignment,
-        TextAnnotationDraft, ViewportToImage,
+        Annotation, AnnotationEditor, AnnotationSizeLevel, AnnotationTool, ImagePoint, StrokeColor,
+        TextAlignment, TextAnnotationDraft, ViewportToImage,
     },
     frame::{CapturedFrame, PixelRect},
     geometry::{FrameViewport, LogicalViewport, ViewportToFrame},
     lifecycle::{
-        export_notification, export_should_close_overlay, overlay_close_policy, AppAction,
-        ClosePolicy, ExportKind, TrayCommand,
+        export_notification, overlay_close_policy, overlay_shortcut, AppAction, ClosePolicy,
+        ExportKind, OverlayShortcut, TrayCommand,
     },
+    ocr::{complete as complete_ocr, normalize_result, OcrCompletion},
     selection::{hit_test_selection, GestureKind, LogicalRect, SelectionGeometry, SelectionHit},
     session::CaptureSession,
+    settings::{self, AppSettings},
 };
-use overlay_ui::OverlayPrototype;
+use overlay_ui::{OverlayPrototype, SettingsPrototype};
 use slint::private_unstable_api::re_exports::PointerEventKind;
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer};
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicIsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+static DEFAULT_SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREVIEW_TIMING_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static SELECTION_TIMING_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+fn trace_sampled_duration(name: &str, started: Instant, counter: &AtomicU64) {
+    let sample = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if sample == 1 || sample.is_multiple_of(60) {
+        platform::trace_event(&format!(
+            "perf.{name} sample={sample} elapsed_us={}",
+            started.elapsed().as_micros()
+        ));
+    }
+}
+
+struct ExportSuccess {
+    message: String,
+    preview: CapturedFrame,
+}
+
+struct PendingExportNotification {
+    message: &'static str,
+    preview: CapturedFrame,
+    owner_hwnd: isize,
+    enabled: bool,
+}
+
+fn report_copy_failure(error: &str, owner_hwnd: isize) {
+    let message = format!("Could not copy screenshot: {error}");
+    log::error!("{message}");
+    if let Err(notification_error) = platform::show_notification(&message, owner_hwnd) {
+        log::error!("Could not show native copy failure notification: {notification_error}");
+    }
+}
 
 fn set_status(overlay: &OverlayPrototype, message: impl Into<slint::SharedString>) {
     let message = message.into();
@@ -49,41 +86,86 @@ fn close_capture_after_export(
     overlay: &OverlayPrototype,
     state: &SelectionState,
     reason: &str,
+    notification: PendingExportNotification,
 ) -> Result<(), String> {
     platform::trace_event(&format!(
         "capture.export_success.close.begin reason={reason:?}"
     ));
-    trace_overlay_state(overlay, "capture.export_success.close.before");
-    overlay
-        .hide()
-        .map_err(|error| format!("Could not hide the selection overlay: {error}"))?;
-    trace_overlay_state(overlay, "capture.export_success.close.hidden");
-    overlay.window().set_fullscreen(false);
-    platform::trace_slint_native_handle(
-        "Overlay",
-        "export_success.after_hide_and_fullscreen_exit",
-        overlay.window(),
-    );
+    schedule_capture_close(overlay, state, reason, true, Some(notification))
+}
 
-    *state.frame.lock().expect("capture frame lock") = None;
-    *state.crop.lock().expect("selected crop lock") = None;
-    *state.bounds.lock().expect("selection bounds lock") = None;
-    *state.geometry.lock().expect("selection geometry lock") = SelectionGeometry::default();
-    *state.active_kind.lock().expect("active gesture lock") = None;
-    *state.viewport.lock().expect("frame viewport lock") = None;
-    *state.editor.lock().expect("annotation editor lock") = None;
-    state.clear_text_interaction();
-    overlay.set_annotation_mode(false);
-    overlay.set_toolbar_tooltip_text("".into());
-    overlay.set_color_palette_open(false);
-    overlay.set_annotation_image(Image::default());
-    overlay.set_text_entry_visible(false);
-    overlay.set_text_entry_line_count(1);
-    overlay.set_captured_image(Image::default());
-    finish_capture_session(&state.session, reason);
-    platform::trace_event(&format!(
-        "capture.export_success.close.complete reason={reason:?}"
-    ));
+fn schedule_capture_close(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    reason: &str,
+    finish_session: bool,
+    notification: Option<PendingExportNotification>,
+) -> Result<(), String> {
+    if state.closing.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    overlay.set_overlay_closing(true);
+    // Leave the captured desktop image visible while the controls fade away.
+    // A black cover would otherwise become a full-screen black frame just
+    // before the fullscreen HWND is hidden.
+    overlay.set_fade_animation_enabled(false);
+    overlay.set_fade_cover_color(slint::Color::from_argb_u8(0, 0, 0, 0));
+    overlay.set_fade_animation_enabled(true);
+    overlay.set_content_opacity(0.0);
+    platform::trace_event(&format!("capture.fade_out.begin reason={reason:?}"));
+    let weak_overlay = overlay.as_weak();
+    let state = state.clone();
+    let reason = reason.to_owned();
+    slint::Timer::single_shot(std::time::Duration::from_millis(160), move || {
+        if let Some(overlay) = weak_overlay.upgrade() {
+            trace_overlay_state(&overlay, "capture.fade_out.complete.before_hide");
+            if let Err(error) = overlay.hide() {
+                log::warn!("Could not hide the selection overlay after fade-out: {error}");
+            }
+            overlay.window().set_fullscreen(false);
+            overlay.set_fade_animation_enabled(false);
+            overlay.set_content_opacity(1.0);
+            overlay.set_annotation_mode(false);
+            overlay.set_color_palette_open(false);
+            overlay.set_size_menu_open(false);
+            overlay.set_copy_in_progress(false);
+            overlay.set_annotation_image(Image::default());
+            overlay.set_text_entry_visible(false);
+            overlay.set_text_entry_line_count(1);
+            overlay.set_captured_image(Image::default());
+            overlay.set_control_held(false);
+            overlay.set_overlay_closing(false);
+            trace_overlay_state(&overlay, "capture.fade_out.complete.hidden");
+        }
+        *state.frame.lock().expect("capture frame lock") = None;
+        *state.crop.lock().expect("selected crop lock") = None;
+        *state.bounds.lock().expect("selection bounds lock") = None;
+        *state.geometry.lock().expect("selection geometry lock") = SelectionGeometry::default();
+        *state.active_kind.lock().expect("active gesture lock") = None;
+        *state.viewport.lock().expect("frame viewport lock") = None;
+        *state.editor.lock().expect("annotation editor lock") = None;
+        state.clear_text_interaction();
+        if finish_session {
+            finish_capture_session(&state.session, &reason);
+        }
+        state.closing.store(false, Ordering::Release);
+        platform::trace_event(&format!("capture.fade_out.complete reason={reason:?}"));
+        if let Some(notification) = notification.filter(|notification| notification.enabled) {
+            // Fullscreen can silence Windows toast banners. Submit only after
+            // the overlay is hidden and its fullscreen transition has ended.
+            slint::Timer::single_shot(std::time::Duration::from_millis(100), move || {
+                thread::spawn(move || {
+                    if let Err(error) = platform::show_screenshot_notification(
+                        notification.message,
+                        notification.owner_hwnd,
+                        &notification.preview,
+                    ) {
+                        log::warn!("Could not show export success notification: {error}");
+                    }
+                });
+            });
+        }
+    });
     Ok(())
 }
 
@@ -120,55 +202,247 @@ fn annotation_snapshot(
     Ok((crop, annotations))
 }
 
+fn claim_export_operation(
+    overlay: &OverlayPrototype,
+    busy: &AtomicBool,
+    status: &'static str,
+) -> bool {
+    if busy
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        overlay.set_export_status("An export operation is already running.".into());
+        return false;
+    }
+    overlay.set_export_busy(true);
+    overlay.set_export_status(status.into());
+    true
+}
+
+fn release_export_claim(overlay: &OverlayPrototype, busy: &AtomicBool, message: &str) {
+    overlay.set_export_busy(false);
+    overlay.set_export_status(message.into());
+    busy.store(false, Ordering::Release);
+}
+
+fn request_save(
+    overlay: &OverlayPrototype,
+    state: &SelectionState,
+    busy: Arc<AtomicBool>,
+    notification_owner: Arc<AtomicIsize>,
+    application_settings: Arc<Mutex<AppSettings>>,
+    save_as: bool,
+) {
+    if state.closing.load(Ordering::Acquire) {
+        return;
+    }
+    if state
+        .text_position
+        .lock()
+        .expect("pending text position lock")
+        .is_some()
+    {
+        overlay.set_export_status("Add or cancel the current text before saving.".into());
+        return;
+    }
+    let (crop, annotations) = match annotation_snapshot(&state.crop, &state.editor) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            overlay.set_export_status(format!("Could not save screenshot: {error}").into());
+            return;
+        }
+    };
+    let (save_directory, notifications_enabled) = {
+        let settings = application_settings
+            .lock()
+            .expect("application settings lock");
+        (
+            settings.save_directory.clone(),
+            settings.notifications_enabled,
+        )
+    };
+
+    let path = if save_as {
+        if !claim_export_operation(overlay, &busy, "Choose where to save the screenshot…") {
+            return;
+        }
+        match platform::save_png_dialog(save_directory.as_deref()) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                release_export_claim(
+                    overlay,
+                    &busy,
+                    "Save cancelled. The capture session is unchanged.",
+                );
+                return;
+            }
+            Err(error) => {
+                release_export_claim(overlay, &busy, &format!("Save As failed: {error}"));
+                return;
+            }
+        }
+    } else {
+        let Some(directory) = save_directory else {
+            overlay.set_export_status(
+                "Choose a default save folder in Settings before saving.".into(),
+            );
+            return;
+        };
+        if let Err(error) = settings::validate_save_directory(&directory) {
+            overlay.set_export_status(
+                format!("Default save folder is unavailable: {error}. Choose another in Settings.")
+                    .into(),
+            );
+            return;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = DEFAULT_SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        crate::core::export::default_screenshot_path(
+            &directory,
+            nanos,
+            std::process::id(),
+            sequence,
+        )
+    };
+
+    let owner_hwnd = notification_owner.load(Ordering::Acquire);
+    let busy_for_completion = Arc::clone(&busy);
+    let state_for_completion = state.clone();
+    let save = move || {
+        let rendered =
+            annotation_render::render_composite(&crop, &annotations).map_err(str::to_owned)?;
+        crate::core::export::write_png(&path, &rendered)?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "screenshot.png".into());
+        Ok(ExportSuccess {
+            message: format!("Saved {name}"),
+            preview: rendered,
+        })
+    };
+    let completed = move |overlay: &OverlayPrototype, success: ExportSuccess, message| {
+        close_capture_after_export(
+            overlay,
+            &state_for_completion,
+            "saved",
+            PendingExportNotification {
+                message,
+                preview: success.preview,
+                owner_hwnd,
+                enabled: notifications_enabled,
+            },
+        )
+    };
+    if save_as {
+        start_export_operation_claimed(
+            overlay,
+            busy_for_completion,
+            "Saving PNG…",
+            ExportKind::Save,
+            owner_hwnd,
+            save,
+            completed,
+        );
+    } else {
+        start_export_operation(
+            overlay,
+            busy_for_completion,
+            "Saving PNG…",
+            ExportKind::Save,
+            owner_hwnd,
+            save,
+            completed,
+        );
+    }
+}
+
 fn start_export_operation(
     overlay: &OverlayPrototype,
     busy: Arc<AtomicBool>,
     status: &'static str,
     kind: ExportKind,
     notification_owner_hwnd: isize,
-    operation: impl FnOnce() -> Result<String, String> + Send + 'static,
-    on_success: impl FnOnce(&OverlayPrototype) -> Result<(), String> + Send + 'static,
+    operation: impl FnOnce() -> Result<ExportSuccess, String> + Send + 'static,
+    on_success: impl FnOnce(&OverlayPrototype, ExportSuccess, &'static str) -> Result<(), String>
+        + Send
+        + 'static,
 ) {
     platform::trace_event(&format!("export.requested status={status:?}"));
-    if busy
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        overlay.set_export_status("An export operation is already running.".into());
+    if !claim_export_operation(overlay, &busy, status) {
         return;
     }
+    start_export_operation_claimed(
+        overlay,
+        busy,
+        status,
+        kind,
+        notification_owner_hwnd,
+        operation,
+        on_success,
+    );
+}
+
+fn start_export_operation_claimed(
+    overlay: &OverlayPrototype,
+    busy: Arc<AtomicBool>,
+    status: &'static str,
+    kind: ExportKind,
+    notification_owner_hwnd: isize,
+    operation: impl FnOnce() -> Result<ExportSuccess, String> + Send + 'static,
+    on_success: impl FnOnce(&OverlayPrototype, ExportSuccess, &'static str) -> Result<(), String>
+        + Send
+        + 'static,
+) {
     overlay.set_export_busy(true);
+    overlay.set_copy_in_progress(kind == ExportKind::Copy);
     overlay.set_export_status(status.into());
     platform::trace_native_event(&format!("export.started status={status:?}"));
     trace_overlay_state(overlay, "export.started");
     let weak_overlay = overlay.as_weak();
     thread::spawn(move || {
         platform::trace_event(&format!("export.worker.begin status={status:?}"));
+        let worker_started = Instant::now();
         let result = operation();
+        platform::trace_event(&format!(
+            "perf.export.operation status={status:?} elapsed_ms={} success={}",
+            worker_started.elapsed().as_millis(),
+            result.is_ok()
+        ));
         platform::trace_event(&format!(
             "export.worker.end status={status:?} success={}",
             result.is_ok()
         ));
-        if let Some(message) = export_notification(&result, kind) {
-            if let Err(error) = platform::show_notification(message, notification_owner_hwnd) {
-                log::warn!("Could not show export success notification: {error}");
-            }
-        }
+        platform::trace_event(&format!(
+            "perf.export.worker_total status={status:?} elapsed_ms={}",
+            worker_started.elapsed().as_millis()
+        ));
         let busy_for_dispatch = busy.clone();
         let dispatched = slint::invoke_from_event_loop(move || {
             platform::trace_event(&format!("export.result_dispatch.entered status={status:?}"));
-            let was_successful = export_should_close_overlay(&result);
-            let mut message = match result {
-                Ok(message) => message,
-                Err(error) => format!("Export failed: {error}"),
+            let notification_message = export_notification(&result, kind);
+            let (mut message, success) = match result {
+                Ok(success) => (success.message.clone(), Some(success)),
+                Err(error) => {
+                    if kind == ExportKind::Copy {
+                        report_copy_failure(&error, notification_owner_hwnd);
+                    }
+                    (format!("Export failed: {error}"), None)
+                }
             };
             if let Some(overlay) = weak_overlay.upgrade() {
-                if was_successful {
-                    if let Err(error) = on_success(&overlay) {
+                if let Some(success) = success {
+                    let notification_message = notification_message
+                        .expect("successful export has a success notification message");
+                    if let Err(error) = on_success(&overlay, success, notification_message) {
                         message = format!("{message}, but the overlay could not close: {error}");
                     }
                 }
                 overlay.set_export_busy(false);
+                overlay.set_copy_in_progress(false);
                 overlay.set_export_status(message.clone().into());
                 trace_overlay_state(&overlay, "export.completed");
             }
@@ -253,14 +527,14 @@ struct SelectionState {
     session: Arc<CaptureSession>,
     toolbar_snapshot: Arc<Mutex<Option<ToolbarPositionSnapshot>>>,
     toolbar_drag: Arc<Mutex<Option<ToolbarDrag>>>,
+    closing: Arc<AtomicBool>,
 }
 
-const TOOLBAR_DESIGN_WIDTH: f64 = 472.0;
-const TOOLBAR_DESIGN_HEIGHT: f64 = 64.0;
+const TOOLBAR_DESIGN_WIDTH: f64 = 466.0;
+const TOOLBAR_DESIGN_HEIGHT: f64 = 38.0;
 const TOOLBAR_GAP: f64 = 8.0;
 const TEXT_EDITOR_WIDTH: f64 = 360.0;
 const TEXT_EDITOR_HEIGHT: f64 = 208.0;
-const CROP_MOVE_BAND: f64 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ToolbarLayout {
@@ -302,6 +576,7 @@ impl SelectionState {
             session: Arc::new(CaptureSession::default()),
             toolbar_snapshot: Arc::new(Mutex::new(None)),
             toolbar_drag: Arc::new(Mutex::new(None)),
+            closing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -328,7 +603,9 @@ fn show_text_editor(
 ) {
     overlay.set_text_entry_value(draft.text.clone().into());
     overlay.set_text_entry_line_count(text_editor_visual_line_count(&draft.text));
-    overlay.set_annotation_size(draft.text_style.font_size.round().clamp(8.0, 256.0) as i32);
+    overlay.set_annotation_size(
+        AnnotationSizeLevel::closest_for(AnnotationTool::Text, draft.text_style.font_size).as_ui(),
+    );
     overlay.set_annotation_color_index(draft.color.palette_index());
     overlay.set_color_palette_open(false);
     overlay.set_text_bold(draft.text_style.bold);
@@ -349,7 +626,7 @@ fn show_text_editor(
 }
 
 fn sync_annotation_controls(overlay: &OverlayPrototype, editor: &AnnotationEditor) {
-    overlay.set_annotation_size(editor.active_size().round() as i32);
+    overlay.set_annotation_size(editor.active_size_level().as_ui());
     overlay.set_annotation_color_index(editor.active_color().palette_index());
 }
 
@@ -367,17 +644,19 @@ fn text_editor_visual_line_count(text: &str) -> i32 {
     lines.clamp(1, 6) as i32
 }
 
-fn selection_move_band_contains(selection: LogicalRect, x: f64, y: f64) -> bool {
-    let right = selection.x + selection.width;
-    let bottom = selection.y + selection.height;
-    x >= selection.x
-        && x <= right
-        && y >= selection.y
-        && y <= bottom
-        && (x - selection.x <= CROP_MOVE_BAND
-            || right - x <= CROP_MOVE_BAND
-            || y - selection.y <= CROP_MOVE_BAND
-            || bottom - y <= CROP_MOVE_BAND)
+fn crop_move_modifier(control: bool, meta: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // Slint maps the physical Control key to `meta` on macOS because
+        // Command is exposed as `control` for conventional shortcuts.
+        let _ = control;
+        meta
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        control
+    }
 }
 
 fn present_pixel_rect(
@@ -580,7 +859,41 @@ fn toolbar_contains(overlay: &OverlayPrototype, x: f64, y: f64) -> bool {
     let top = f64::from(overlay.get_toolbar_position_y());
     let right = left + f64::from(overlay.get_toolbar_effective_width());
     let bottom = top + f64::from(overlay.get_toolbar_effective_height());
-    x >= left && x <= right && y >= top && y <= bottom
+    if x >= left && x <= right && y >= top && y <= bottom {
+        return true;
+    }
+    let scale = f64::from(overlay.get_toolbar_scale());
+    if overlay.get_size_menu_open() {
+        let menu_top = top
+            + if top + 184.0 * scale > f64::from(overlay.get_frame_viewport_height()) {
+                -146.0 * scale
+            } else {
+                38.0 * scale
+            };
+        if x >= left + 398.0 * scale
+            && x <= left + 444.0 * scale
+            && y >= menu_top
+            && y <= menu_top + 144.0 * scale
+        {
+            return true;
+        }
+    }
+    if overlay.get_color_palette_open() {
+        let palette_top = top
+            + if top + 70.0 * scale > f64::from(overlay.get_frame_viewport_height()) {
+                -30.0 * scale
+            } else {
+                40.0 * scale
+            };
+        if x >= left + 294.0 * scale
+            && x <= left + 440.0 * scale
+            && y >= palette_top
+            && y <= palette_top + 26.0 * scale
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn handle_toolbar_pointer_event(
@@ -782,6 +1095,7 @@ fn update_selection_gesture(
     width: f64,
     height: f64,
 ) -> Result<bool, &'static str> {
+    let started = Instant::now();
     if !state
         .geometry
         .lock()
@@ -809,6 +1123,11 @@ fn update_selection_gesture(
         overlay.set_toolbar_manual_position(false);
     }
     present_gesture_preview(overlay, state, transform)?;
+    trace_sampled_duration(
+        "selection_gesture_update",
+        started,
+        &SELECTION_TIMING_SAMPLES,
+    );
     Ok(true)
 }
 
@@ -970,6 +1289,7 @@ fn finish_selection_gesture(
         overlay.set_annotation_size(3);
         overlay.set_annotation_color_index(0);
         overlay.set_color_palette_open(false);
+        overlay.set_size_menu_open(false);
         overlay.set_text_entry_visible(false);
         overlay.set_text_entry_value(String::new().into());
         overlay.set_text_entry_line_count(1);
@@ -1148,11 +1468,12 @@ fn refresh_annotation_preview(
     crop_slot: &Arc<Mutex<Option<CapturedFrame>>>,
     editor_slot: &Arc<Mutex<Option<AnnotationEditor>>>,
 ) -> Result<(), &'static str> {
+    let started = Instant::now();
     let crop_guard = crop_slot.lock().expect("selected crop lock");
     let Some(crop) = crop_guard.as_ref() else {
         return Err("selected crop is no longer available");
     };
-    let (annotations, can_undo, can_redo, can_delete_last) = {
+    let (annotations, can_undo, can_redo, can_clear_annotations) = {
         let guard = editor_slot.lock().expect("annotation editor lock");
         let Some(editor) = guard.as_ref() else {
             return Err("annotation editor is no longer available");
@@ -1169,7 +1490,8 @@ fn refresh_annotation_preview(
     overlay.set_annotation_image(output);
     overlay.set_can_undo(can_undo);
     overlay.set_can_redo(can_redo);
-    overlay.set_can_delete_last_annotation(can_delete_last);
+    overlay.set_can_clear_annotations(can_clear_annotations);
+    trace_sampled_duration("annotation_preview", started, &PREVIEW_TIMING_SAMPLES);
     Ok(())
 }
 
@@ -1192,6 +1514,7 @@ fn update_preview_if_possible(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let startup_started = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     platform::initialize().map_err(std::io::Error::other)?;
     #[cfg(target_os = "windows")]
@@ -1227,6 +1550,201 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace_overlay_state(&overlay, "main.after_overlay_create");
     platform::diagnose_cursor("overlay component created");
 
+    let (mut initial_settings, mut settings_load_error, loaded_settings_path) =
+        match AppSettings::load() {
+            Ok((settings, path)) => (settings, None, Some(path)),
+            Err(error) => {
+                log::warn!("Could not load Carambola settings: {error}");
+                (
+                    AppSettings::default(),
+                    Some(format!("Settings could not be loaded: {error}")),
+                    settings::settings_file_path(),
+                )
+            }
+        };
+    if let Err(error) = initial_settings.capture_shortcut.validate() {
+        log::warn!("Stored capture shortcut is invalid: {error}");
+        settings_load_error = Some(format!(
+            "The saved capture shortcut is unsupported ({error}). Record a supported key in Settings."
+        ));
+    }
+    initial_settings.capture_shortcut = initial_settings.capture_shortcut.normalize_legacy_letter();
+    let settings_path = Arc::new(loaded_settings_path);
+    let application_settings = Arc::new(Mutex::new(initial_settings));
+    let settings_window = SettingsPrototype::new().map_err(|error| {
+        std::io::Error::other(format!("Could not create the Settings window: {error}"))
+    })?;
+    {
+        let current = application_settings
+            .lock()
+            .expect("application settings lock");
+        settings_window.set_save_directory(
+            current
+                .save_directory
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+                .into(),
+        );
+        settings_window.set_capture_shortcut(current.capture_shortcut.display().into());
+        settings_window.set_notifications_enabled(current.notifications_enabled);
+    }
+    if let Some(error) = settings_load_error {
+        settings_window.set_settings_message(error.into());
+    }
+    let weak_settings_window = settings_window.as_weak();
+    let settings_for_folder = application_settings.clone();
+    let settings_path_for_folder = settings_path.clone();
+    settings_window.on_choose_save_directory(move || {
+        let weak_settings_window = weak_settings_window.clone();
+        let initial = settings_for_folder
+            .lock()
+            .expect("application settings lock")
+            .save_directory
+            .clone();
+        let result = platform::pick_save_directory(initial.as_deref()).and_then(|selection| {
+            let Some(directory) = selection else {
+                return Ok(None);
+            };
+            settings::validate_save_directory(&directory)?;
+            let mut updated = settings_for_folder
+                .lock()
+                .map_err(|_| "Application settings lock is unavailable".to_string())?
+                .clone();
+            updated.save_directory = Some(directory.clone());
+            let path = settings_path_for_folder
+                .as_ref()
+                .as_ref()
+                .ok_or_else(|| "Carambola settings file path is unavailable".to_string())?;
+            updated.save_to(path)?;
+            *settings_for_folder
+                .lock()
+                .map_err(|_| "Application settings lock is unavailable".to_string())? = updated;
+            Ok(Some(directory))
+        });
+        if let Some(settings_window) = weak_settings_window.upgrade() {
+            match result {
+                Ok(Some(directory)) => {
+                    settings_window.set_save_directory(directory.display().to_string().into());
+                    settings_window.set_settings_message("Default save folder updated.".into());
+                }
+                Ok(None) => {}
+                Err(error) => settings_window.set_settings_message(error.into()),
+            }
+        }
+    });
+    let settings_for_notifications = application_settings.clone();
+    let settings_path_for_notifications = settings_path.clone();
+    let weak_settings_for_notifications = settings_window.as_weak();
+    settings_window.on_notifications_toggled(move |enabled| {
+        let result = (|| {
+            let mut current = settings_for_notifications
+                .lock()
+                .map_err(|_| "Application settings lock is unavailable".to_string())?;
+            let mut updated = current.clone();
+            updated.notifications_enabled = enabled;
+            let path = settings_path_for_notifications
+                .as_ref()
+                .as_ref()
+                .ok_or_else(|| "Carambola settings file path is unavailable".to_string())?;
+            updated.save_to(path)?;
+            *current = updated;
+            Ok::<(), String>(())
+        })();
+        if let Some(window) = weak_settings_for_notifications.upgrade() {
+            match result {
+                Ok(()) => {
+                    window.set_notifications_enabled(enabled);
+                    window.set_settings_message(if enabled {
+                        "Screenshot notifications enabled.".into()
+                    } else {
+                        "Screenshot notifications disabled.".into()
+                    });
+                }
+                Err(error) => window.set_settings_message(error.into()),
+            }
+        }
+    });
+    let settings_for_shortcut = application_settings.clone();
+    let settings_path_for_shortcut = settings_path.clone();
+    #[cfg(target_os = "windows")]
+    let tray_service_slot: Arc<Mutex<Option<platform::tray::TrayService>>> =
+        Arc::new(Mutex::new(None));
+    #[cfg(target_os = "windows")]
+    let tray_service_for_shortcut = tray_service_slot.clone();
+    let weak_settings_for_shortcut = settings_window.as_weak();
+    settings_window.on_shortcut_key_captured(move |text, control, shift, alt, meta| {
+        let requested =
+            core::hotkey::HotkeyConfig::from_recorded_key(text.as_str(), control, shift, alt, meta);
+        let result = match requested {
+            Err(error) => Err(error.to_string()),
+            Ok(requested) => {
+                #[cfg(target_os = "windows")]
+                {
+                    let mut settings_guard = settings_for_shortcut
+                        .lock()
+                        .expect("application settings lock");
+                    let mut service_guard = tray_service_for_shortcut
+                        .lock()
+                        .expect("tray service slot lock");
+                    match service_guard.as_mut() {
+                        Some(service) => settings::change_shortcut(
+                            &mut settings_guard,
+                            requested,
+                            service,
+                            |updated| {
+                                let path = settings_path_for_shortcut
+                                    .as_ref()
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "Carambola settings file path is unavailable".to_string()
+                                    })?;
+                                updated.save_to(path)
+                            },
+                        ),
+                        None => Err("The tray hotkey service is unavailable".into()),
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = (
+                        requested,
+                        &settings_for_shortcut,
+                        &settings_path_for_shortcut,
+                    );
+                    Err("Global shortcut changes are currently supported on Windows only".into())
+                }
+            }
+        };
+        if let Some(settings_window) = weak_settings_for_shortcut.upgrade() {
+            settings_window.set_shortcut_recording(false);
+            match result {
+                Ok(()) => {
+                    if let Ok(settings) = settings_for_shortcut.lock() {
+                        settings_window
+                            .set_capture_shortcut(settings.capture_shortcut.display().into());
+                    }
+                    settings_window.set_settings_message("Capture shortcut updated.".into());
+                }
+                Err(error) => settings_window.set_settings_message(error.into()),
+            }
+        }
+    });
+    let weak_settings_for_close = settings_window.as_weak();
+    settings_window.on_close_settings(move || {
+        if let Some(settings_window) = weak_settings_for_close.upgrade() {
+            settings_window.set_shortcut_recording(false);
+            let _ = settings_window.hide();
+        }
+    });
+    let weak_settings_for_window_close = settings_window.as_weak();
+    settings_window.window().on_close_requested(move || {
+        if let Some(settings_window) = weak_settings_for_window_close.upgrade() {
+            settings_window.set_shortcut_recording(false);
+        }
+        slint::CloseRequestResponse::HideWindow
+    });
+
     let selection = SelectionState::new();
     let export_busy = Arc::new(AtomicBool::new(false));
     let clipboard_owner_hwnd = Arc::new(AtomicIsize::new(0));
@@ -1236,6 +1754,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_for_capture = selection.clone();
     let busy_for_capture = export_busy.clone();
     overlay.on_request_capture(move || {
+        let capture_requested_at = Instant::now();
         platform::clear_window_action("new_capture_requested");
         platform::trace_event("capture.start.requested");
         platform::diagnose_cursor("capture requested");
@@ -1243,6 +1762,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(overlay) = weak_overlay.upgrade() {
                 set_status(&overlay, "Please wait for the current export to finish.");
             }
+            return;
+        }
+        if state_for_capture.closing.load(Ordering::Acquire) {
             return;
         }
         if !state_for_capture.session.begin_capture() {
@@ -1264,8 +1786,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
         overlay.set_annotation_mode(false);
-        overlay.set_toolbar_tooltip_text("".into());
+        overlay.set_overlay_closing(false);
+        overlay.set_control_held(false);
+        overlay.set_fade_animation_enabled(false);
+        // The captured image is installed before show. Start its fade with a
+        // light tint instead of an opaque black frame on the first capture.
+        overlay.set_fade_cover_color(slint::Color::from_argb_u8(64, 7, 16, 29));
+        overlay.set_content_opacity(1.0);
         overlay.set_color_palette_open(false);
+        overlay.set_size_menu_open(false);
         overlay.set_annotation_color_index(0);
         overlay.set_annotation_size(3);
         overlay.set_confirm_selection_action_visible(false);
@@ -1276,6 +1805,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         overlay.set_can_undo(false);
         overlay.set_can_redo(false);
         overlay.set_export_busy(false);
+        overlay.set_copy_in_progress(false);
         overlay.set_export_status("Capturing desktop…".into());
         clear_selection_preview(&overlay);
 
@@ -1288,35 +1818,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        platform::trace_event("capture.start.prepare_capture.begin");
-        if let Err(error) = platform::prepare_capture() {
-            set_status(&overlay, format!("Could not prepare the desktop for capture: {error}"));
-            finish_capture_session(&state_for_capture.session, "prepare_capture_failed");
-            return;
-        }
-        platform::trace_event("capture.start.prepare_capture.complete");
-        platform::diagnose_cursor("capture prepared");
-
         let weak_overlay = overlay.as_weak();
         let state_for_result = state_for_capture.clone();
         thread::spawn(move || {
+            let worker_started = Instant::now();
+            platform::trace_event("capture.start.prepare_capture.begin");
+            let prepared = platform::prepare_capture();
+            platform::trace_event(&format!(
+                "capture.start.prepare_capture.complete success={}",
+                prepared.is_ok()
+            ));
+            platform::diagnose_cursor("capture prepared");
             platform::trace_event(&format!(
                 "capture.capture_display.worker_begin display={requested_display_id:?}"
             ));
-            let captured = platform::capture_display(requested_display_id.as_deref());
+            let captured = prepared
+                .map_err(|error| format!("Could not prepare the desktop for capture: {error}"))
+                .and_then(|()| platform::capture_display(requested_display_id.as_deref()))
+                .map(|frame| {
+                    let pixels = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                        frame.pixels(), frame.width(), frame.height(),
+                    );
+                    (frame, pixels)
+                });
             platform::trace_event(&format!(
                 "capture.capture_display.worker_end display={requested_display_id:?} success={}",
+                captured.is_ok()
+            ));
+            platform::trace_event(&format!(
+                "perf.capture.worker elapsed_ms={} success={}",
+                worker_started.elapsed().as_millis(),
                 captured.is_ok()
             ));
             let session_for_dispatch = state_for_result.session.clone();
             let session_for_queue_error = state_for_result.session.clone();
             let dispatched = slint::invoke_from_event_loop(move || {
+                let dispatch_started = Instant::now();
                 platform::trace_event("capture.capture_result.dispatch_entered");
                 let Some(overlay) = weak_overlay.upgrade() else {
                     finish_capture_session(&session_for_dispatch, "overlay_dropped_during_capture");
                     return;
                 };
-                let frame = match captured {
+                let (frame, image_pixels) = match captured {
                     Ok(frame) => frame,
                     Err(error) => {
                         set_status(&overlay, format!("Screen capture failed: {error}"));
@@ -1402,7 +1945,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                 overlay.set_frame_viewport_width(logical_size.width as f32);
                 overlay.set_frame_viewport_height(logical_size.height as f32);
-                overlay.set_captured_image(image_from_rgba(frame.pixels(), frame.width(), frame.height()));
+                overlay.set_captured_image(Image::from_rgba8(image_pixels));
                 overlay.set_annotation_mode(false);
                 overlay.set_annotation_image(Image::default());
                 clear_selection_preview(&overlay);
@@ -1425,6 +1968,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
                 trace_overlay_state(&overlay, "overlay.show.after");
+                platform::trace_event(&format!(
+                    "perf.capture.to_show elapsed_ms={} dispatch_ms={}",
+                    capture_requested_at.elapsed().as_millis(),
+                    dispatch_started.elapsed().as_millis()
+                ));
+                overlay.set_fade_animation_enabled(true);
+                overlay.set_fade_cover_color(slint::Color::from_argb_u8(0, 0, 0, 0));
                 platform::trace_slint_native_handle("Overlay", "after_show", overlay.window());
 
                 #[cfg(target_os = "windows")]
@@ -1486,57 +2036,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             platform::finish_window_action(action_id, "rejected_no_active_session");
             return;
         }
-        *state_for_cancel.frame.lock().expect("capture frame lock") = None;
-        *state_for_cancel.crop.lock().expect("selected crop lock") = None;
-        *state_for_cancel
-            .bounds
-            .lock()
-            .expect("selection bounds lock") = None;
-        *state_for_cancel
-            .geometry
-            .lock()
-            .expect("selection geometry lock") = SelectionGeometry::default();
-        *state_for_cancel
-            .active_kind
-            .lock()
-            .expect("active gesture lock") = None;
-        *state_for_cancel
-            .viewport
-            .lock()
-            .expect("frame viewport lock") = None;
-        *state_for_cancel
-            .editor
-            .lock()
-            .expect("annotation editor lock") = None;
-        state_for_cancel.clear_text_interaction();
         if let Some(overlay) = weak_overlay.upgrade() {
-            overlay.set_annotation_mode(false);
-            overlay.set_annotation_image(Image::default());
-            overlay.set_text_entry_visible(false);
-            overlay.set_confirm_selection_action_visible(false);
-            platform::trace_event("overlay.hide.cancel.before");
-            trace_overlay_state(&overlay, "overlay.hide.cancel.before");
-            let result = overlay.hide();
-            platform::trace_event(&format!(
-                "overlay.hide.cancel.result success={}",
-                result.is_ok()
-            ));
-            trace_overlay_state(&overlay, "overlay.hide.cancel.after");
-            overlay.window().set_fullscreen(false);
-            platform::trace_slint_native_handle(
-                "Overlay",
-                "cancel.after_hide_and_fullscreen_exit",
-                overlay.window(),
-            );
-            overlay.set_captured_image(Image::default());
+            if let Err(error) =
+                schedule_capture_close(&overlay, &state_for_cancel, "cancelled", false, None)
+            {
+                log::warn!("Could not schedule overlay fade-out: {error}");
+            }
             platform::diagnose_cursor("escape after close");
+        } else {
+            *state_for_cancel.frame.lock().expect("capture frame lock") = None;
+            *state_for_cancel.crop.lock().expect("selected crop lock") = None;
+            *state_for_cancel
+                .bounds
+                .lock()
+                .expect("selection bounds lock") = None;
+            *state_for_cancel
+                .geometry
+                .lock()
+                .expect("selection geometry lock") = SelectionGeometry::default();
+            *state_for_cancel
+                .active_kind
+                .lock()
+                .expect("active gesture lock") = None;
+            *state_for_cancel
+                .viewport
+                .lock()
+                .expect("frame viewport lock") = None;
+            *state_for_cancel
+                .editor
+                .lock()
+                .expect("annotation editor lock") = None;
+            state_for_cancel.clear_text_interaction();
         }
         platform::finish_window_action(action_id, "cancel_teardown_complete");
     });
 
     let weak_overlay = overlay.as_weak();
     let state_for_down = selection.clone();
-    overlay.on_pointer_down(move |x, y, width, height| {
+    overlay.on_pointer_down(move |x, y, width, height, control, meta| {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
@@ -1570,7 +2107,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("selection geometry lock")
                 .committed();
             if let Some(rect) = committed {
-                let logical_bounds = *state_for_down.bounds.lock().expect("selection bounds lock");
                 let hit = match hit_test_selection(rect, x as f64, y as f64, 5.0, transform) {
                     Ok(hit) => hit,
                     Err(error) => {
@@ -1580,9 +2116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let starts_crop_gesture = match hit {
                     SelectionHit::Outside | SelectionHit::Resize(_) => true,
-                    SelectionHit::Move => logical_bounds.is_some_and(|bounds| {
-                        selection_move_band_contains(bounds, x as f64, y as f64)
-                    }),
+                    SelectionHit::Move => crop_move_modifier(control, meta),
                 };
                 if starts_crop_gesture {
                     if let Err(error) = begin_selection_gesture(
@@ -1778,16 +2312,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             return;
         }
-        let crop = state_for_move
-            .crop
-            .lock()
-            .expect("selected crop lock")
-            .clone();
         let bounds = *state_for_move.bounds.lock().expect("selection bounds lock");
-        let (Some(crop), Some(bounds)) = (crop, bounds) else {
+        let Some(bounds) = bounds else {
             return;
         };
-        let mapped = annotation_point(x as f64, y as f64, bounds, &crop);
+        // A crop can be many megabytes; pointer movement needs only its
+        // dimensions. Borrow it briefly instead of cloning every pixel.
+        let mapped = {
+            let crop = state_for_move.crop.lock().expect("selected crop lock");
+            let Some(crop) = crop.as_ref() else {
+                return;
+            };
+            annotation_point(x as f64, y as f64, bounds, crop)
+        };
         if let Ok(Some(point)) = mapped {
             let drawing = {
                 let mut guard = state_for_move
@@ -1975,25 +2512,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak_overlay = overlay.as_weak();
-    let state_for_delete_last = selection.clone();
-    overlay.on_delete_last_annotation(move || {
+    let state_for_clear = selection.clone();
+    overlay.on_clear_annotations(move || {
         if let Some(overlay) = weak_overlay.upgrade() {
-            if !overlay.get_annotation_mode() || overlay.get_text_entry_visible() {
+            if state_for_clear.closing.load(Ordering::Acquire)
+                || !overlay.get_annotation_mode()
+                || overlay.get_text_entry_visible()
+            {
                 return;
             }
-            let deleted = state_for_delete_last
+            let cleared = state_for_clear
                 .editor
                 .lock()
                 .expect("annotation editor lock")
                 .as_mut()
-                .is_some_and(AnnotationEditor::delete_last);
-            if deleted {
+                .is_some_and(AnnotationEditor::clear_annotations);
+            if cleared {
                 update_preview_if_possible(
                     &overlay,
-                    &state_for_delete_last.crop,
-                    &state_for_delete_last.editor,
+                    &state_for_clear.crop,
+                    &state_for_clear.editor,
                 );
-                overlay.set_export_status("Last annotation deleted. Undo is available.".into());
+                overlay.set_export_status("All annotations cleared. Undo is available.".into());
             }
             overlay.invoke_focus_selection();
         }
@@ -2097,11 +2637,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let weak_overlay = overlay.as_weak();
     let state_for_size = selection.clone();
-    overlay.on_annotation_size_adjusted(move |direction| {
+    overlay.on_annotation_size_level_selected(move |value| {
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
-        let size = {
+        let Some(level) = AnnotationSizeLevel::from_ui(value) else {
+            return;
+        };
+        let size_level = {
             let mut guard = state_for_size
                 .editor
                 .lock()
@@ -2109,14 +2652,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(editor) = guard.as_mut() else {
                 return;
             };
-            let step = if editor.active_tool() == AnnotationTool::Text {
-                2.0
-            } else {
-                1.0
-            };
-            editor.set_active_size(editor.active_size() + f64::from(direction) * step)
+            editor.set_active_size_level(level);
+            editor.active_size_level().as_ui()
         };
-        overlay.set_annotation_size(size.round() as i32);
+        overlay.set_annotation_size(size_level);
         update_preview_if_possible(&overlay, &state_for_size.crop, &state_for_size.editor);
         overlay.invoke_focus_selection();
     });
@@ -2357,66 +2896,123 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             update_preview_if_possible(&overlay, &state_for_redo.crop, &state_for_redo.editor);
         }
     });
-    let weak_overlay = overlay.as_weak();
-    let state_for_save = selection.clone();
-    let state_for_save_completion = selection.clone();
-    let busy_for_save = export_busy.clone();
-    let notification_owner_for_save = clipboard_owner_hwnd.clone();
-    overlay.on_save_png(move || {
-        platform::trace_event("export.save_png.callback");
-        let Some(overlay) = weak_overlay.upgrade() else {
+
+    let weak_overlay_for_ocr = overlay.as_weak();
+    let state_for_ocr = selection.clone();
+    let busy_for_ocr = export_busy.clone();
+    let clipboard_owner_for_ocr = clipboard_owner_hwnd.clone();
+    overlay.on_recognize_text(move || {
+        let Some(overlay) = weak_overlay_for_ocr.upgrade() else {
             return;
         };
-        if state_for_save
+        if state_for_ocr
             .text_position
             .lock()
             .expect("pending text position lock")
             .is_some()
         {
-            overlay.set_export_status("Add or cancel the current text before saving.".into());
+            overlay.set_export_status(
+                "Add or cancel the current text before recognizing text.".into(),
+            );
             return;
         }
-        let (crop, annotations) =
-            match annotation_snapshot(&state_for_save.crop, &state_for_save.editor) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    overlay.set_export_status(format!("Could not save screenshot: {error}").into());
-                    return;
-                }
-            };
-        let path = match platform::save_png_dialog() {
-            Ok(Some(path)) => path,
-            Ok(None) => {
-                overlay
-                    .set_export_status("Save cancelled. The capture session is unchanged.".into());
-                return;
-            }
-            Err(error) => {
-                overlay.set_export_status(format!("Save As failed: {error}").into());
+        let crop = match state_for_ocr
+            .crop
+            .lock()
+            .expect("selected crop lock")
+            .clone()
+        {
+            Some(crop) => crop,
+            None => {
+                overlay.set_export_status("There is no crop to recognize yet.".into());
                 return;
             }
         };
-        let notification_owner = notification_owner_for_save.load(Ordering::Acquire);
-        start_export_operation(
+        if busy_for_ocr
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            overlay.set_export_status("Another export or OCR operation is already running.".into());
+            return;
+        }
+        overlay.set_export_busy(true);
+        overlay.set_export_status("Recognizing text locally…".into());
+        let owner_hwnd = clipboard_owner_for_ocr.load(Ordering::Acquire);
+        let weak_overlay = overlay.as_weak();
+        let busy_for_dispatch = busy_for_ocr.clone();
+        thread::spawn(move || {
+            let recognized = normalize_result(platform::recognize_text(&crop));
+            let completion = complete_ocr(recognized, |text| {
+                platform::copy_text_to_clipboard(text, owner_hwnd)
+            });
+            let (status, notification) = match completion {
+                OcrCompletion::Copied { notification, .. } => (
+                    "Recognized text was copied to the clipboard.".to_owned(),
+                    Some(notification),
+                ),
+                OcrCompletion::Empty { notification } => (
+                    "No text was found in the selected crop.".to_owned(),
+                    Some(notification),
+                ),
+                OcrCompletion::Error(error) => (format!("OCR failed: {error}"), None),
+            };
+            let notification_error = notification
+                .and_then(|message| platform::show_notification(message, owner_hwnd).err());
+            let busy_for_error = busy_for_dispatch.clone();
+            let dispatched = slint::invoke_from_event_loop(move || {
+                if let Some(overlay) = weak_overlay.upgrade() {
+                    let message = notification_error
+                        .map(|error| format!("{status} Notification failed: {error}"))
+                        .unwrap_or(status);
+                    overlay.set_export_busy(false);
+                    overlay.set_export_status(message.into());
+                }
+                busy_for_dispatch.store(false, Ordering::Release);
+            });
+            if let Err(error) = dispatched {
+                busy_for_error.store(false, Ordering::Release);
+                log::error!("Could not return OCR results to the UI thread: {error}");
+            }
+        });
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_save = selection.clone();
+    let busy_for_save = export_busy.clone();
+    let notification_owner_for_save = clipboard_owner_hwnd.clone();
+    let settings_for_save = application_settings.clone();
+    overlay.on_save_png(move || {
+        platform::trace_event("export.save_as.callback");
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        request_save(
             &overlay,
-            busy_for_save.clone(),
-            "Saving PNG…",
-            ExportKind::Save,
-            notification_owner,
-            move || {
-                let rendered = annotation_render::render_composite(&crop, &annotations)
-                    .map_err(str::to_owned)?;
-                crate::core::export::write_png(&path, &rendered)?;
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "screenshot.png".into());
-                Ok(format!("Saved {name}"))
-            },
-            {
-                let state = state_for_save_completion.clone();
-                move |overlay| close_capture_after_export(overlay, &state, "saved")
-            },
+            &state_for_save,
+            Arc::clone(&busy_for_save),
+            Arc::clone(&notification_owner_for_save),
+            Arc::clone(&settings_for_save),
+            true,
+        );
+    });
+
+    let weak_overlay = overlay.as_weak();
+    let state_for_default_save = selection.clone();
+    let busy_for_default_save = export_busy.clone();
+    let notification_owner_for_default_save = clipboard_owner_hwnd.clone();
+    let settings_for_default_save = application_settings.clone();
+    overlay.on_save_default_png(move || {
+        platform::trace_event("export.save_default.callback");
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        request_save(
+            &overlay,
+            &state_for_default_save,
+            Arc::clone(&busy_for_default_save),
+            Arc::clone(&notification_owner_for_default_save),
+            Arc::clone(&settings_for_default_save),
+            false,
         );
     });
 
@@ -2425,29 +3021,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_for_copy_completion = selection.clone();
     let busy_for_copy = export_busy.clone();
     let clipboard_owner_for_copy = clipboard_owner_hwnd.clone();
+    let settings_for_copy = application_settings.clone();
     overlay.on_copy_image(move || {
         platform::trace_event("export.copy_image.callback");
         let Some(overlay) = weak_overlay.upgrade() else {
             return;
         };
+        let owner_hwnd = clipboard_owner_for_copy.load(Ordering::Acquire);
+        let notifications_enabled = settings_for_copy
+            .lock()
+            .expect("application settings lock")
+            .notifications_enabled;
+        if state_for_copy.closing.load(Ordering::Acquire) {
+            return;
+        }
         if state_for_copy
             .text_position
             .lock()
             .expect("pending text position lock")
             .is_some()
         {
-            overlay.set_export_status("Add or cancel the current text before copying.".into());
+            report_copy_failure("Add or cancel the current text before copying.", owner_hwnd);
             return;
         }
         let (crop, annotations) =
             match annotation_snapshot(&state_for_copy.crop, &state_for_copy.editor) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    overlay.set_export_status(format!("Could not copy screenshot: {error}").into());
+                    report_copy_failure(&error, owner_hwnd);
                     return;
                 }
             };
-        let owner_hwnd = clipboard_owner_for_copy.load(Ordering::Acquire);
         start_export_operation(
             &overlay,
             busy_for_copy.clone(),
@@ -2458,13 +3062,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rendered = annotation_render::render_composite(&crop, &annotations)
                     .map_err(str::to_owned)?;
                 platform::copy_image_to_clipboard(&rendered, owner_hwnd)?;
-                Ok("Image copied to clipboard".into())
+                Ok(ExportSuccess {
+                    message: "Image copied to clipboard".into(),
+                    preview: rendered,
+                })
             },
             {
                 let state = state_for_copy_completion.clone();
-                move |overlay| close_capture_after_export(overlay, &state, "copied")
+                move |overlay, success: ExportSuccess, message| {
+                    close_capture_after_export(
+                        overlay,
+                        &state,
+                        "copied",
+                        PendingExportNotification {
+                            message,
+                            preview: success.preview,
+                            owner_hwnd,
+                            enabled: notifications_enabled,
+                        },
+                    )
+                }
             },
         );
+    });
+
+    let weak_overlay = overlay.as_weak();
+    overlay.on_overlay_shortcut_requested(move |key, control, shift, text_editor_active| {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        match overlay_shortcut(key.as_str(), control, shift, text_editor_active) {
+            Some(OverlayShortcut::Copy) => overlay.invoke_copy_image(),
+            Some(OverlayShortcut::SaveDefault) => overlay.invoke_save_default_png(),
+            Some(OverlayShortcut::SaveAs) => overlay.invoke_save_png(),
+            None => {}
+        }
     });
 
     #[cfg(target_os = "windows")]
@@ -2478,56 +3110,133 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .on_close_requested(|| slint::CloseRequestResponse::HideWindow);
 
     #[cfg(target_os = "windows")]
-    let tray_service = {
+    {
         let weak_overlay = overlay.as_weak();
+        let weak_settings = settings_window.as_weak();
+        let settings_for_tray = application_settings.clone();
+        let startup_hotkey = application_settings
+            .lock()
+            .expect("application settings lock")
+            .capture_shortcut;
         platform::trace_event("main.tray_start.before");
-        let service = platform::tray::TrayService::start(move |command: TrayCommand| {
-            let weak_overlay = weak_overlay.clone();
-            platform::trace_event(&format!(
-                "tray.command.dispatch_to_slint command={command:?}"
-            ));
-            if let Err(error) = slint::invoke_from_event_loop(move || {
-                platform::trace_event(&format!("tray.command.slint_callback command={command:?}"));
-                match command.action() {
-                    AppAction::StartCapture => {
-                        platform::trace_event("tray.action.start_capture");
-                        if let Some(overlay) = weak_overlay.upgrade() {
-                            overlay.invoke_request_capture();
+        let service = platform::tray::TrayService::start(
+            move |command: TrayCommand| {
+                let weak_overlay = weak_overlay.clone();
+                let weak_settings = weak_settings.clone();
+                let settings_for_tray = settings_for_tray.clone();
+                platform::trace_event(&format!(
+                    "tray.command.dispatch_to_slint command={command:?}"
+                ));
+                if let Err(error) = slint::invoke_from_event_loop(move || {
+                    platform::trace_event(&format!(
+                        "tray.command.slint_callback command={command:?}"
+                    ));
+                    match command.action() {
+                        AppAction::StartCapture => {
+                            platform::trace_event("tray.action.start_capture");
+                            if let Some(overlay) = weak_overlay.upgrade() {
+                                overlay.invoke_request_capture();
+                            }
+                        }
+                        AppAction::OpenSettings => {
+                            platform::trace_event("tray.action.open_settings");
+                            if let Some(settings_window) = weak_settings.upgrade() {
+                                if let Ok(settings) = settings_for_tray.lock() {
+                                    settings_window.set_save_directory(
+                                        settings
+                                            .save_directory
+                                            .as_ref()
+                                            .map(|path| path.display().to_string())
+                                            .unwrap_or_default()
+                                            .into(),
+                                    );
+                                    settings_window.set_capture_shortcut(
+                                        settings.capture_shortcut.display().into(),
+                                    );
+                                    settings_window.set_notifications_enabled(settings.notifications_enabled);
+                                }
+                                settings_window.set_shortcut_recording(false);
+                                let background_ready = match platform::windows::prepare_settings_window(settings_window.window()) {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        log::warn!("Settings native window was not ready before show: {error}");
+                                        false
+                                    }
+                                };
+                                settings_window.window().set_minimized(false);
+                                if let Err(error) = settings_window.show() {
+                                    settings_window.set_settings_message(
+                                        format!("Could not open Settings: {error}").into(),
+                                    );
+                                } else {
+                                    let activation_ready = match platform::windows::activate_settings_window(settings_window.window()) {
+                                        Ok(()) => true,
+                                        Err(error) => {
+                                            log::warn!("Could not activate Settings immediately: {error}");
+                                            false
+                                        }
+                                    };
+                                    if !background_ready || !activation_ready {
+                                    let weak_settings = settings_window.as_weak();
+                                    slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+                                        if let Some(settings_window) = weak_settings.upgrade() {
+                                            if !background_ready {
+                                                if let Err(error) = platform::windows::prepare_settings_window(settings_window.window()) {
+                                                    log::warn!("Could not initialize the Settings background: {error}");
+                                                }
+                                            }
+                                            if !activation_ready {
+                                                if let Err(error) = platform::windows::activate_settings_window(settings_window.window()) {
+                                                    log::warn!("Could not bring Settings to the foreground: {error}");
+                                                    settings_window.set_settings_message(error.into());
+                                                }
+                                            }
+                                        }
+                                    });
+                                    }
+                                }
+                            }
+                        }
+                        AppAction::Quit => {
+                            platform::trace_event("tray.action.exit");
+                            let _ = slint::quit_event_loop();
                         }
                     }
-                    AppAction::Quit => {
-                        platform::trace_event("tray.action.exit");
-                        let _ = slint::quit_event_loop();
-                    }
+                }) {
+                    log::error!("Could not dispatch tray command {command:?}: {error}");
                 }
-            }) {
-                log::error!("Could not dispatch tray command {command:?}: {error}");
-            }
-        })
+            },
+            startup_hotkey,
+        )
         .map_err(std::io::Error::other)?;
         clipboard_owner_hwnd.store(service.native_window_handle(), Ordering::Release);
+        let shortcut_label = startup_hotkey.display();
         match service.hotkey_state() {
             core::hotkey::RegistrationState::Registered => {
-                log::info!("Tray ready; Ctrl+Shift+S starts a capture")
+                log::info!("Tray ready; {shortcut_label} starts a capture")
             }
             core::hotkey::RegistrationState::Conflict => {
-                log::warn!("Tray ready, but Ctrl+Shift+S is registered by another application")
+                log::warn!("Tray ready, but {shortcut_label} is registered by another application")
             }
             core::hotkey::RegistrationState::Failed(code) => log::warn!(
-                "Tray ready, but Ctrl+Shift+S registration failed with Windows error {code}"
+                "Tray ready, but {shortcut_label} registration failed with Windows error {code}"
             ),
         }
         platform::trace_event(&format!(
             "main.tray_start.after hwnd=0x{:X}",
             service.native_window_handle() as usize
         ));
-        Some(service)
-    };
+        *tray_service_slot.lock().expect("tray service slot lock") = Some(service);
+    }
 
     platform::trace_event("event_loop.first_callback.queue.before");
     let weak_overlay_startup = overlay.as_weak();
     let first_callback_result = slint::invoke_from_event_loop(move || {
         platform::trace_event("event_loop.initialized");
+        platform::trace_event(&format!(
+            "perf.startup.to_event_loop elapsed_ms={}",
+            startup_started.elapsed().as_millis()
+        ));
         if let Some(overlay) = weak_overlay_startup.upgrade() {
             platform::trace_slint_native_handle(
                 "Overlay",
@@ -2550,8 +3259,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "main.event_loop.returned result={event_loop_result:?}"
     ));
     event_loop_result?;
-    #[cfg(target_os = "windows")]
-    drop(tray_service);
     platform::trace_event("main.after_event_loop");
     platform::trace_event("main.before_overlay_component_drop");
     Ok(())
@@ -2607,7 +3314,7 @@ mod toolbar_layout_tests {
             Some(selection(120.0, 560.0, 240.0, 100.0)),
             viewport(900.0, 700.0),
         );
-        assert_eq!(layout.y, 488.0);
+        assert_eq!(layout.y, 514.0);
         assert!(!layout.forced_inside);
     }
 
@@ -2627,7 +3334,7 @@ mod toolbar_layout_tests {
             Some(selection(700.0, 0.0, 100.0, 600.0)),
             viewport(900.0, 600.0),
         );
-        assert_eq!((layout.x, layout.y), (220.0, 0.0));
+        assert_eq!((layout.x, layout.y), (226.0, 0.0));
         assert!(!layout.forced_inside);
     }
 
@@ -2652,8 +3359,8 @@ mod toolbar_layout_tests {
             (-50.0, 590.0),
         ] {
             let (x, y) = clamp_toolbar_position(x, y, viewport, 1.0);
-            assert!((0.0..=328.0).contains(&x));
-            assert!((0.0..=536.0).contains(&y));
+            assert!((0.0..=334.0).contains(&x));
+            assert!((0.0..=562.0).contains(&y));
         }
     }
 
@@ -2666,6 +3373,11 @@ mod toolbar_layout_tests {
         assert!(layout.y >= 0.0);
         assert!(layout.x + TOOLBAR_DESIGN_WIDTH * layout.scale <= viewport.width);
         assert!(layout.y + TOOLBAR_DESIGN_HEIGHT * layout.scale <= viewport.height);
+    }
+
+    #[test]
+    fn toolbar_design_dimensions_match_the_slint_toolbar_bounds() {
+        assert_eq!(toolbar_scale_for_viewport(viewport(466.0, 38.0)), 1.0);
     }
 
     #[test]
@@ -2698,12 +3410,19 @@ mod toolbar_layout_tests {
     }
 
     #[test]
-    fn crop_move_band_is_inside_the_perimeter_and_not_the_drawing_interior() {
-        let crop = selection(20.0, 30.0, 200.0, 120.0);
-        assert!(selection_move_band_contains(crop, 80.0, 35.0));
-        assert!(selection_move_band_contains(crop, 25.0, 90.0));
-        assert!(!selection_move_band_contains(crop, 100.0, 90.0));
-        assert!(!selection_move_band_contains(crop, 10.0, 90.0));
+    fn crop_move_requires_control_without_changing_other_pointer_gestures() {
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(crop_move_modifier(true, false));
+            assert!(!crop_move_modifier(false, true));
+            assert!(!crop_move_modifier(false, false));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(crop_move_modifier(false, true));
+            assert!(!crop_move_modifier(true, false));
+            assert!(!crop_move_modifier(false, false));
+        }
     }
 
     #[test]

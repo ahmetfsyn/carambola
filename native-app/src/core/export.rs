@@ -42,6 +42,17 @@ pub fn ensure_png_extension(mut path: PathBuf) -> Result<PathBuf, String> {
     }
 }
 
+pub fn default_screenshot_path(
+    directory: &Path,
+    unix_nanos: u128,
+    process_id: u32,
+    sequence: u64,
+) -> PathBuf {
+    directory.join(format!(
+        "Carambola Screenshot-{unix_nanos}-{process_id}-{sequence}.png"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{encode_png, ensure_png_extension, write_png};
@@ -137,5 +148,23 @@ mod tests {
             ensure_png_extension(PathBuf::from("screenshot.PNG")).unwrap(),
             PathBuf::from("screenshot.PNG")
         );
+    }
+
+    #[test]
+    fn default_save_path_is_in_the_configured_directory_and_unique_per_sequence() {
+        let directory = PathBuf::from("screenshots");
+        let first = super::default_screenshot_path(&directory, 123, 456, 1);
+        let second = super::default_screenshot_path(&directory, 123, 456, 2);
+        assert_eq!(first.parent(), Some(directory.as_path()));
+        assert_eq!(
+            first.extension().and_then(|extension| extension.to_str()),
+            Some("png")
+        );
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("Carambola Screenshot-"));
     }
 }

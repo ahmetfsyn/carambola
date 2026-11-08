@@ -6,6 +6,231 @@ use windows::Win32::UI::HiDpi::{
 
 use crate::core::frame::CapturedFrame;
 
+/// Resolve a recorded logical character to the virtual key used by the
+/// foreground thread's active keyboard layout. RegisterHotKey only accepts a
+/// virtual key, while Slint records the character the user actually pressed.
+pub fn resolve_hotkey_for_foreground_layout(
+    shortcut: crate::core::hotkey::HotkeyConfig,
+) -> Result<crate::core::hotkey::HotkeyConfig, String> {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::{
+            Input::KeyboardAndMouse::{GetKeyboardLayout, VkKeyScanExW},
+            WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
+        },
+    };
+
+    shortcut.validate().map_err(str::to_owned)?;
+    if shortcut.key_character == 0 {
+        return Ok(shortcut);
+    }
+    let character = char::from_u32(shortcut.key_character)
+        .ok_or_else(|| "The selected shortcut character is invalid".to_string())?;
+    let mut utf16 = [0u16; 2];
+    let encoded = character.encode_utf16(&mut utf16);
+    if encoded.len() != 1 {
+        return Err("This character has no Windows virtual-key mapping".into());
+    }
+
+    let foreground = unsafe { GetForegroundWindow() };
+    let foreground_thread = unsafe { GetWindowThreadProcessId(HWND(foreground.0), None) };
+    let layout = unsafe { GetKeyboardLayout(foreground_thread) };
+    let mapping = unsafe { VkKeyScanExW(encoded[0], layout) };
+    if mapping == -1 {
+        return Err(format!(
+            "The active keyboard layout cannot map {character:?} to a key"
+        ));
+    }
+    let mapping = mapping as u16;
+    let virtual_key = u32::from(mapping & 0x00ff);
+    let required = ((mapping >> 8) & 0x00ff) as u8;
+    let required_modifiers = (if required & 0x01 != 0 {
+        crate::core::hotkey::MOD_SHIFT
+    } else {
+        0
+    }) | (if required & 0x02 != 0 {
+        crate::core::hotkey::MOD_CONTROL
+    } else {
+        0
+    }) | (if required & 0x04 != 0 {
+        crate::core::hotkey::MOD_ALT
+    } else {
+        0
+    });
+    if required_modifiers & !shortcut.modifiers != 0 {
+        let mut required_names = Vec::new();
+        if required_modifiers & crate::core::hotkey::MOD_CONTROL != 0 {
+            required_names.push("Ctrl");
+        }
+        if required_modifiers & crate::core::hotkey::MOD_SHIFT != 0 {
+            required_names.push("Shift");
+        }
+        if required_modifiers & crate::core::hotkey::MOD_ALT != 0 {
+            required_names.push("Alt");
+        }
+        return Err(format!(
+            "The active keyboard layout requires {} to type {character:?}; include those modifiers in the shortcut",
+            required_names.join("+")
+        ));
+    }
+    let mut resolved = shortcut;
+    resolved.virtual_key = virtual_key;
+    Ok(resolved)
+}
+
+/// Resolve the Settings HWND directly from Slint so a similarly titled window
+/// in another process cannot receive window operations.
+fn settings_hwnd(window: &slint::Window) -> Result<windows::Win32::Foundation::HWND, String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::GetWindowThreadProcessId};
+
+    let handle = window.window_handle();
+    let raw = handle
+        .window_handle()
+        .map_err(|error| format!("Settings HWND is not ready: {error}"))?;
+    let RawWindowHandle::Win32(raw) = raw.as_raw() else {
+        return Err("Settings has no Windows HWND".into());
+    };
+    let hwnd = HWND(raw.hwnd.get() as *mut _);
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid != std::process::id() {
+        return Err("Settings HWND does not belong to Carambola".into());
+    }
+    Ok(hwnd)
+}
+
+fn settings_icon_handles() -> Result<(isize, isize), String> {
+    use std::sync::OnceLock;
+    use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+    static ICONS: OnceLock<Result<(isize, isize), String>> = OnceLock::new();
+    ICONS
+        .get_or_init(|| {
+            let small = crate::platform::tray::create_carambola_window_icon(16, 16)?;
+            let big = match crate::platform::tray::create_carambola_window_icon(32, 32) {
+                Ok(icon) => icon,
+                Err(error) => {
+                    let _ = unsafe { DestroyIcon(small) };
+                    return Err(error);
+                }
+            };
+            Ok((small.0 as isize, big.0 as isize))
+        })
+        .clone()
+}
+
+unsafe extern "system" fn settings_background_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    subclass_id: usize,
+    first_paint_done: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::{
+        Foundation::{COLORREF, LRESULT, RECT},
+        Graphics::Gdi::{
+            CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC, HBRUSH, HDC, HGDIOBJ,
+        },
+        UI::{
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            WindowsAndMessaging::{GetClientRect, WM_ERASEBKGND, WM_NCDESTROY, WM_PAINT},
+        },
+    };
+    let paint_background = |dc: HDC| {
+        let mut rect = RECT::default();
+        if GetClientRect(hwnd, &mut rect).is_ok() {
+            let brush: HBRUSH = CreateSolidBrush(COLORREF(0x0020_120B));
+            let painted = FillRect(dc, &rect, brush) != 0;
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+            return painted;
+        }
+        false
+    };
+    if message == WM_ERASEBKGND && paint_background(HDC(wparam.0 as *mut _)) {
+        return LRESULT(1);
+    }
+    if message == WM_PAINT && first_paint_done == 0 {
+        let dc = GetDC(Some(hwnd));
+        let _ = paint_background(dc);
+        let _ = ReleaseDC(Some(hwnd), dc);
+        let _ = SetWindowSubclass(hwnd, Some(settings_background_proc), subclass_id, 1);
+    }
+    if message == WM_NCDESTROY {
+        let _ = RemoveWindowSubclass(hwnd, Some(settings_background_proc), subclass_id);
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+/// Give the hidden Settings HWND the same dark initial client/title background
+/// as its Slint component before Windows makes it visible.
+pub fn prepare_settings_window(window: &slint::Window) -> Result<(), String> {
+    use windows::Win32::{
+        Foundation::COLORREF,
+        Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR},
+        UI::{
+            Shell::SetWindowSubclass,
+            WindowsAndMessaging::{SendMessageW, ICON_BIG, ICON_SMALL, ICON_SMALL2, WM_SETICON},
+        },
+    };
+    let hwnd = settings_hwnd(window)?;
+    let (small_icon, big_icon) = settings_icon_handles()?;
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(windows::Win32::Foundation::WPARAM(ICON_SMALL as usize)),
+            Some(windows::Win32::Foundation::LPARAM(small_icon)),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(windows::Win32::Foundation::WPARAM(ICON_SMALL2 as usize)),
+            Some(windows::Win32::Foundation::LPARAM(small_icon)),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(windows::Win32::Foundation::WPARAM(ICON_BIG as usize)),
+            Some(windows::Win32::Foundation::LPARAM(big_icon)),
+        );
+    }
+    if !unsafe { SetWindowSubclass(hwnd, Some(settings_background_proc), 1, 0) }.as_bool() {
+        return Err(format!(
+            "Could not set the initial Settings background (Windows error {})",
+            unsafe { windows::Win32::Foundation::GetLastError().0 }
+        ));
+    }
+    let color = COLORREF(0x0020_120B);
+    if let Err(error) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &color as *const _ as *const _,
+            std::mem::size_of_val(&color) as u32,
+        )
+    } {
+        log::warn!("Could not set the Settings title background: {error}");
+    }
+    Ok(())
+}
+
+pub fn activate_settings_window(window: &slint::Window) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+    let hwnd = settings_hwnd(window)?;
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
+    unsafe { BringWindowToTop(hwnd) }
+        .map_err(|error| format!("Could not raise Settings: {error}"))?;
+    if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        return Err("Windows did not allow Settings to take foreground focus".into());
+    }
+    Ok(())
+}
+
 fn find_app_window(
     title: windows::core::PCWSTR,
 ) -> Result<windows::Win32::Foundation::HWND, String> {
@@ -25,7 +250,9 @@ fn find_app_window(
 }
 
 /// Display the standard Windows Save As dialog for a PNG file.
-pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
+pub fn save_png_dialog(
+    default_directory: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
     use std::{os::windows::ffi::OsStringExt, path::PathBuf};
     use windows::{
         core::{w, PCWSTR, PWSTR},
@@ -47,6 +274,14 @@ pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
     let title = "Save annotated screenshot as PNG\0"
         .encode_utf16()
         .collect::<Vec<_>>();
+    let initial_directory = default_directory
+        .filter(|path| path.is_dir())
+        .and_then(|path| path.to_str())
+        .map(|path| {
+            path.encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>()
+        });
     let default_extension = w!("png");
     let mut dialog = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
@@ -56,6 +291,9 @@ pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
         lpstrFile: PWSTR(file_name.as_mut_ptr()),
         nMaxFile: file_name.len() as u32,
         lpstrTitle: PCWSTR(title.as_ptr()),
+        lpstrInitialDir: initial_directory
+            .as_ref()
+            .map_or(PCWSTR::null(), |path| PCWSTR(path.as_ptr())),
         Flags: OFN_EXPLORER
             | OFN_PATHMUSTEXIST
             | OFN_OVERWRITEPROMPT
@@ -83,6 +321,86 @@ pub fn save_png_dialog() -> Result<Option<std::path::PathBuf>, String> {
         .unwrap_or(file_name.len());
     let path = PathBuf::from(std::ffi::OsString::from_wide(&file_name[..length]));
     Ok(Some(crate::core::export::ensure_png_extension(path)?))
+}
+
+/// Display a native folder browser for the default screenshot directory.
+pub fn pick_save_directory(
+    initial_directory: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    use std::{os::windows::ffi::OsStringExt, path::PathBuf};
+    use windows::{
+        core::{w, PCWSTR, PWSTR},
+        Win32::{
+            Foundation::{HWND, LPARAM, WPARAM},
+            System::Com::CoTaskMemFree,
+            UI::Shell::{
+                SHBrowseForFolderW, SHGetPathFromIDListW, BFFM_INITIALIZED, BFFM_SETSELECTIONW,
+                BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW,
+            },
+            UI::WindowsAndMessaging::SendMessageW,
+        },
+    };
+
+    unsafe extern "system" fn initialize_folder_picker(
+        dialog: HWND,
+        message: u32,
+        _parameter: LPARAM,
+        initial_path: LPARAM,
+    ) -> i32 {
+        if message == BFFM_INITIALIZED {
+            let path = initial_path.0 as *const u16;
+            if !path.is_null() {
+                let _ = SendMessageW(
+                    dialog,
+                    BFFM_SETSELECTIONW,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(path as isize)),
+                );
+            }
+        }
+        0
+    }
+
+    let owner = find_app_window(w!("Carambola Settings"))?;
+    let title = "Choose the default screenshot save folder"
+        .encode_utf16()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let initial = initial_directory
+        .filter(|path| path.is_dir())
+        .and_then(|path| path.to_str())
+        .map(|path| path.encode_utf16().chain([0]).collect::<Vec<_>>());
+    let mut display_name = [0u16; 32_768];
+    let mut info = BROWSEINFOW {
+        hwndOwner: owner,
+        pszDisplayName: PWSTR(display_name.as_mut_ptr()),
+        lpszTitle: PCWSTR(title.as_ptr()),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        lpfn: initial.as_ref().map(|_| {
+            initialize_folder_picker as unsafe extern "system" fn(HWND, u32, LPARAM, LPARAM) -> i32
+        }),
+        lParam: initial
+            .as_ref()
+            .map_or(LPARAM(0), |path| LPARAM(path.as_ptr() as isize)),
+        ..Default::default()
+    };
+    let selected = unsafe { SHBrowseForFolderW(&mut info) };
+    if selected.is_null() {
+        return Ok(None);
+    }
+    let mut path_buffer = [0u16; 260];
+    let copied = unsafe { SHGetPathFromIDListW(selected, &mut path_buffer) }.as_bool();
+    unsafe { CoTaskMemFree(Some(selected.cast())) };
+    if !copied {
+        return Err("Windows could not read the selected save folder path".into());
+    }
+    let length = path_buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(path_buffer.len());
+    Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(
+        &path_buffer[..length],
+    ))))
 }
 
 struct ClipboardMemory(Option<windows::Win32::Foundation::HGLOBAL>);
@@ -176,6 +494,103 @@ pub fn copy_image_to_clipboard(frame: &CapturedFrame, owner_hwnd: isize) -> Resu
         .map_err(|error| format!("Could not copy the image to the Windows clipboard: {error}"))?;
     allocation.transfer_to_clipboard();
     clipboard.close()
+}
+
+pub fn copy_text_to_clipboard(text: &str, owner_hwnd: isize) -> Result<(), String> {
+    use std::ptr::copy_nonoverlapping;
+    use windows::Win32::{
+        Foundation::{HANDLE, HWND},
+        System::{
+            DataExchange::{EmptyClipboard, SetClipboardData},
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+        },
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
+    };
+
+    if owner_hwnd == 0 {
+        return Err("Clipboard owner window is unavailable".into());
+    }
+    let owner = HWND(owner_hwnd as *mut std::ffi::c_void);
+    if !unsafe { IsWindow(Some(owner)) }.as_bool() {
+        return Err("Clipboard owner HWND is no longer valid".into());
+    }
+    let mut owner_process_id = 0u32;
+    unsafe { GetWindowThreadProcessId(owner, Some(&mut owner_process_id)) };
+    if owner_process_id != std::process::id() {
+        return Err("Clipboard owner HWND belongs to another process".into());
+    }
+
+    let wide = text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let size = wide.len() * std::mem::size_of::<u16>();
+    let allocation = unsafe { GlobalAlloc(GMEM_MOVEABLE, size) }
+        .map_err(|error| format!("Could not allocate clipboard text memory: {error}"))?;
+    let mut allocation = ClipboardMemory::new(allocation);
+    let destination = unsafe { GlobalLock(allocation.handle()) };
+    if destination.is_null() {
+        return Err("Could not lock clipboard text memory".into());
+    }
+    unsafe { copy_nonoverlapping(wide.as_ptr(), destination.cast::<u16>(), wide.len()) };
+    let _ = unsafe { GlobalUnlock(allocation.handle()) };
+
+    let clipboard = ClipboardLock::open(owner)?;
+    unsafe { EmptyClipboard() }
+        .map_err(|error| format!("Could not clear the Windows clipboard: {error}"))?;
+    unsafe { SetClipboardData(13, Some(HANDLE(allocation.handle().0))) }.map_err(|error| {
+        format!("Could not copy recognized text to the Windows clipboard: {error}")
+    })?;
+    allocation.transfer_to_clipboard();
+    clipboard.close()
+}
+
+pub fn recognize_text(frame: &CapturedFrame) -> Result<String, String> {
+    use windows::{
+        Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap},
+        Media::Ocr::OcrEngine,
+        Storage::Streams::DataWriter,
+    };
+
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
+        .map_err(|error| format!("Could not initialize Windows OCR: {error}. Install an OCR language pack in Windows Settings."))?;
+    let writer =
+        DataWriter::new().map_err(|error| format!("Could not create OCR pixel buffer: {error}"))?;
+    writer
+        .WriteBytes(frame.pixels())
+        .map_err(|error| format!("Could not prepare pixels for OCR: {error}"))?;
+    let buffer = writer
+        .DetachBuffer()
+        .map_err(|error| format!("Could not prepare pixels for OCR: {error}"))?;
+    let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+        &buffer,
+        BitmapPixelFormat::Rgba8,
+        frame.width() as i32,
+        frame.height() as i32,
+    )
+    .map_err(|error| format!("Could not create an OCR bitmap: {error}"))?;
+    let result = engine
+        .RecognizeAsync(&bitmap)
+        .map_err(|error| format!("Windows OCR could not start: {error}"))?
+        .join()
+        .map_err(|error| format!("Windows OCR failed: {error}"))?;
+    let lines = result
+        .Lines()
+        .map_err(|error| format!("Could not read Windows OCR output: {error}"))?;
+    let mut text = String::new();
+    for line in lines {
+        let line = line
+            .Text()
+            .map_err(|error| format!("Could not read a Windows OCR line: {error}"))?;
+        let line = line.to_string_lossy();
+        if !line.trim().is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&line);
+        }
+    }
+    Ok(text)
 }
 
 /// Record what Windows reports inside the application's UI thread. This is
@@ -588,6 +1003,16 @@ mod tests {
     use super::enumerate_displays;
     use crate::core::display::select_display;
     use std::collections::HashSet;
+
+    #[test]
+    fn settings_icon_uses_the_embedded_carambola_ico() {
+        let icon = image::load_from_memory_with_format(
+            include_bytes!("../../assets/carambola.ico"),
+            image::ImageFormat::Ico,
+        )
+        .expect("the Settings window icon must be decodable");
+        assert!(icon.width() > 0 && icon.height() > 0);
+    }
 
     #[test]
     fn win32_monitor_enumeration_metadata_and_selection_are_consistent() {

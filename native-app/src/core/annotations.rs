@@ -231,6 +231,48 @@ impl AnnotationTool {
     }
 }
 
+/// One of the five annotation sizes shown in the toolbar. The selected level
+/// is shared across vector and text tools, while each maps it to its own
+/// physical-pixel size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnnotationSizeLevel(u8);
+
+impl AnnotationSizeLevel {
+    pub const DEFAULT: Self = Self(3);
+
+    pub const fn from_ui(value: i32) -> Option<Self> {
+        if value >= 1 && value <= 5 {
+            Some(Self(value as u8))
+        } else {
+            None
+        }
+    }
+
+    pub const fn as_ui(self) -> i32 {
+        self.0 as i32
+    }
+
+    pub const fn physical_pixels(self, tool: AnnotationTool) -> f64 {
+        const VECTOR: [f64; 5] = [3.0, 5.0, 8.0, 12.0, 18.0];
+        const TEXT: [f64; 5] = [16.0, 22.0, 30.0, 40.0, 56.0];
+        match tool {
+            AnnotationTool::Text => TEXT[self.0 as usize - 1],
+            _ => VECTOR[self.0 as usize - 1],
+        }
+    }
+
+    pub fn closest_for(tool: AnnotationTool, pixels: f64) -> Self {
+        (1..=5)
+            .map(Self)
+            .min_by(|left, right| {
+                (left.physical_pixels(tool) - pixels)
+                    .abs()
+                    .total_cmp(&(right.physical_pixels(tool) - pixels).abs())
+            })
+            .unwrap_or(Self::DEFAULT)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AnnotationGeometry {
     Pen {
@@ -381,6 +423,7 @@ enum AnnotationAction {
         after: Annotation,
     },
     Deleted(Annotation),
+    Cleared(Vec<Annotation>),
 }
 
 impl AnnotationDocument {
@@ -469,6 +512,18 @@ impl AnnotationDocument {
         true
     }
 
+    /// Remove all committed annotations as one undoable document operation.
+    pub fn clear(&mut self) -> bool {
+        if self.annotations.is_empty() {
+            return false;
+        }
+        self.history.truncate(self.cursor);
+        let cleared = std::mem::take(&mut self.annotations);
+        self.history.push(AnnotationAction::Cleared(cleared));
+        self.cursor += 1;
+        true
+    }
+
     pub fn edit_text(
         &mut self,
         id: u64,
@@ -539,6 +594,11 @@ impl AnnotationDocument {
                 }
             }
             AnnotationAction::Deleted(annotation) => self.insert_ordered(annotation),
+            AnnotationAction::Cleared(annotations) => {
+                for annotation in annotations {
+                    self.insert_ordered(annotation);
+                }
+            }
         }
         self.cursor -= 1;
         true
@@ -567,6 +627,14 @@ impl AnnotationDocument {
                 {
                     self.annotations.remove(index);
                 }
+            }
+            AnnotationAction::Cleared(annotations) => {
+                let cleared_ids = annotations
+                    .iter()
+                    .map(|annotation| annotation.id)
+                    .collect::<Vec<_>>();
+                self.annotations
+                    .retain(|annotation| !cleared_ids.contains(&annotation.id));
             }
         }
         self.cursor += 1;
@@ -628,7 +696,7 @@ pub struct TextAnnotationDraft {
 }
 
 /// Edits annotation vectors independently of the screenshot buffer.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AnnotationEditor {
     document: AnnotationDocument,
     active_tool: AnnotationTool,
@@ -636,6 +704,26 @@ pub struct AnnotationEditor {
     active_text_style: TextStyle,
     draft: Option<Draft>,
     text_draft: Option<TextAnnotationDraft>,
+    size_level: AnnotationSizeLevel,
+}
+
+impl Default for AnnotationEditor {
+    fn default() -> Self {
+        let size_level = AnnotationSizeLevel::DEFAULT;
+        let mut active_stroke_style = StrokeStyle::default();
+        active_stroke_style.width = size_level.physical_pixels(AnnotationTool::Pen);
+        let mut active_text_style = TextStyle::default();
+        active_text_style.font_size = size_level.physical_pixels(AnnotationTool::Text);
+        Self {
+            document: AnnotationDocument::default(),
+            active_tool: AnnotationTool::default(),
+            active_stroke_style,
+            active_text_style,
+            draft: None,
+            text_draft: None,
+            size_level,
+        }
+    }
 }
 
 impl Default for AnnotationTool {
@@ -673,6 +761,22 @@ impl AnnotationEditor {
         }
     }
 
+    pub fn active_size_level(&self) -> AnnotationSizeLevel {
+        self.size_level
+    }
+
+    pub fn set_active_size_level(&mut self, level: AnnotationSizeLevel) -> f64 {
+        self.size_level = level;
+        let vector_size = level.physical_pixels(AnnotationTool::Pen);
+        let text_size = level.physical_pixels(AnnotationTool::Text);
+        self.active_stroke_style.width = vector_size;
+        self.active_text_style.font_size = text_size;
+        if let Some(draft) = self.text_draft.as_mut() {
+            draft.text_style.font_size = text_size;
+        }
+        self.active_size()
+    }
+
     /// Update the one toolbar size value using the active tool's natural unit.
     /// Vector tools use physical stroke pixels; Text uses physical font pixels.
     pub fn set_active_size(&mut self, size: f64) -> f64 {
@@ -683,6 +787,7 @@ impl AnnotationEditor {
                 self.active_text_style.font_size
             };
             self.active_text_style.font_size = size;
+            self.size_level = AnnotationSizeLevel::closest_for(self.active_tool, size);
             if let Some(draft) = self.text_draft.as_mut() {
                 draft.text_style.font_size = size;
             }
@@ -694,6 +799,7 @@ impl AnnotationEditor {
                 self.active_stroke_style.width
             };
             self.active_stroke_style.width = size;
+            self.size_level = AnnotationSizeLevel::closest_for(self.active_tool, size);
             size
         }
     }
@@ -916,6 +1022,12 @@ impl AnnotationEditor {
             return false;
         };
         self.document.delete(id)
+    }
+
+    pub fn clear_annotations(&mut self) -> bool {
+        self.draft = None;
+        self.text_draft = None;
+        self.document.clear()
     }
 
     pub fn select_tool(&mut self, tool: AnnotationTool) {
@@ -1591,6 +1703,87 @@ mod tests {
         assert!(editor.document().annotation(last).is_some());
         assert!(editor.redo());
         assert!(editor.document().annotation(last).is_none());
+    }
+
+    #[test]
+    fn clear_annotations_removes_everything_without_changing_crop_geometry_and_is_undoable() {
+        let mut editor = AnnotationEditor::default();
+        for x in [2.0, 12.0, 22.0] {
+            editor
+                .document
+                .add(
+                    AnnotationGeometry::Rectangle {
+                        bounds: ImageBounds {
+                            x,
+                            y: 2.0,
+                            width: 5.0,
+                            height: 5.0,
+                        },
+                    },
+                    StrokeStyle::default(),
+                    40,
+                    40,
+                )
+                .unwrap();
+        }
+        let before = editor.document().annotations().to_vec();
+
+        assert!(editor.clear_annotations());
+        assert!(editor.document().is_empty());
+        assert!(!editor.clear_annotations());
+        assert!(editor.undo());
+        assert_eq!(editor.document().annotations(), before);
+        assert!(editor.redo());
+        assert!(editor.document().is_empty());
+    }
+
+    #[test]
+    fn toolbar_size_levels_map_consistently_across_vector_and_text_tools() {
+        use super::{AnnotationSizeLevel, AnnotationTool};
+
+        assert_eq!(AnnotationSizeLevel::from_ui(0), None);
+        assert_eq!(AnnotationSizeLevel::from_ui(6), None);
+        let vector_sizes = [3.0, 5.0, 8.0, 12.0, 18.0];
+        let text_sizes = [16.0, 22.0, 30.0, 40.0, 56.0];
+        let default_editor = AnnotationEditor::default();
+        assert_eq!(default_editor.active_size_level().as_ui(), 3);
+        assert_eq!(default_editor.active_stroke_style().width, 8.0);
+        for value in 1..=5 {
+            let level = AnnotationSizeLevel::from_ui(value).unwrap();
+            let index = (value - 1) as usize;
+            assert_eq!(level.as_ui(), value);
+            for tool in [
+                AnnotationTool::Pen,
+                AnnotationTool::Arrow,
+                AnnotationTool::Rectangle,
+                AnnotationTool::Triangle,
+                AnnotationTool::Ellipse,
+                AnnotationTool::Mosaic,
+            ] {
+                assert_eq!(level.physical_pixels(tool), vector_sizes[index]);
+            }
+            assert_eq!(
+                level.physical_pixels(AnnotationTool::Text),
+                text_sizes[index]
+            );
+            assert_eq!(
+                AnnotationSizeLevel::closest_for(AnnotationTool::Pen, vector_sizes[index]),
+                level
+            );
+            assert_eq!(
+                AnnotationSizeLevel::closest_for(AnnotationTool::Text, text_sizes[index]),
+                level
+            );
+        }
+
+        let mut editor = AnnotationEditor::default();
+        let level = AnnotationSizeLevel::from_ui(5).unwrap();
+        assert_eq!(editor.set_active_size_level(level), 18.0);
+        editor.select_tool(AnnotationTool::Text);
+        assert_eq!(editor.set_active_size_level(level), 56.0);
+        editor.select_tool(AnnotationTool::Pen);
+        assert_eq!(editor.set_active_size_level(level), 18.0);
+        assert_eq!(editor.active_size_level(), level);
     }
 
     #[test]

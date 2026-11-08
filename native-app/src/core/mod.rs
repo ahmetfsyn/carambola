@@ -7,7 +7,10 @@ pub mod frame;
 pub mod geometry;
 pub mod hotkey;
 pub mod lifecycle;
+pub mod notification_preview;
+pub mod ocr;
 pub mod selection;
 pub mod session;
+pub mod settings;
 #[cfg(test)]
 mod workflow_test;
