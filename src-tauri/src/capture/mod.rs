@@ -211,6 +211,24 @@ fn select_monitor(monitors: &[Monitor]) -> Monitor {
         .unwrap_or_else(|| monitors[0].clone())
 }
 
+/// Returns the bounds of the monitor that would be selected for capture,
+/// without reading or encoding its pixels. Windows uses this during startup to
+/// size the hidden overlay before its first screenshot activation.
+pub fn selected_display_bounds() -> Result<DisplayBounds, String> {
+    let monitors = Monitor::all().map_err(|e| format!("Failed to enumerate monitors: {e}"))?;
+    if monitors.is_empty() {
+        return Err("No active displays found".to_string());
+    }
+
+    let monitor = select_monitor(&monitors);
+    Ok(DisplayBounds {
+        x: monitor.x() as f64,
+        y: monitor.y() as f64,
+        width: monitor.width() as f64,
+        height: monitor.height() as f64,
+    })
+}
+
 /// Grabs the monitor pixels directly into an RGBA buffer.
 ///
 /// On Windows this uses a single GDI `BitBlt` + `GetDIBits` pass. It avoids the

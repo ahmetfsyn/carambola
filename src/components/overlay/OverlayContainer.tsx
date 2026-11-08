@@ -1,7 +1,19 @@
-import React, { useRef, useState, useEffect, useLayoutEffect, useCallback } from "react";
+import React, {
+  useRef,
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Point, Rect, DragState, HandleType } from "../../types/crop";
-import { ToolType, ShapeMode, AnnotationElement } from "../../types/annotations";
+import {
+  ToolType,
+  ShapeMode,
+  AnnotationElement,
+} from "../../types/annotations";
 import {
   pointInRect,
   normalizeRect,
@@ -25,6 +37,14 @@ import { notifyScreenshotExported } from "../../lib/notifications";
 /** Duration of the close (fade-out) transition, matching the CSS transition. */
 const CLOSE_FADE_MS = 180;
 const isMac = /Mac/i.test(navigator.platform);
+const isWindows = /Win/i.test(navigator.platform);
+
+function logWindowsNotificationDiagnostic(stage: string, detail: string): void {
+  if (!isWindows) return;
+  void invoke("log_notification_diagnostic", { stage, detail }).catch((err) => {
+    console.error(`[notification] Could not persist ${stage} diagnostic:`, err);
+  });
+}
 
 function prefersReducedMotion(): boolean {
   return (
@@ -35,14 +55,12 @@ function prefersReducedMotion(): boolean {
 
 interface OverlayContainerProps {
   backgroundImage: ImageBitmap | HTMLImageElement | null;
-  scaleFactor: number;
   captureToken: number;
   presentationReady: boolean;
 }
 
 export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   backgroundImage,
-  scaleFactor,
   captureToken,
   presentationReady,
 }) => {
@@ -52,7 +70,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   // physical pixels (`css * dpr`) so the screenshot is rendered crisply at the
   // display's native resolution, while all interaction coordinates stay in CSS
   // pixels (the canvas context is scaled by `dpr` in `renderCanvas`).
-  const dpr = window.devicePixelRatio || 1;
+  const [dpr, setDpr] = useState(() => window.devicePixelRatio || 1);
 
   // Crop & interaction state
   const [crop, setCrop] = useState<Rect | null>(null);
@@ -71,10 +89,20 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   const [elements, setElements] = useState<AnnotationElement[]>([]);
   const [undoStack, setUndoStack] = useState<AnnotationElement[][]>([]);
   const [redoStack, setRedoStack] = useState<AnnotationElement[][]>([]);
-  const [currentDrawing, setCurrentDrawing] = useState<AnnotationElement | null>(null);
+  const [currentDrawing, setCurrentDrawing] =
+    useState<AnnotationElement | null>(null);
+  // Pen input can arrive faster than the canvas can paint. Keep every point,
+  // but append and redraw at most once per animation frame instead of copying
+  // the growing point array for every mouse event.
+  const activePenPoints = useRef<Point[] | null>(null);
+  const pendingPenPoints = useRef<Point[]>([]);
+  const penFrame = useRef<number | null>(null);
 
   // In-place text editing
-  const [editingText, setEditingText] = useState<{ position: Point; text: string } | null>(null);
+  const [editingText, setEditingText] = useState<{
+    position: Point;
+    text: string;
+  } | null>(null);
 
   // Feedback states
   const [copiedFeedback, setCopiedFeedback] = useState<boolean>(false);
@@ -108,20 +136,37 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     return () => window.clearTimeout(timer);
   }, [textEditing]);
 
-  const [windowSize, setWindowSize] = useState<{ width: number; height: number }>({
+  const [windowSize, setWindowSize] = useState<{
+    width: number;
+    height: number;
+  }>({
     width: window.innerWidth,
     height: window.innerHeight,
   });
+  const imageScale = getImageScale(backgroundImage, windowSize.width);
 
   // Track window resize
   useEffect(() => {
     const handleResize = () => {
       setWindowSize({ width: window.innerWidth, height: window.innerHeight });
+      setDpr(window.devicePixelRatio || 1);
     };
     window.addEventListener("resize", handleResize);
+    let disposed = false;
+    let unlistenResize: (() => void) | undefined;
+    let unlistenScale: (() => void) | undefined;
+    const currentWindow = getCurrentWindow();
+    void currentWindow.onResized(() => handleResize()).then((unlisten) => {
+      if (disposed) unlisten(); else unlistenResize = unlisten;
+    }).catch(() => {});
+    void currentWindow.onScaleChanged(({ payload }) => {
+      setDpr(payload.scaleFactor || window.devicePixelRatio || 1);
+      handleResize();
+    }).then((unlisten) => {
+      if (disposed) unlisten(); else unlistenScale = unlisten;
+    }).catch(() => {});
 
     // Tear down safely even if registration resolves after unmount (StrictMode).
-    let disposed = false;
     let unlistenSettings: (() => void) | null = null;
     listen("open_shortcut_settings", () => {
       setIsSettingsOpen(true);
@@ -138,6 +183,8 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     return () => {
       disposed = true;
       window.removeEventListener("resize", handleResize);
+      unlistenResize?.();
+      unlistenScale?.();
       unlistenSettings?.();
       unlistenSettings = null;
     };
@@ -153,6 +200,12 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     setUndoStack([]);
     setRedoStack([]);
     setCurrentDrawing(null);
+    activePenPoints.current = null;
+    pendingPenPoints.current = [];
+    if (penFrame.current !== null) {
+      window.cancelAnimationFrame(penFrame.current);
+      penFrame.current = null;
+    }
     setEditingText(null);
     setDragState({
       mode: "none",
@@ -196,9 +249,17 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       closeTimer.current = null;
       const notify = notifyAfterClose.current;
       notifyAfterClose.current = null;
-      void hideOverlay()
-        .catch((err) => console.error("Failed to hide overlay:", err))
-        .finally(() => notify?.());
+      if (isWindows) {
+        // Windows can defer full-screen app toasts to Notification Center. Wait
+        // for hide_overlay to finish before starting the post-close timer.
+        void hideOverlay()
+          .then(() => notify?.())
+          .catch((err) => console.error("Failed to hide overlay:", err));
+      } else {
+        void hideOverlay()
+          .catch((err) => console.error("Failed to hide overlay:", err))
+          .finally(() => notify?.());
+      }
     }, duration);
   }, []);
 
@@ -208,6 +269,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       if (closeTimer.current !== null) {
         window.clearTimeout(closeTimer.current);
         closeTimer.current = null;
+      }
+      if (penFrame.current !== null) {
+        window.cancelAnimationFrame(penFrame.current);
+        penFrame.current = null;
       }
     };
   }, []);
@@ -231,14 +296,25 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       activeElement: currentDrawing,
       isHovered: false,
     });
-  }, [windowSize, backgroundImage, crop, elements, currentDrawing, dpr, captureToken]);
+  }, [
+    windowSize,
+    backgroundImage,
+    crop,
+    elements,
+    currentDrawing,
+    dpr,
+    captureToken,
+  ]);
 
   // Push element to history
-  const pushElement = useCallback((element: AnnotationElement) => {
-    setUndoStack((prev) => [...prev, elements]);
-    setRedoStack([]);
-    setElements((prev) => [...prev, element]);
-  }, [elements]);
+  const pushElement = useCallback(
+    (element: AnnotationElement) => {
+      setUndoStack((prev) => [...prev, elements]);
+      setRedoStack([]);
+      setElements((prev) => [...prev, element]);
+    },
+    [elements],
+  );
 
   const handleUndo = useCallback(() => {
     if (undoStack.length === 0) return;
@@ -249,16 +325,44 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
   }, [elements, undoStack]);
 
   const notifySuccessfulExport = useCallback(async () => {
-    if (notifiedCaptureToken.current === captureToken) return;
+    if (notifiedCaptureToken.current === captureToken) {
+      logWindowsNotificationDiagnostic(
+        "duplicate_suppressed",
+        `capture_token=${captureToken}`,
+      );
+      return;
+    }
     try {
       const settings = await getScreenshotNotificationSettings();
-      if (!settings.enabled || notifiedCaptureToken.current === captureToken) return;
+      logWindowsNotificationDiagnostic(
+        "export_success",
+        `capture_token=${captureToken}; screenshot_notifications=${settings.enabled}`,
+      );
+      if (!settings.enabled) {
+        logWindowsNotificationDiagnostic(
+          "delivery_suppressed",
+          "screenshot preference disabled",
+        );
+        return;
+      }
+      if (notifiedCaptureToken.current === captureToken) {
+        logWindowsNotificationDiagnostic(
+          "duplicate_suppressed",
+          `capture_token=${captureToken}`,
+        );
+        return;
+      }
       notifiedCaptureToken.current = captureToken;
       await notifyScreenshotExported(settings);
     } catch (err) {
       console.warn("Could not read screenshot notification settings:", err);
+      logWindowsNotificationDiagnostic("settings_read_failed", String(err));
     }
   }, [captureToken]);
+
+  const notifyWindowsAfterOverlayClose = useCallback(() => {
+    void notifySuccessfulExport();
+  }, [notifySuccessfulExport]);
 
   const handleRedo = useCallback(() => {
     if (redoStack.length === 0) return;
@@ -270,13 +374,24 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
   // Output handlers
   const handleCopy = useCallback(async () => {
-    if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage) return;
+    if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage)
+      return;
     try {
-      const imageScale = getImageScale(backgroundImage, windowSize.width);
-      const bytes = composeCropRgba(crop, elements, backgroundImage, imageScale);
+      const bytes = composeCropRgba(
+        crop,
+        elements,
+        backgroundImage,
+        imageScale,
+      );
       await copyCropImage(bytes);
+      logWindowsNotificationDiagnostic(
+        "export_complete",
+        `mode=clipboard; capture_token=${captureToken}`,
+      );
       if (isMac) {
         notifyAfterClose.current = () => void notifySuccessfulExport();
+      } else if (isWindows) {
+        notifyAfterClose.current = notifyWindowsAfterOverlayClose;
       } else {
         void notifySuccessfulExport();
       }
@@ -287,17 +402,41 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       }, 350);
     } catch (err) {
       console.error("Failed to copy crop:", err);
+      logWindowsNotificationDiagnostic(
+        "export_failed",
+        `mode=clipboard; error=${String(err)}`,
+      );
     }
-  }, [crop, elements, backgroundImage, windowSize.width, requestClose, notifySuccessfulExport]);
+  }, [
+    crop,
+    elements,
+    backgroundImage,
+    windowSize.width,
+    requestClose,
+    notifySuccessfulExport,
+    notifyWindowsAfterOverlayClose,
+    captureToken,
+  ]);
 
   const handleSave = useCallback(async () => {
-    if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage) return;
+    if (!crop || crop.width <= 0 || crop.height <= 0 || !backgroundImage)
+      return;
     try {
-      const imageScale = getImageScale(backgroundImage, windowSize.width);
-      const bytes = composeCropRgba(crop, elements, backgroundImage, imageScale);
+      const bytes = composeCropRgba(
+        crop,
+        elements,
+        backgroundImage,
+        imageScale,
+      );
       const savedPath = await saveCropImage(bytes);
+      logWindowsNotificationDiagnostic(
+        "export_complete",
+        `mode=file; capture_token=${captureToken}`,
+      );
       if (isMac) {
         notifyAfterClose.current = () => void notifySuccessfulExport();
+      } else if (isWindows) {
+        notifyAfterClose.current = notifyWindowsAfterOverlayClose;
       } else {
         void notifySuccessfulExport();
       }
@@ -308,25 +447,39 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       }, 800);
     } catch (err) {
       console.error("Failed to save crop:", err);
+      logWindowsNotificationDiagnostic(
+        "export_failed",
+        `mode=file; error=${String(err)}`,
+      );
     }
-  }, [crop, elements, backgroundImage, windowSize.width, requestClose, notifySuccessfulExport]);
+  }, [
+    crop,
+    elements,
+    backgroundImage,
+    windowSize.width,
+    requestClose,
+    notifySuccessfulExport,
+    notifyWindowsAfterOverlayClose,
+    captureToken,
+  ]);
 
   const handleOcr = useCallback(async () => {
     if (!crop || crop.width <= 0 || crop.height <= 0) return;
     setOcrLoading(true);
     try {
-      const text = await extractOcrText(crop, scaleFactor);
+      const text = await extractOcrText(crop, imageScale);
       setOcrLoading(false);
       setToastMessage(`OCR Extracted (${text.length} chars)`);
       setTimeout(() => setToastMessage(null), 2500);
     } catch (err) {
       setOcrLoading(false);
       console.error("Failed to run OCR:", err);
-      const message = typeof err === "string" ? err : "OCR is not available on this platform";
+      const message =
+        typeof err === "string" ? err : "OCR is not available on this platform";
       setToastMessage(message);
       setTimeout(() => setToastMessage(null), 3500);
     }
-  }, [crop, scaleFactor]);
+  }, [crop, imageScale]);
 
   const handleClose = useCallback(() => {
     requestClose();
@@ -364,7 +517,14 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [editingText, handleClose, handleCopy, handleSave, handleUndo, handleRedo]);
+  }, [
+    editingText,
+    handleClose,
+    handleCopy,
+    handleSave,
+    handleUndo,
+    handleRedo,
+  ]);
 
   // Mouse event handlers
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -435,10 +595,13 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
             strokeWidth: activeStrokeWidth,
           });
         } else if (activeTool === "pen") {
+          const points = [pt];
+          activePenPoints.current = points;
+          pendingPenPoints.current = [];
           setCurrentDrawing({
             id,
             type: "pen",
-            points: [pt],
+            points,
             color: activeColor,
             strokeWidth: activeStrokeWidth,
           });
@@ -513,10 +676,20 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
           bounds: normalizeRect(drawingOrigin.current ?? pt, pt),
         });
       } else if (currentDrawing.type === "pen") {
-        setCurrentDrawing({
-          ...currentDrawing,
-          points: [...currentDrawing.points, pt],
-        });
+        pendingPenPoints.current.push(pt);
+        if (penFrame.current === null) {
+          penFrame.current = window.requestAnimationFrame(() => {
+            penFrame.current = null;
+            const points = activePenPoints.current;
+            if (points) points.push(...pendingPenPoints.current);
+            pendingPenPoints.current = [];
+            setCurrentDrawing((drawing) =>
+              drawing?.type === "pen" && points
+                ? { ...drawing, points }
+                : drawing,
+            );
+          });
+        }
       } else if (currentDrawing.type === "mosaic") {
         setCurrentDrawing({
           ...currentDrawing,
@@ -538,8 +711,20 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       const dx = pt.x - dragState.startPoint.x;
       const dy = pt.y - dragState.startPoint.y;
       setCrop({
-        x: Math.max(0, Math.min(windowSize.width - dragState.initialRect.width, dragState.initialRect.x + dx)),
-        y: Math.max(0, Math.min(windowSize.height - dragState.initialRect.height, dragState.initialRect.y + dy)),
+        x: Math.max(
+          0,
+          Math.min(
+            windowSize.width - dragState.initialRect.width,
+            dragState.initialRect.x + dx,
+          ),
+        ),
+        y: Math.max(
+          0,
+          Math.min(
+            windowSize.height - dragState.initialRect.height,
+            dragState.initialRect.y + dy,
+          ),
+        ),
         width: dragState.initialRect.width,
         height: dragState.initialRect.height,
       });
@@ -547,13 +732,17 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     }
 
     // Handle crop resize
-    if (dragState.mode === "resizing" && dragState.initialRect && dragState.activeHandle) {
+    if (
+      dragState.mode === "resizing" &&
+      dragState.initialRect &&
+      dragState.activeHandle
+    ) {
       const resized = resizeRectWithHandle(
         dragState.initialRect,
         dragState.activeHandle,
         pt,
         windowSize.width,
-        windowSize.height
+        windowSize.height,
       );
       setCrop(resized);
     }
@@ -561,7 +750,19 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
 
   const handleMouseUp = () => {
     if (currentDrawing) {
-      pushElement(currentDrawing);
+      if (currentDrawing.type === "pen") {
+        if (penFrame.current !== null) {
+          window.cancelAnimationFrame(penFrame.current);
+          penFrame.current = null;
+        }
+        const points = activePenPoints.current ?? currentDrawing.points;
+        points.push(...pendingPenPoints.current);
+        pendingPenPoints.current = [];
+        pushElement({ ...currentDrawing, points });
+        activePenPoints.current = null;
+      } else {
+        pushElement(currentDrawing);
+      }
       setCurrentDrawing(null);
     }
     drawingOrigin.current = null;
@@ -578,8 +779,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     <div
       className="relative w-screen h-screen overflow-hidden select-none"
       style={{
-        opacity: closing || (isMac && !presentationReady) ? 0 : 1,
-        transition: !prefersReducedMotion() && (isMac || closing)
+        // Keep the whole visual layer transparent until the fresh screenshot
+        // has been painted and the native window is ready to be revealed.
+        opacity: closing || !presentationReady ? 0 : 1,
+        transition: !prefersReducedMotion()
           ? `opacity ${CLOSE_FADE_MS}ms ease-out`
           : "none",
         pointerEvents: closing ? "none" : "auto",
@@ -590,7 +793,10 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
         ref={canvasRef}
         width={Math.round(windowSize.width * dpr)}
         height={Math.round(windowSize.height * dpr)}
-        style={{ width: `${windowSize.width}px`, height: `${windowSize.height}px` }}
+        style={{
+          width: `${windowSize.width}px`,
+          height: `${windowSize.height}px`,
+        }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
@@ -598,9 +804,7 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
       />
 
       {/* Live Dimension Badge */}
-      {crop && (
-        <DimensionBadge crop={crop} scaleFactor={scaleFactor} />
-      )}
+      {crop && <DimensionBadge crop={crop} scaleFactor={imageScale} />}
 
       {/* Floating Toolbar */}
       {crop && dragState.mode === "none" && !currentDrawing && (
@@ -637,7 +841,9 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
           ref={textInputRef}
           autoFocus
           value={editingText.text}
-          onChange={(e) => setEditingText({ ...editingText, text: e.target.value })}
+          onChange={(e) =>
+            setEditingText({ ...editingText, text: e.target.value })
+          }
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               if (editingText.text.trim()) {
@@ -686,4 +892,3 @@ export const OverlayContainer: React.FC<OverlayContainerProps> = ({
     </div>
   );
 };
-

@@ -41,8 +41,28 @@ export async function getCurrentFrameBytes(): Promise<ArrayBuffer> {
  * Second half of an activation: shows the pre-created overlay window only after
  * the frontend has decoded the fresh frame and cleared the previous session.
  */
-export async function presentOverlay(): Promise<void> {
-  await invoke("present_overlay");
+export interface OverlayRenderMetrics {
+  captureId: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  dpr: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  imageWidth: number;
+  imageHeight: number;
+}
+
+export async function acknowledgeOverlayRender(metrics: OverlayRenderMetrics): Promise<void> {
+  await invoke("acknowledge_overlay_render", { ...metrics });
+}
+
+export async function presentOverlay(captureId: number): Promise<void> {
+  await invoke("present_overlay", { captureId });
+}
+
+/** Signals that the hidden overlay has subscribed to capture events. */
+export async function markOverlayFrontendReady(): Promise<void> {
+  await invoke("overlay_frontend_ready");
 }
 
 /**

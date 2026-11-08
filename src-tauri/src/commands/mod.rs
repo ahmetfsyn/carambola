@@ -6,9 +6,16 @@ use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use tauri::ipc::InvokeBody;
 use tauri::{AppHandle, Manager, State};
+
+#[tauri::command]
+pub fn log_notification_diagnostic(stage: String, detail: String) {
+    let stage = stage.replace(['\r', '\n'], " ");
+    let detail = detail.replace(['\r', '\n'], " ");
+    info!("[notification] stage=frontend_{stage} detail={detail}");
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CropRect {
@@ -27,6 +34,16 @@ pub fn get_display_info(state: State<'_, AppState>) -> Result<DisplayInfo, Strin
     }
 }
 
+/// Called after React has subscribed to capture events so an early first
+/// activation cannot be lost during asynchronous listener registration.
+#[tauri::command]
+pub fn overlay_frontend_ready(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::window::overlay_frontend_ready(&app_handle, &state)
+}
+
 /// Returns the freshly captured PNG as a raw binary IPC body. Returning
 /// `Vec<u8>` directly would serialize every byte as a JSON number, which costs
 /// several megabytes of string parsing inside the webview on every activation.
@@ -42,8 +59,37 @@ pub fn get_current_frame(state: State<'_, AppState>) -> Result<tauri::ipc::Respo
 /// Second half of the activation handshake: called by the frontend once the new
 /// screenshot has been decoded and the previous session state has been cleared.
 #[tauri::command]
-pub fn present_overlay(app_handle: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    crate::window::present_overlay(&app_handle, &state)
+pub fn present_overlay(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    capture_id: u64,
+) -> Result<(), String> {
+    crate::window::present_overlay(&app_handle, &state, capture_id)
+}
+
+#[tauri::command]
+pub fn acknowledge_overlay_render(
+    state: State<'_, AppState>,
+    capture_id: u64,
+    viewport_width: f64,
+    viewport_height: f64,
+    dpr: f64,
+    canvas_width: u32,
+    canvas_height: u32,
+    image_width: u32,
+    image_height: u32,
+) -> Result<(), String> {
+    crate::window::acknowledge_overlay_render(
+        &state,
+        capture_id,
+        viewport_width,
+        viewport_height,
+        dpr,
+        canvas_width,
+        canvas_height,
+        image_width,
+        image_height,
+    )
 }
 
 /// Decodes the raw RGBA payload produced by the frontend compositor. The buffer
@@ -56,13 +102,32 @@ fn parse_rgba_payload(bytes: &[u8]) -> Result<(u32, u32, &[u8]), String> {
     }
     let width = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let pixel_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "Image dimensions are too large".to_string())?;
     let expected = 8usize
-        .checked_add((width as usize) * (height as usize) * 4)
+        .checked_add(pixel_bytes)
         .ok_or_else(|| "Image dimensions are too large".to_string())?;
     if width == 0 || height == 0 || bytes.len() != expected {
         return Err("Image payload has invalid dimensions".to_string());
     }
     Ok((width, height, &bytes[8..]))
+}
+
+fn write_png_file(file: File, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
+    let mut writer = BufWriter::new(file);
+    PngEncoder::new(&mut writer)
+        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
+        .map_err(|e| format!("Failed to write PNG: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush PNG to disk: {e}"))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|e| format!("Failed to commit PNG to disk: {e}"))?;
+    Ok(())
 }
 
 fn raw_body<'a>(request: &'a tauri::ipc::Request<'_>) -> Result<&'a [u8], String> {
@@ -101,11 +166,7 @@ pub fn save_crop_image(request: tauri::ipc::Request<'_>) -> Result<String, Strin
     let file_path = carambola_dir.join(format!("Carambola_{timestamp}.png"));
 
     let file = File::create(&file_path).map_err(|e| format!("Failed to create file: {e}"))?;
-    let mut writer = BufWriter::new(file);
-
-    PngEncoder::new(&mut writer)
-        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
-        .map_err(|e| format!("Failed to write PNG: {e}"))?;
+    write_png_file(file, rgba, width, height)?;
 
     let saved_str = file_path.to_string_lossy().to_string();
     info!("Saved screenshot to: {}", saved_str);
@@ -242,6 +303,155 @@ pub fn notify_macos_screenshot() -> Result<(), String> {
     Err("macOS notifications are unavailable on this platform".to_string())
 }
 
+/// Delivers Windows screenshot notifications through Tauri's native backend.
+#[cfg(target_os = "windows")]
+fn submit_windows_notification(
+    app_handle: &AppHandle,
+    category: &str,
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
+    use std::path::MAIN_SEPARATOR as SEP;
+    use windows::core::HSTRING;
+    use windows::UI::Notifications::{NotificationSetting, ToastNotificationManager};
+
+    let stage_prefix = if category == "screenshot" {
+        ""
+    } else {
+        "update_"
+    };
+    let app_id = app_handle.config().identifier.clone();
+    let executable = tauri::utils::platform::current_exe()
+        .map_err(|err| format!("Could not resolve Carambola executable for notification: {err}"))?;
+    let executable_dir = executable
+        .parent()
+        .ok_or_else(|| "Could not resolve Carambola executable directory".to_string())?;
+    let executable_dir = executable_dir.to_string_lossy();
+    let is_development_executable = executable_dir
+        .ends_with(format!("{SEP}target{SEP}debug").as_str())
+        || executable_dir.ends_with(format!("{SEP}target{SEP}release").as_str());
+    let executable_mode = if is_development_executable {
+        "development"
+    } else {
+        "installed_or_packaged"
+    };
+    info!(
+        "[notification] stage={stage_prefix}identity app_id={} mode={} executable={}",
+        app_id,
+        executable_mode,
+        executable.display()
+    );
+
+    // Desktop toasts must always use the AUMID registered on the app's Start
+    // Menu shortcut. The parameterless overload binds to a generic shell host
+    // identity instead of Carambola's registered identity.
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id.as_str()))
+    .map_err(|err| {
+        log::error!("[notification] stage={stage_prefix}notifier_create_failed error={err:?}");
+        let detail = if is_development_executable {
+            format!(
+                "Windows could not create the notifier for Carambola AUMID '{app_id}': {err:?}. Development builds require the installed Start Menu shortcut to register this AUMID; install the NSIS package to test development notifications."
+            )
+        } else {
+            format!(
+                "Windows could not create the notifier for Carambola AUMID '{app_id}': {err:?}. Verify the installed Start Menu shortcut is registered with this same AUMID."
+            )
+        };
+        log::error!("[notification] stage={stage_prefix}registration_guidance detail={detail}");
+        detail
+    })?;
+    info!("[notification] stage={stage_prefix}notifier_create result=success app_id={app_id}");
+
+    let setting = notifier.Setting().map_err(|err| {
+        log::error!("[notification] stage={stage_prefix}os_setting_query_failed error={err:?}");
+        format!("Could not read the Windows notification setting for Carambola: {err:?}")
+    })?;
+    let setting_name = match setting {
+        NotificationSetting::Enabled => "Enabled",
+        NotificationSetting::DisabledForApplication => "DisabledForApplication",
+        NotificationSetting::DisabledForUser => "DisabledForUser",
+        NotificationSetting::DisabledByGroupPolicy => "DisabledByGroupPolicy",
+        NotificationSetting::DisabledByManifest => "DisabledByManifest",
+        _ => "Unknown",
+    };
+    info!("[notification] stage={stage_prefix}os_setting setting={setting_name}");
+    if setting != NotificationSetting::Enabled {
+        let err = format!(
+            "Windows notifications for Carambola are {setting_name}. Enable Carambola under Settings > System > Notifications."
+        );
+        log::error!("[notification] stage={stage_prefix}suppressed reason=os_setting detail={err}");
+        return Err(err);
+    }
+
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .summary(title)
+        .body(body)
+        .auto_icon()
+        .app_id(&app_id);
+
+    match notification.show() {
+        Ok(_handle) => {
+            info!("[notification] stage={stage_prefix}windows_api_result result=accepted_by_windows_api");
+            Ok(())
+        }
+        Err(err) => {
+            log::error!(
+                "[notification] stage={stage_prefix}windows_api_result result=failed error={err:?}"
+            );
+            Err(format!(
+                "Windows failed to submit the Carambola toast: {err:?}"
+            ))
+        }
+    }
+}
+
+/// Delivers Windows screenshot notifications through Carambola's registered identity.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn notify_windows_screenshot(app_handle: AppHandle) -> Result<(), String> {
+    info!("[notification] stage=rust_command_enter platform=windows");
+    let config = crate::config::load_or_create();
+    info!(
+        "[notification] stage=settings_read screenshot_notifications={} permission_prompted={}",
+        config.screenshot_notifications, config.notification_permission_prompted
+    );
+    if !config.screenshot_notifications {
+        info!("[notification] stage=suppressed reason=screenshot_preference_disabled");
+        return Ok(());
+    }
+
+    submit_windows_notification(
+        &app_handle,
+        "screenshot",
+        "Carambola",
+        "Screenshot captured successfully.",
+    )
+}
+
+/// Delivers updater feedback without consulting the screenshot notification preference.
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn notify_windows_update(
+    app_handle: AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    submit_windows_notification(&app_handle, "update", &title, &body)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn notify_windows_screenshot() -> Result<(), String> {
+    Err("Windows notifications are unavailable on this platform".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn notify_windows_update(_title: String, _body: String) -> Result<(), String> {
+    Err("Windows notifications are unavailable on this platform".to_string())
+}
+
 #[tauri::command]
 pub fn set_screenshot_notifications(
     enabled: bool,
@@ -267,7 +477,9 @@ pub fn claim_notification_permission_prompt() -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rgba_payload;
+    use super::{parse_rgba_payload, write_png_file};
+    use std::fs::{self, File};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn payload(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(8 + (width * height * 4) as usize);
@@ -292,5 +504,48 @@ mod tests {
         wrong.truncate(8 + 4);
         assert!(parse_rgba_payload(&wrong).is_err());
         assert!(parse_rgba_payload(&payload(0, 2)).is_err());
+    }
+
+    #[test]
+    fn rejects_dimensions_that_overflow_32_bit_payload_arithmetic() {
+        let mut bytes = Vec::from(1_073_741_824u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        assert!(parse_rgba_payload(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_rgba_lengths_that_overflow_addressable_memory() {
+        let mut bytes = Vec::from(u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            parse_rgba_payload(&bytes).unwrap_err(),
+            "Image dimensions are too large"
+        );
+    }
+
+    #[test]
+    fn saved_png_is_flushed_committed_and_decodable() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "carambola-save-test-{}-{unique}.png",
+            std::process::id()
+        ));
+        let pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create unique temporary PNG");
+
+        write_png_file(file, &pixels, 2, 1).expect("write and commit PNG");
+        let encoded = fs::read(&path).expect("read committed PNG");
+        let decoded = image::load_from_memory_with_format(&encoded, image::ImageFormat::Png)
+            .expect("decode saved PNG")
+            .to_rgba8();
+        assert_eq!(decoded.as_raw(), &pixels);
+        fs::remove_file(path).expect("remove temporary PNG");
     }
 }

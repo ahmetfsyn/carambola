@@ -1,0 +1,30 @@
+name: Native Windows tests
+
+on:
+  push:
+    paths:
+      - "native-app/**"
+      - ".github/workflows/windows-native-tests.yml"
+  pull_request:
+    paths:
+      - "native-app/**"
+      - ".github/workflows/windows-native-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check Windows build
+        run: cargo check --locked
+      - name: Run Windows tests
+        run: cargo test --locked

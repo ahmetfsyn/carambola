@@ -1,0 +1,888 @@
+import { TextEdit } from "std-widgets.slint";
+
+component SelectionHandle inherits Rectangle {
+    in property <MouseCursor> handle-cursor: MouseCursor.default;
+    callback gesture-pointer-event(PointerEventKind, float, float);
+    width: 10px;
+    height: 10px;
+    background: #f8fafc;
+    border-color: #0284c7;
+    border-width: 2px;
+    border-radius: 2px;
+    TouchArea {
+        mouse-cursor: root.handle-cursor;
+        pointer-event(event) => {
+            if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                root.gesture-pointer-event(event.kind, (root.x + self.mouse-x) / 1px, (root.y + self.mouse-y) / 1px);
+            }
+        }
+    }
+}
+
+component ToolbarIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> tooltip;
+    in property <bool> enabled: true;
+    in property <bool> selected: false;
+    callback clicked();
+    accessible-label: root.tooltip;
+    accessible-role: button;
+    background: transparent;
+    border-width: 0px;
+
+    Image {
+        x: 4px;
+        y: 4px;
+        width: root.width - 8px;
+        height: root.height - 8px;
+        source: root.icon;
+        image-fit: contain;
+        colorize: root.selected ? #38bdf8 : area.has-hover ? #e2e8f0 : #a8b4c4;
+        opacity: root.enabled ? 1.0 : 0.38;
+    }
+
+    area := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+export component OverlayPrototype inherits Window {
+    title: "Carambola screenshot selection";
+    in property <length> frame-viewport-width: 1280px;
+    in property <length> frame-viewport-height: 720px;
+    width: root.frame-viewport-width;
+    height: root.frame-viewport-height;
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+
+    in property <image> captured-image;
+    in property <length> selection-x: 0px;
+    in property <length> selection-y: 0px;
+    in property <length> selection-width: 0px;
+    in property <length> selection-height: 0px;
+    in property <bool> annotation-mode: false;
+    in property <bool> overlay-closing: false;
+    in-out property <bool> control-held: false;
+    in-out property <color> fade-cover-color: #00000000;
+    in-out property <bool> fade-animation-enabled: true;
+    in-out property <float> content-opacity: 1.0;
+    in property <length> toolbar-auto-x: 0px;
+    in property <length> toolbar-auto-y: 0px;
+    in property <float> toolbar-scale: 1.0;
+    in property <bool> toolbar-forced-inside: false;
+    in property <bool> toolbar-manual-position: false;
+    in property <length> toolbar-manual-x: 0px;
+    in property <length> toolbar-manual-y: 0px;
+    out property <length> toolbar-effective-width: 466px * root.toolbar-scale;
+    out property <length> toolbar-effective-height: 38px * root.toolbar-scale;
+    out property <length> toolbar-position-x: max(0px, min(root.toolbar-manual-position ? root.toolbar-manual-x : root.toolbar-auto-x, root.width - root.toolbar-effective-width));
+    out property <length> toolbar-position-y: max(0px, min(root.toolbar-manual-position ? root.toolbar-manual-y : root.toolbar-auto-y, root.height - root.toolbar-effective-height));
+    out property <bool> toolbar-drag-enabled: root.toolbar-forced-inside || root.toolbar-manual-position;
+    in property <bool> confirm-selection-action-visible: false;
+    in property <string> confirm-selection-action-message: "";
+    in property <image> annotation-image;
+    in property <int> selected-tool: 0;
+    in property <bool> text-entry-visible: false;
+    in property <bool> text-entry-existing: false;
+    in property <bool> text-entry-awaiting-position: false;
+    in property <string> text-entry-message: "";
+    in-out property <string> text-entry-value: "";
+    in property <int> text-entry-line-count: 1;
+    in property <length> text-entry-x: 0px;
+    in property <length> text-entry-y: 0px;
+    in property <int> annotation-size: 3;
+    in-out property <bool> size-menu-open: false;
+    in-out property <int> annotation-color-index: 0;
+    in-out property <bool> color-palette-open: false;
+    in-out property <bool> text-bold: false;
+    in-out property <bool> text-italic: false;
+    in-out property <int> text-alignment: 0;
+    out property <length> text-entry-content-height: max(24px, min(116px, root.text-entry-line-count * 18px));
+    out property <length> text-entry-panel-height: root.text-entry-awaiting-position ? 96px : 78px + root.text-entry-content-height + (root.text-entry-message == "" ? 0px : 14px);
+    in property <bool> can-undo: false;
+    in property <bool> can-redo: false;
+    in property <bool> can-clear-annotations: false;
+    in property <bool> export-busy: false;
+    in property <bool> copy-in-progress: false;
+    in property <bool> ocr-in-progress: false;
+    in property <string> export-status: "";
+
+    callback pointer-down(float, float, float, float, bool, bool);
+    callback pointer-move(float, float, float, float);
+    callback pointer-up(float, float, float, float);
+    callback pointer-cancel();
+    callback crop-selection-pointer-event(PointerEventKind, float, float, float, float);
+    callback toolbar-pointer-event(PointerEventKind, float, float, float, float);
+    callback cycle-shape-tool();
+    callback annotation-color-changed(int);
+    callback annotation-size-level-selected(int);
+    callback clear-annotations();
+    callback confirm-selection-action();
+    callback cancel-selection-action();
+    callback cancel-selection();
+    callback focus-selection();
+    callback tool-selected(int);
+    callback submit-text(string);
+    callback cancel-text();
+    callback text-content-changed(string);
+    callback text-style-changed(bool, bool, int);
+    callback request-text-reposition();
+    callback undo-annotation();
+    callback redo-annotation();
+    callback save-png();
+    callback save-default-png();
+    callback copy-image();
+    callback overlay-shortcut-requested(string, bool, bool, bool);
+    callback recognize-text();
+    callback request-capture();
+
+    focus-selection => { escape-scope.focus(); }
+
+    changed visible => {
+        if (self.visible) {
+            escape-scope.focus();
+        }
+    }
+
+    changed text-entry-visible => {
+        if (self.text-entry-visible) { root.control-held = false; text-input.focus(); }
+        else { escape-scope.focus(); }
+    }
+
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.captured-image;
+        image-fit: fill;
+    }
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        opacity: root.content-opacity;
+        animate opacity { duration: 140ms; easing: ease-in-out; enabled: root.fade-animation-enabled; }
+
+    // Four masks preserve the captured screenshot inside the selection and
+    // darken the rest without re-copying or re-capturing pixels during drag.
+    Rectangle { x: 0px; y: 0px; width: parent.width; height: root.selection-y; background: #07101d88; }
+    Rectangle { x: 0px; y: root.selection-y + root.selection-height; width: parent.width; height: parent.height - root.selection-y - root.selection-height; background: #07101d88; }
+    Rectangle { x: 0px; y: root.selection-y; width: root.selection-x; height: root.selection-height; background: #07101d88; }
+    Rectangle { x: root.selection-x + root.selection-width; y: root.selection-y; width: parent.width - root.selection-x - root.selection-width; height: root.selection-height; background: #07101d88; }
+
+    Image {
+        x: root.selection-x;
+        y: root.selection-y;
+        width: root.selection-width;
+        height: root.selection-height;
+        source: root.annotation-image;
+        image-fit: fill;
+        visible: root.annotation-mode;
+    }
+
+    Rectangle {
+        x: root.selection-x;
+        y: root.selection-y;
+        width: root.selection-width;
+        height: root.selection-height;
+        background: transparent;
+        border-color: #ffffff;
+        border-width: 1px;
+    }
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        // Keep the fullscreen capture surface's cursor explicit and visible
+        // across the hidden-window -> overlay focus transition.
+        mouse-cursor: root.control-held
+            && self.mouse-x >= root.selection-x
+            && self.mouse-x <= root.selection-x + root.selection-width
+            && self.mouse-y >= root.selection-y
+            && self.mouse-y <= root.selection-y + root.selection-height
+            ? move : crosshair;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.move || event.kind == PointerEventKind.down) {
+                root.control-held = event.modifiers.control || event.modifiers.meta;
+            }
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                root.pointer-down(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px, event.modifiers.control, event.modifiers.meta);
+            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                root.pointer-up(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px);
+            } else if (event.kind == PointerEventKind.cancel) {
+                root.pointer-cancel();
+            } else if (event.kind == PointerEventKind.move) {
+                root.pointer-move(self.mouse-x / 1px, self.mouse-y / 1px, root.width / 1px, root.height / 1px);
+            }
+        }
+    }
+
+    // The frame is not a parent of these handles, so their outer halves stay
+    // visible outside the selection border. Ctrl+drag inside the crop moves it
+    // while ordinary drags remain available to annotation tools.
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: transparent;
+        visible: root.selection-width > 0px && root.selection-height > 0px;
+
+        // Edge handles precede corners so corner cursors win if hit areas overlap.
+        SelectionHandle {
+            x: root.selection-x + root.selection-width / 2 - 5px;
+            y: root.selection-y - 5px;
+            handle-cursor: ns-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width - 5px;
+            y: root.selection-y + root.selection-height / 2 - 5px;
+            handle-cursor: ew-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width / 2 - 5px;
+            y: root.selection-y + root.selection-height - 5px;
+            handle-cursor: ns-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x - 5px;
+            y: root.selection-y + root.selection-height / 2 - 5px;
+            handle-cursor: ew-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x - 5px;
+            y: root.selection-y - 5px;
+            handle-cursor: nwse-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width - 5px;
+            y: root.selection-y - 5px;
+            handle-cursor: nesw-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x + root.selection-width - 5px;
+            y: root.selection-y + root.selection-height - 5px;
+            handle-cursor: nwse-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+        SelectionHandle {
+            x: root.selection-x - 5px;
+            y: root.selection-y + root.selection-height - 5px;
+            handle-cursor: nesw-resize;
+            gesture-pointer-event(kind, x, y) => { root.crop-selection-pointer-event(kind, x, y, root.width / 1px, root.height / 1px); }
+        }
+    }
+
+    // Compact annotation toolbar with smaller icon targets.
+    Rectangle {
+        x: root.toolbar-position-x;
+        y: root.toolbar-position-y;
+        width: 466px;
+        height: 38px;
+        transform-scale-x: root.toolbar-scale * 100%;
+        transform-scale-y: root.toolbar-scale * 100%;
+        transform-origin: { x: 0px, y: 0px };
+        visible: root.annotation-mode;
+        background: #0f172af2;
+        border-color: #64748b;
+        border-width: 1px;
+        border-radius: 6px;
+
+        TouchArea { }
+
+        ToolbarIconButton {
+            x: 8px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/pen.svg"); tooltip: "Pen";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 0;
+            clicked => { root.tool-selected(0); }
+
+        }
+        ToolbarIconButton {
+            x: 38px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/arrow.svg"); tooltip: "Arrow";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 1;
+            clicked => { root.tool-selected(1); }
+
+        }
+        ToolbarIconButton {
+            x: 68px; y: 5px; width: 26px; height: 26px;
+            icon: root.selected-tool == 3 ? @image-url("icons/triangle.svg") : root.selected-tool == 4 ? @image-url("icons/ellipse.svg") : @image-url("icons/rectangle.svg");
+            tooltip: root.selected-tool == 3 ? "Shape: Triangle (click to cycle)" : root.selected-tool == 4 ? "Shape: Ellipse (click to cycle)" : "Shape: Rectangle (click to cycle)";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 2 || root.selected-tool == 3 || root.selected-tool == 4;
+            clicked => { root.cycle-shape-tool(); }
+
+        }
+        ToolbarIconButton {
+            x: 98px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/text.svg"); tooltip: "Text";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 5;
+            clicked => { root.tool-selected(5); }
+
+        }
+        ToolbarIconButton {
+            x: 128px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/mosaic.svg"); tooltip: "Mosaic";
+            enabled: !root.text-entry-visible;
+            selected: root.selected-tool == 6;
+            clicked => { root.tool-selected(6); }
+
+        }
+
+        Rectangle { x: 159px; y: 6px; width: 1px; height: 26px; background: #475569; }
+
+        ToolbarIconButton {
+            x: 168px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/undo.svg"); tooltip: "Undo";
+            enabled: root.can-undo && !root.text-entry-visible;
+            clicked => { root.undo-annotation(); }
+
+        }
+        ToolbarIconButton {
+            x: 198px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/redo.svg"); tooltip: "Redo";
+            enabled: root.can-redo && !root.text-entry-visible;
+            clicked => { root.redo-annotation(); }
+
+        }
+
+        Rectangle { x: 229px; y: 6px; width: 1px; height: 26px; background: #475569; }
+
+        ToolbarIconButton {
+            x: 238px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/ocr.svg"); tooltip: "Recognize text in crop";
+            enabled: !root.export-busy && !root.text-entry-visible;
+            clicked => { root.recognize-text(); }
+
+        }
+
+        ToolbarIconButton {
+            x: 268px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/copy.svg"); tooltip: "Copy";
+            enabled: !root.export-busy && !root.text-entry-visible;
+            clicked => { root.copy-image(); }
+
+        }
+        ToolbarIconButton {
+            x: 298px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/save.svg"); tooltip: "Save";
+            enabled: !root.export-busy && !root.text-entry-visible;
+            clicked => { root.save-png(); }
+
+        }
+
+        ToolbarIconButton {
+            x: 328px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/delete.svg"); tooltip: "Clear annotations";
+            enabled: root.can-clear-annotations && !root.text-entry-visible && !root.overlay-closing;
+            clicked => { root.clear-annotations(); }
+
+        }
+
+        Rectangle { x: 359px; y: 6px; width: 1px; height: 26px; background: #475569; }
+        ToolbarIconButton {
+            x: 368px; y: 5px; width: 26px; height: 26px;
+            icon: @image-url("icons/color.svg"); tooltip: "Annotation color";
+            enabled: !root.export-busy;
+            clicked => { root.size-menu-open = false; root.color-palette-open = !root.color-palette-open; }
+
+        }
+        Rectangle {
+            x: 386px; y: 30px; width: 7px; height: 4px;
+            background: root.annotation-color-index == 0 ? #ff3750 : root.annotation-color-index == 1 ? #ffffff : root.annotation-color-index == 2 ? #facc15 : root.annotation-color-index == 3 ? #22d3ee : #22c55e;
+            border-radius: 2px;
+        }
+        for palette-color[i] in [#ff3750, #ffffff, #facc15, #22d3ee, #22c55e]: Rectangle {
+            x: 294px + i * 30px;
+            y: root.toolbar-position-y + 70px * root.toolbar-scale > root.height ? -30px : 40px;
+            width: 26px; height: 26px;
+            visible: root.color-palette-open;
+            background: palette-color;
+            border-color: root.annotation-color-index == i ? #38bdf8 : #64748b;
+            border-width: root.annotation-color-index == i ? 2px : 1px;
+            border-radius: 13px;
+            accessible-role: button;
+            accessible-label: i == 0 ? "Red" : i == 1 ? "White" : i == 2 ? "Yellow" : i == 3 ? "Cyan" : "Green";
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.annotation-color-index = i;
+                    root.annotation-color-changed(i);
+                    root.color-palette-open = false;
+                }
+            }
+        }
+
+        Rectangle {
+            x: 400px; y: 5px; width: 42px; height: 26px;
+            background: root.size-menu-open ? #075985 : #1e293b;
+            border-color: root.size-menu-open ? #38bdf8 : #64748b;
+            border-width: 1px;
+            border-radius: 4px;
+            accessible-role: button;
+            accessible-label: "Drawing size";
+            Text {
+                text: root.annotation-size;
+                color: #f8fafc;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            TouchArea {
+                enabled: !root.export-busy && !root.overlay-closing;
+                mouse-cursor: pointer;
+                clicked => { root.color-palette-open = false; root.size-menu-open = !root.size-menu-open; }
+            }
+        }
+        TouchArea {
+            x: 446px; y: 5px; width: 12px; height: 26px;
+            enabled: root.toolbar-drag-enabled;
+            mouse-cursor: move;
+            pointer-event(event) => {
+                if ((event.kind != PointerEventKind.down && event.kind != PointerEventKind.up) || event.button == PointerEventButton.left) {
+                    root.toolbar-pointer-event(
+                        event.kind,
+                        (root.toolbar-position-x + (self.x + self.mouse-x) * root.toolbar-scale) / 1px,
+                        (root.toolbar-position-y + (self.y + self.mouse-y) * root.toolbar-scale) / 1px,
+                        root.width / 1px,
+                        root.height / 1px
+                    );
+                }
+            }
+        }
+        Rectangle {
+            x: 398px;
+            y: root.toolbar-position-y + 184px * root.toolbar-scale > root.height ? -146px : 38px;
+            width: 46px; height: 144px;
+            visible: root.size-menu-open;
+            background: #0f172af2;
+            border-color: #64748b;
+            border-width: 1px;
+            border-radius: 4px;
+            for option[index] in [1, 2, 3, 4, 5]: Rectangle {
+                x: 2px; y: 2px + index * 28px; width: 42px; height: 28px;
+                background: root.annotation-size == option ? #075985 : transparent;
+                Text {
+                    text: option;
+                    color: #f8fafc;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.annotation-size-level-selected(option); root.size-menu-open = false; }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        x: max(0px, min(root.text-entry-x, parent.width - 360px));
+        y: max(0px, min(root.text-entry-y, parent.height - min(root.text-entry-panel-height, parent.height)));
+        width: min(360px, parent.width);
+        height: min(root.text-entry-panel-height, parent.height);
+        visible: root.text-entry-visible;
+        background: #111827ee;
+        border-color: #64748b;
+        border-width: 1px;
+        border-radius: 5px;
+
+        text-input := TextEdit {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: root.text-entry-content-height;
+            text <=> root.text-entry-value;
+            wrap: word-wrap;
+            font-size: 13px;
+            visible: !root.text-entry-awaiting-position;
+            placeholder-text: "Enter text";
+            edited(text) => { root.text-content-changed(text); }
+        }
+        Rectangle {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: 36px;
+            visible: root.text-entry-awaiting-position;
+            background: #1f2937;
+            Text {
+                x: 8px;
+                y: 4px;
+                width: parent.width - 16px;
+                height: parent.height - 8px;
+                text: "Click the new text position in the selection.";
+                color: #e2e8f0;
+                font-size: 11px;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle {
+            x: 8px; y: 12px + root.text-entry-content-height; width: 28px; height: 24px;
+            visible: !root.text-entry-awaiting-position;
+            background: root.text-bold ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text { text: "B"; color: white; font-size: 11px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.text-bold = !root.text-bold;
+                    root.text-style-changed(root.text-bold, root.text-italic, root.text-alignment);
+                }
+            }
+        }
+        Rectangle {
+            x: 40px; y: 12px + root.text-entry-content-height; width: 28px; height: 24px;
+            visible: !root.text-entry-awaiting-position;
+            background: root.text-italic ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text { text: "I"; color: white; font-size: 11px; font-italic: true; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.text-italic = !root.text-italic;
+                    root.text-style-changed(root.text-bold, root.text-italic, root.text-alignment);
+                }
+            }
+        }
+        for alignment[i] in ["L", "C", "R"]: Rectangle {
+            x: 76px + i * 27px;
+            y: 12px + root.text-entry-content-height;
+            width: 24px;
+            height: 24px;
+            visible: !root.text-entry-awaiting-position;
+            background: root.text-alignment == i ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text { text: alignment; color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.text-alignment = i;
+                    root.text-style-changed(root.text-bold, root.text-italic, root.text-alignment);
+                }
+            }
+        }
+        Text {
+            x: 8px;
+            y: 40px + root.text-entry-content-height;
+            width: parent.width - 16px;
+            height: 14px;
+            visible: root.text-entry-message != "" && !root.text-entry-awaiting-position;
+            text: root.text-entry-message;
+            color: #cbd5e1;
+            font-size: 9px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            x: 8px; y: parent.height - 36px; width: 72px; height: 28px;
+            visible: root.text-entry-existing;
+            background: root.text-entry-awaiting-position ? #0369a1 : #334155;
+            border-radius: 3px;
+            Text {
+                text: root.text-entry-awaiting-position ? "Cancel move" : "Move";
+                color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center;
+            }
+            TouchArea { mouse-cursor: pointer; clicked => { root.request-text-reposition(); } }
+        }
+        Rectangle {
+            x: parent.width - 132px; y: parent.height - 36px; width: 60px; height: 28px;
+            background: #15803d; border-radius: 3px;
+            Text { text: "Confirm"; color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea {
+                enabled: !root.text-entry-awaiting-position;
+                mouse-cursor: pointer;
+                clicked => { root.submit-text(root.text-entry-value); }
+            }
+        }
+        Rectangle {
+            x: parent.width - 66px; y: parent.height - 36px; width: 58px; height: 28px;
+            background: #334155; border-radius: 3px;
+            Text { text: "Cancel"; color: white; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+            TouchArea { mouse-cursor: pointer; clicked => { root.cancel-text(); } }
+        }
+    }
+    Rectangle {
+        visible: root.confirm-selection-action-visible;
+        width: parent.width;
+        height: parent.height;
+        background: #07101dcc;
+        TouchArea { }
+        Rectangle {
+            x: (parent.width - 360px) / 2;
+            y: (parent.height - 128px) / 2;
+            width: 360px;
+            height: 128px;
+            background: #111827;
+            border-color: #64748b;
+            border-width: 1px;
+            border-radius: 6px;
+            Text {
+                x: 16px;
+                y: 12px;
+                width: 328px;
+                height: 64px;
+                text: root.confirm-selection-action-message;
+                color: white;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                x: 164px; y: 84px; width: 86px; height: 32px;
+                background: #334155; border-radius: 3px;
+                Text { text: "Keep"; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { mouse-cursor: pointer; clicked => { root.cancel-selection-action(); } }
+            }
+            Rectangle {
+                x: 258px; y: 84px; width: 86px; height: 32px;
+                background: #dc2626; border-radius: 3px;
+                Text { text: "Discard"; color: white; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { mouse-cursor: pointer; clicked => { root.confirm-selection-action(); } }
+            }
+        }
+    }
+
+    Rectangle {
+        visible: root.export-busy;
+        width: parent.width;
+        height: parent.height;
+        // Keep export input blocked without briefly blackening the entire capture.
+        background: transparent;
+        Rectangle {
+            visible: !root.copy-in-progress && !root.ocr-in-progress;
+            x: (parent.width - 320px) / 2;
+            y: (parent.height - 52px) / 2;
+            width: 320px;
+            height: 52px;
+            background: #111827ee;
+            border-color: #64748b;
+            border-width: 1px;
+            border-radius: 6px;
+            Text {
+                text: root.export-status;
+                color: white;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            enabled: root.export-busy;
+        }
+    }
+    }
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        enabled: root.overlay-closing;
+    }
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: root.fade-cover-color;
+        animate background { duration: 140ms; easing: ease-in-out; enabled: root.fade-animation-enabled; }
+    }
+
+    escape-scope := FocusScope {
+        width: 1px;
+        height: 1px;
+        key-pressed(event) => {
+            if (root.overlay-closing) {
+                reject
+            } else if (root.text-entry-visible) {
+                if (event.text == Key.Escape) { root.cancel-text(); accept }
+                else { reject }
+            } else if (event.text == Key.Control) {
+                root.control-held = true;
+                reject
+            } else if (root.annotation-mode && root.selection-width > 0px && root.selection-height > 0px
+                && event.modifiers.control
+                && (event.text == "c" || event.text == "C" || event.text == "s" || event.text == "S")) {
+                root.overlay-shortcut-requested(
+                    event.text,
+                    event.modifiers.control,
+                    event.modifiers.shift,
+                    root.text-entry-visible
+                );
+                accept
+            } else if (event.text == Key.Escape) {
+                if (root.text-entry-visible) {
+                    root.cancel-text();
+                } else {
+                    root.cancel-selection();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+        key-released(event) => {
+            if (event.text == Key.Control) { root.control-held = false; }
+            reject
+        }
+    }
+}
+
+export component SettingsPrototype inherits Window {
+    title: "Carambola Settings";
+    icon: @image-url("../assets/carambola.ico");
+    preferred-width: 440px;
+    preferred-height: 324px;
+    min-width: 440px;
+    min-height: 324px;
+    background: #0b1220;
+
+    in-out property <string> save-directory: "";
+    in-out property <string> capture-shortcut: "Ctrl+Shift+S";
+    in-out property <bool> notifications-enabled: true;
+    in-out property <bool> shortcut-recording: false;
+    in-out property <string> settings-message: "";
+    callback choose-save-directory();
+    callback shortcut-key-captured(string, bool, bool, bool, bool);
+    callback notifications-toggled(bool);
+    callback close-settings();
+
+    Rectangle {
+        x: 20px; y: 18px; width: parent.width - 40px; height: parent.height - 36px;
+        background: #111c2e;
+        border-color: #26364d;
+        border-width: 1px;
+        border-radius: 10px;
+    }
+    Text {
+        x: 40px; y: 30px; width: parent.width - 80px; height: 30px;
+        text: "Settings";
+        color: #f8fafc;
+        font-size: 20px;
+        font-weight: 700;
+    }
+    Text {
+        x: 40px; y: 72px; width: 250px; height: 22px;
+        text: "Default save folder";
+        color: #e2e8f0;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    Text {
+        x: 40px; y: 96px; width: parent.width - 190px; height: 34px;
+        text: root.save-directory == "" ? "Choose a folder to use for saved screenshots" : root.save-directory;
+        color: #94a3b8;
+        font-size: 10px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        x: parent.width - 142px; y: 94px; width: 102px; height: 32px;
+        background: #1e293b;
+        border-color: #334155;
+        border-width: 1px;
+        border-radius: 6px;
+        Text { text: "Choose folder"; color: #e2e8f0; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+        TouchArea { mouse-cursor: pointer; clicked => { root.choose-save-directory(); } }
+    }
+    Text {
+        x: 40px; y: 146px; width: 250px; height: 22px;
+        text: "Global capture shortcut";
+        color: #e2e8f0;
+        font-size: 12px;
+        font-weight: 600;
+    }
+    Text {
+        x: 40px; y: 170px; width: parent.width - 195px; height: 30px;
+        text: root.shortcut-recording ? "Press shortcut…" : root.capture-shortcut;
+        color: root.shortcut-recording ? #38bdf8 : #cbd5e1;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: parent.width - 142px; y: 168px; width: 102px; height: 32px;
+        background: root.shortcut-recording ? #075985 : #1e293b;
+        border-color: #334155;
+        border-width: 1px;
+        border-radius: 6px;
+        Text { text: root.shortcut-recording ? "Cancel" : "Record"; color: #e2e8f0; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.shortcut-recording = !root.shortcut-recording;
+                root.settings-message = root.shortcut-recording ? "Press a key with Ctrl, Shift, or Alt." : "";
+                if (root.shortcut-recording) { shortcut-capture.focus(); }
+            }
+        }
+    }
+    Text {
+        x: 40px; y: 210px; width: 250px; height: 24px;
+        text: "Screenshot notifications";
+        color: #e2e8f0;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: parent.width - 102px; y: 210px; width: 62px; height: 26px;
+        border-radius: 13px;
+        background: root.notifications-enabled ? #0e7490 : #334155;
+        Text {
+            text: root.notifications-enabled ? "On" : "Off";
+            color: #f8fafc;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.notifications-toggled(!root.notifications-enabled); }
+        }
+    }
+    Text {
+        x: 40px; y: 248px; width: parent.width - 180px; height: 32px;
+        visible: root.settings-message != "";
+        text: root.settings-message;
+        color: #fbbf24;
+        font-size: 10px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        x: parent.width - 124px; y: parent.height - 60px; width: 84px; height: 30px;
+        background: #164e63;
+        border-radius: 6px;
+        Text { text: "Close"; color: #ecfeff; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+        TouchArea { mouse-cursor: pointer; clicked => { root.close-settings(); } }
+    }
+    shortcut-capture := FocusScope {
+        width: 1px;
+        height: 1px;
+        key-pressed(event) => {
+            if (!root.shortcut-recording) { reject }
+            else if (event.text == Key.Control || event.text == Key.Shift || event.text == Key.Alt) { reject }
+            else {
+                root.shortcut-key-captured(
+                    event.text,
+                    event.modifiers.control,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.meta
+                );
+                accept
+            }
+        }
+    }
+}
