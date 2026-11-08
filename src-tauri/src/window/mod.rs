@@ -577,14 +577,14 @@ mod tests {
 
 /// Reports a failed capture through the system log and gives macOS users an
 /// actionable Screen Recording permission prompt when that is the cause.
-pub fn report_activation_error(app_handle: &AppHandle, error: &str) {
+pub fn report_activation_error(_app_handle: &AppHandle, error: &str) {
     error!("Screenshot activation failed: {error}");
 
     #[cfg(target_os = "macos")]
     {
         let permission_denied = error.starts_with("Screen Recording access is not available");
         let detail = error.to_string();
-        let app_handle = app_handle.clone();
+        let app_handle = _app_handle.clone();
         if let Err(dispatch_error) = app_handle.clone().run_on_main_thread(move || {
             use objc2::MainThreadMarker;
             use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSWorkspace};
@@ -627,7 +627,7 @@ pub fn report_activation_error(app_handle: &AppHandle, error: &str) {
 /// Explains when a previously saved shortcut cannot be restored at startup.
 /// The fallback remains available for this run while the saved value is left
 /// untouched so the user can resolve the conflict in Settings.
-pub fn report_hotkey_fallback(app_handle: &AppHandle, shortcut: &str, error: &str) {
+pub fn report_hotkey_fallback(_app_handle: &AppHandle, shortcut: &str, error: &str) {
     warn!("Saved shortcut {shortcut:?} could not be restored: {error}");
 
     #[cfg(target_os = "macos")]
@@ -635,7 +635,7 @@ pub fn report_hotkey_fallback(app_handle: &AppHandle, shortcut: &str, error: &st
         let message = format!(
             "Carambola could not restore the saved shortcut {shortcut:?}. The fallback Alt+A is active for this session. Right-click the Carambola menu bar icon and open Settings to choose another shortcut."
         );
-        let app_handle = app_handle.clone();
+        let app_handle = _app_handle.clone();
         if let Err(dispatch_error) = app_handle.clone().run_on_main_thread(move || {
             use objc2::MainThreadMarker;
             use objc2_app_kit::NSAlert;

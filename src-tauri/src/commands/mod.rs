@@ -6,7 +6,7 @@ use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use tauri::ipc::InvokeBody;
 use tauri::{AppHandle, Manager, State};
 
@@ -102,13 +102,32 @@ fn parse_rgba_payload(bytes: &[u8]) -> Result<(u32, u32, &[u8]), String> {
     }
     let width = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let height = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let pixel_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "Image dimensions are too large".to_string())?;
     let expected = 8usize
-        .checked_add((width as usize) * (height as usize) * 4)
+        .checked_add(pixel_bytes)
         .ok_or_else(|| "Image dimensions are too large".to_string())?;
     if width == 0 || height == 0 || bytes.len() != expected {
         return Err("Image payload has invalid dimensions".to_string());
     }
     Ok((width, height, &bytes[8..]))
+}
+
+fn write_png_file(file: File, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
+    let mut writer = BufWriter::new(file);
+    PngEncoder::new(&mut writer)
+        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
+        .map_err(|e| format!("Failed to write PNG: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush PNG to disk: {e}"))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|e| format!("Failed to commit PNG to disk: {e}"))?;
+    Ok(())
 }
 
 fn raw_body<'a>(request: &'a tauri::ipc::Request<'_>) -> Result<&'a [u8], String> {
@@ -147,11 +166,7 @@ pub fn save_crop_image(request: tauri::ipc::Request<'_>) -> Result<String, Strin
     let file_path = carambola_dir.join(format!("Carambola_{timestamp}.png"));
 
     let file = File::create(&file_path).map_err(|e| format!("Failed to create file: {e}"))?;
-    let mut writer = BufWriter::new(file);
-
-    PngEncoder::new(&mut writer)
-        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
-        .map_err(|e| format!("Failed to write PNG: {e}"))?;
+    write_png_file(file, rgba, width, height)?;
 
     let saved_str = file_path.to_string_lossy().to_string();
     info!("Saved screenshot to: {}", saved_str);
@@ -462,7 +477,9 @@ pub fn claim_notification_permission_prompt() -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rgba_payload;
+    use super::{parse_rgba_payload, write_png_file};
+    use std::fs::{self, File};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn payload(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(8 + (width * height * 4) as usize);
@@ -487,5 +504,48 @@ mod tests {
         wrong.truncate(8 + 4);
         assert!(parse_rgba_payload(&wrong).is_err());
         assert!(parse_rgba_payload(&payload(0, 2)).is_err());
+    }
+
+    #[test]
+    fn rejects_dimensions_that_overflow_32_bit_payload_arithmetic() {
+        let mut bytes = Vec::from(1_073_741_824u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        assert!(parse_rgba_payload(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_rgba_lengths_that_overflow_addressable_memory() {
+        let mut bytes = Vec::from(u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            parse_rgba_payload(&bytes).unwrap_err(),
+            "Image dimensions are too large"
+        );
+    }
+
+    #[test]
+    fn saved_png_is_flushed_committed_and_decodable() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "carambola-save-test-{}-{unique}.png",
+            std::process::id()
+        ));
+        let pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+        let file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create unique temporary PNG");
+
+        write_png_file(file, &pixels, 2, 1).expect("write and commit PNG");
+        let encoded = fs::read(&path).expect("read committed PNG");
+        let decoded = image::load_from_memory_with_format(&encoded, image::ImageFormat::Png)
+            .expect("decode saved PNG")
+            .to_rgba8();
+        assert_eq!(decoded.as_raw(), &pixels);
+        fs::remove_file(path).expect("remove temporary PNG");
     }
 }
