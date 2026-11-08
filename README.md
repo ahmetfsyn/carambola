@@ -1,5 +1,10 @@
 # Carambola
 
+**Native Windows app:** The Slint-based v1.1.0 release candidate is documented in
+[native-app/README.md](native-app/README.md). It is undergoing packaged-app
+verification. The existing public v1.0.0 download is the earlier Tauri app;
+the instructions below describe that release.
+
 Carambola is a lightweight, tray-first screenshot and annotation application for the desktop. Press a global shortcut, select any part of the screen, mark it up, then copy it to the clipboard or save it as a PNG. It is built with Tauri v2, Rust, React, and TypeScript.
 
 Carambola runs in the background with no main window. A system-tray menu and a configurable global shortcut are the entry points, so the app stays out of the way until it is needed.

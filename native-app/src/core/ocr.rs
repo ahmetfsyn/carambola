@@ -7,14 +7,19 @@ pub enum OcrResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OcrCompletion {
-    Copied {
-        text: String,
-        notification: &'static str,
-    },
-    Empty {
-        notification: &'static str,
-    },
+    Copied { text: String },
+    Empty,
     Error(String),
+}
+
+impl OcrCompletion {
+    pub fn notification_message(&self) -> String {
+        match self {
+            Self::Copied { .. } => "Text scanned and copied successfully.".into(),
+            Self::Empty => "No text found in the image.".into(),
+            Self::Error(error) => format!("Text scan failed: {error}"),
+        }
+    }
 }
 
 pub fn normalize_result(result: Result<String, String>) -> OcrResult {
@@ -37,17 +42,12 @@ pub fn complete(
 ) -> OcrCompletion {
     match result {
         OcrResult::Text(text) => match copy_to_clipboard(&text) {
-            Ok(()) => OcrCompletion::Copied {
-                text,
-                notification: "Text copied",
-            },
+            Ok(()) => OcrCompletion::Copied { text },
             Err(error) => OcrCompletion::Error(format!(
                 "Text was recognized but could not be copied: {error}"
             )),
         },
-        OcrResult::Empty => OcrCompletion::Empty {
-            notification: "No text found",
-        },
+        OcrResult::Empty => OcrCompletion::Empty,
         OcrResult::Failed(error) => OcrCompletion::Error(error),
     }
 }
@@ -74,24 +74,38 @@ mod tests {
                 clipboard_called.set(true);
                 Err("must not be called".into())
             }),
-            OcrCompletion::Empty {
-                notification: "No text found"
-            }
+            OcrCompletion::Empty
         );
         assert!(!clipboard_called.get());
     }
 
     #[test]
     fn successful_recognition_copies_then_notifies() {
+        let completion = complete(OcrResult::Text("recognized".into()), |text| {
+            assert_eq!(text, "recognized");
+            Ok(())
+        });
         assert_eq!(
-            complete(OcrResult::Text("recognized".into()), |text| {
-                assert_eq!(text, "recognized");
-                Ok(())
-            }),
+            completion,
             OcrCompletion::Copied {
-                text: "recognized".into(),
-                notification: "Text copied"
+                text: "recognized".into()
             }
+        );
+        assert_eq!(
+            completion.notification_message(),
+            "Text scanned and copied successfully."
+        );
+    }
+
+    #[test]
+    fn empty_and_failed_recognition_have_distinct_notification_messages() {
+        assert_eq!(
+            OcrCompletion::Empty.notification_message(),
+            "No text found in the image."
+        );
+        assert_eq!(
+            OcrCompletion::Error("OCR runtime unavailable".into()).notification_message(),
+            "Text scan failed: OCR runtime unavailable"
         );
     }
 
@@ -106,13 +120,18 @@ mod tests {
             OcrCompletion::Error("OCR runtime unavailable".into())
         );
         assert!(!clipboard_called.get());
+        let copy_error = complete(OcrResult::Text("recognized".into()), |_| {
+            Err("clipboard busy".into())
+        });
         assert_eq!(
-            complete(OcrResult::Text("recognized".into()), |_| Err(
-                "clipboard busy".into()
-            )),
+            copy_error,
             OcrCompletion::Error(
                 "Text was recognized but could not be copied: clipboard busy".into()
             )
+        );
+        assert_eq!(
+            copy_error.notification_message(),
+            "Text scan failed: Text was recognized but could not be copied: clipboard busy"
         );
     }
 }

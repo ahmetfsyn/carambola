@@ -107,6 +107,7 @@ export component OverlayPrototype inherits Window {
     in property <bool> can-clear-annotations: false;
     in property <bool> export-busy: false;
     in property <bool> copy-in-progress: false;
+    in property <bool> ocr-in-progress: false;
     in property <string> export-status: "";
 
     callback pointer-down(float, float, float, float, bool, bool);
@@ -660,7 +661,7 @@ export component OverlayPrototype inherits Window {
         // Keep export input blocked without briefly blackening the entire capture.
         background: transparent;
         Rectangle {
-            visible: !root.copy-in-progress;
+            visible: !root.copy-in-progress && !root.ocr-in-progress;
             x: (parent.width - 320px) / 2;
             y: (parent.height - 52px) / 2;
             width: 320px;

@@ -6,6 +6,40 @@ use windows::Win32::UI::HiDpi::{
 
 use crate::core::frame::CapturedFrame;
 
+/// Keep one tray and global hotkey owner per interactive Windows session.
+pub struct SingleInstanceGuard(windows::Win32::Foundation::HANDLE);
+
+impl SingleInstanceGuard {
+    pub fn acquire() -> Result<Option<Self>, String> {
+        Self::acquire_named(windows::core::w!(
+            "Local\\Carambola.Native.9B0C7DC2-E7ED-4CF6-A9A4-3A5E7E871A45"
+        ))
+    }
+
+    fn acquire_named(name: windows::core::PCWSTR) -> Result<Option<Self>, String> {
+        use windows::Win32::{
+            Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS},
+            System::Threading::CreateMutexW,
+        };
+
+        let handle = unsafe { CreateMutexW(None, false, name) }
+            .map_err(|error| format!("Could not establish the Carambola instance lock: {error}"))?;
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(handle) }.map_err(|error| {
+                format!("Could not release the duplicate instance lock: {error}")
+            })?;
+            return Ok(None);
+        }
+        Ok(Some(Self(handle)))
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
 /// Resolve a recorded logical character to the virtual key used by the
 /// foreground thread's active keyboard layout. RegisterHotKey only accepts a
 /// virtual key, while Slint records the character the user actually pressed.
@@ -1000,9 +1034,22 @@ pub fn activate_overlay() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::enumerate_displays;
+    use super::{enumerate_displays, SingleInstanceGuard};
     use crate::core::display::select_display;
     use std::collections::HashSet;
+
+    #[test]
+    fn instance_lock_rejects_a_second_owner_and_releases_on_drop() {
+        let name = format!("Local\\Carambola.Native.Test.{}", std::process::id())
+            .encode_utf16()
+            .chain([0])
+            .collect::<Vec<_>>();
+        let name = windows::core::PCWSTR(name.as_ptr());
+        let first = SingleInstanceGuard::acquire_named(name).unwrap().unwrap();
+        assert!(SingleInstanceGuard::acquire_named(name).unwrap().is_none());
+        drop(first);
+        assert!(SingleInstanceGuard::acquire_named(name).unwrap().is_some());
+    }
 
     #[test]
     fn settings_icon_uses_the_embedded_carambola_ico() {

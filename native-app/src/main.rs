@@ -56,8 +56,8 @@ struct ExportSuccess {
     preview: CapturedFrame,
 }
 
-struct PendingExportNotification {
-    message: &'static str,
+struct PendingScreenshotNotification {
+    message: String,
     preview: CapturedFrame,
     owner_hwnd: isize,
     enabled: bool,
@@ -86,7 +86,7 @@ fn close_capture_after_export(
     overlay: &OverlayPrototype,
     state: &SelectionState,
     reason: &str,
-    notification: PendingExportNotification,
+    notification: PendingScreenshotNotification,
 ) -> Result<(), String> {
     platform::trace_event(&format!(
         "capture.export_success.close.begin reason={reason:?}"
@@ -99,11 +99,12 @@ fn schedule_capture_close(
     state: &SelectionState,
     reason: &str,
     finish_session: bool,
-    notification: Option<PendingExportNotification>,
+    notification: Option<PendingScreenshotNotification>,
 ) -> Result<(), String> {
     if state.closing.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
+    state.cancel_ocr_operation();
     overlay.set_overlay_closing(true);
     // Leave the captured desktop image visible while the controls fade away.
     // A black cover would otherwise become a full-screen black frame just
@@ -129,6 +130,9 @@ fn schedule_capture_close(
             overlay.set_color_palette_open(false);
             overlay.set_size_menu_open(false);
             overlay.set_copy_in_progress(false);
+            overlay.set_ocr_in_progress(false);
+            overlay.set_export_busy(false);
+            overlay.set_export_status("".into());
             overlay.set_annotation_image(Image::default());
             overlay.set_text_entry_visible(false);
             overlay.set_text_entry_line_count(1);
@@ -156,7 +160,7 @@ fn schedule_capture_close(
             slint::Timer::single_shot(std::time::Duration::from_millis(100), move || {
                 thread::spawn(move || {
                     if let Err(error) = platform::show_screenshot_notification(
-                        notification.message,
+                        &notification.message,
                         notification.owner_hwnd,
                         &notification.preview,
                     ) {
@@ -324,19 +328,20 @@ fn request_save(
             preview: rendered,
         })
     };
-    let completed = move |overlay: &OverlayPrototype, success: ExportSuccess, message| {
-        close_capture_after_export(
-            overlay,
-            &state_for_completion,
-            "saved",
-            PendingExportNotification {
-                message,
-                preview: success.preview,
-                owner_hwnd,
-                enabled: notifications_enabled,
-            },
-        )
-    };
+    let completed =
+        move |overlay: &OverlayPrototype, success: ExportSuccess, message: &'static str| {
+            close_capture_after_export(
+                overlay,
+                &state_for_completion,
+                "saved",
+                PendingScreenshotNotification {
+                    message: message.to_owned(),
+                    preview: success.preview,
+                    owner_hwnd,
+                    enabled: notifications_enabled,
+                },
+            )
+        };
     if save_as {
         start_export_operation_claimed(
             overlay,
@@ -524,6 +529,7 @@ struct SelectionState {
     editor: Arc<Mutex<Option<AnnotationEditor>>>,
     text_position: Arc<Mutex<Option<ImagePoint>>>,
     text_awaiting_position: Arc<Mutex<bool>>,
+    ocr_cancellation: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     session: Arc<CaptureSession>,
     toolbar_snapshot: Arc<Mutex<Option<ToolbarPositionSnapshot>>>,
     toolbar_drag: Arc<Mutex<Option<ToolbarDrag>>>,
@@ -573,6 +579,7 @@ impl SelectionState {
             editor: Arc::new(Mutex::new(None)),
             text_position: Arc::new(Mutex::new(None)),
             text_awaiting_position: Arc::new(Mutex::new(false)),
+            ocr_cancellation: Arc::new(Mutex::new(None)),
             session: Arc::new(CaptureSession::default()),
             toolbar_snapshot: Arc::new(Mutex::new(None)),
             toolbar_drag: Arc::new(Mutex::new(None)),
@@ -590,6 +597,17 @@ impl SelectionState {
             .text_awaiting_position
             .lock()
             .expect("text reposition lock") = false;
+    }
+
+    fn cancel_ocr_operation(&self) {
+        if let Some(cancellation) = self
+            .ocr_cancellation
+            .lock()
+            .expect("OCR cancellation lock")
+            .take()
+        {
+            cancellation.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -1516,6 +1534,15 @@ fn update_preview_if_possible(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup_started = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    #[cfg(target_os = "windows")]
+    let _single_instance =
+        match platform::windows::SingleInstanceGuard::acquire().map_err(std::io::Error::other)? {
+            Some(guard) => guard,
+            None => {
+                log::info!("Carambola is already running in this Windows session");
+                return Ok(());
+            }
+        };
     platform::initialize().map_err(std::io::Error::other)?;
     #[cfg(target_os = "windows")]
     let _window_diagnostics = match platform::window_diagnostics::WindowDiagnostics::start() {
@@ -1806,6 +1833,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         overlay.set_can_redo(false);
         overlay.set_export_busy(false);
         overlay.set_copy_in_progress(false);
+        overlay.set_ocr_in_progress(false);
         overlay.set_export_status("Capturing desktop…".into());
         clear_selection_preview(&overlay);
 
@@ -2901,10 +2929,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_for_ocr = selection.clone();
     let busy_for_ocr = export_busy.clone();
     let clipboard_owner_for_ocr = clipboard_owner_hwnd.clone();
+    let settings_for_ocr = application_settings.clone();
     overlay.on_recognize_text(move || {
         let Some(overlay) = weak_overlay_for_ocr.upgrade() else {
             return;
         };
+        if state_for_ocr.closing.load(Ordering::Acquire) {
+            return;
+        }
         if state_for_ocr
             .text_position
             .lock()
@@ -2932,45 +2964,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            overlay.set_export_status("Another export or OCR operation is already running.".into());
+            log::info!("Ignoring OCR request while another export or OCR operation is running");
             return;
         }
+        let notifications_enabled = settings_for_ocr
+            .lock()
+            .expect("application settings lock")
+            .notifications_enabled;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        *state_for_ocr
+            .ocr_cancellation
+            .lock()
+            .expect("OCR cancellation lock") = Some(cancellation.clone());
+        overlay.set_ocr_in_progress(true);
         overlay.set_export_busy(true);
-        overlay.set_export_status("Recognizing text locally…".into());
+        overlay.set_export_status("".into());
         let owner_hwnd = clipboard_owner_for_ocr.load(Ordering::Acquire);
         let weak_overlay = overlay.as_weak();
+        let state_for_worker = state_for_ocr.clone();
+        let state_for_dispatch = state_for_ocr.clone();
+        let cancellation_for_worker = cancellation.clone();
+        let cancellation_for_dispatch = cancellation.clone();
+        let busy_for_worker = busy_for_ocr.clone();
         let busy_for_dispatch = busy_for_ocr.clone();
         thread::spawn(move || {
             let recognized = normalize_result(platform::recognize_text(&crop));
+            if cancellation_for_worker.load(Ordering::Acquire)
+                || !state_for_worker.session.is_active()
+            {
+                busy_for_worker.store(false, Ordering::Release);
+                return;
+            }
             let completion = complete_ocr(recognized, |text| {
                 platform::copy_text_to_clipboard(text, owner_hwnd)
             });
-            let (status, notification) = match completion {
-                OcrCompletion::Copied { notification, .. } => (
-                    "Recognized text was copied to the clipboard.".to_owned(),
-                    Some(notification),
-                ),
-                OcrCompletion::Empty { notification } => (
-                    "No text was found in the selected crop.".to_owned(),
-                    Some(notification),
-                ),
-                OcrCompletion::Error(error) => (format!("OCR failed: {error}"), None),
+            if cancellation_for_worker.load(Ordering::Acquire)
+                || !state_for_worker.session.is_active()
+            {
+                busy_for_worker.store(false, Ordering::Release);
+                return;
+            }
+            let message = completion.notification_message();
+            let close_reason = match &completion {
+                OcrCompletion::Copied { .. } => {
+                    log::info!("{message}");
+                    "ocr_copied"
+                }
+                OcrCompletion::Empty => {
+                    log::info!("{message}");
+                    "ocr_empty"
+                }
+                OcrCompletion::Error(error) => {
+                    log::error!("OCR failed: {error}");
+                    "ocr_failed"
+                }
             };
-            let notification_error = notification
-                .and_then(|message| platform::show_notification(message, owner_hwnd).err());
-            let busy_for_error = busy_for_dispatch.clone();
+            let notification = PendingScreenshotNotification {
+                message,
+                preview: crop,
+                owner_hwnd,
+                enabled: notifications_enabled,
+            };
             let dispatched = slint::invoke_from_event_loop(move || {
+                if cancellation_for_dispatch.load(Ordering::Acquire)
+                    || !state_for_dispatch.session.is_active()
+                {
+                    busy_for_dispatch.store(false, Ordering::Release);
+                    return;
+                }
                 if let Some(overlay) = weak_overlay.upgrade() {
-                    let message = notification_error
-                        .map(|error| format!("{status} Notification failed: {error}"))
-                        .unwrap_or(status);
-                    overlay.set_export_busy(false);
-                    overlay.set_export_status(message.into());
+                    if let Err(error) = schedule_capture_close(
+                        &overlay,
+                        &state_for_dispatch,
+                        close_reason,
+                        true,
+                        Some(notification),
+                    ) {
+                        log::error!("Could not close the overlay after OCR: {error}");
+                        overlay.set_ocr_in_progress(false);
+                        overlay.set_export_busy(false);
+                        overlay.set_export_status("".into());
+                        overlay.set_overlay_closing(false);
+                        state_for_dispatch.closing.store(false, Ordering::Release);
+                    }
                 }
                 busy_for_dispatch.store(false, Ordering::Release);
             });
             if let Err(error) = dispatched {
-                busy_for_error.store(false, Ordering::Release);
+                cancellation_for_worker.store(true, Ordering::Release);
+                busy_for_worker.store(false, Ordering::Release);
                 log::error!("Could not return OCR results to the UI thread: {error}");
             }
         });
@@ -3074,8 +3156,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         overlay,
                         &state,
                         "copied",
-                        PendingExportNotification {
-                            message,
+                        PendingScreenshotNotification {
+                            message: message.to_owned(),
                             preview: success.preview,
                             owner_hwnd,
                             enabled: notifications_enabled,

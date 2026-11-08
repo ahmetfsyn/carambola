@@ -1,6 +1,6 @@
 [package]
 name = "carambola-native"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 publish = false
 build = "build.rs"
@@ -29,6 +29,7 @@ slint = { version = "1.18.1", default-features = false, features = [
 [build-dependencies]
 slint-build = "1.18.1"
 cc = "1"
+embed-resource = "3.0.12"
 
 [patch.crates-io]
 winit = { path = "vendor/winit-0.30.13" }
@@ -40,6 +41,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
