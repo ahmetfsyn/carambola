@@ -1555,9 +1555,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     platform::trace_event("main.entry dpi_initialized=true");
     #[cfg(target_os = "windows")]
     {
+        use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
+
         let backend_result = slint::BackendSelector::new()
             .backend_name("winit".into())
             .renderer_name("software".into())
+            // Carambola has no file-drop workflow; avoid registering Winit's OLE drop target.
+            .with_winit_window_attributes_hook(|attributes| attributes.with_drag_and_drop(false))
             .select();
         platform::trace_event(&format!(
             "backend.select.after success={}",

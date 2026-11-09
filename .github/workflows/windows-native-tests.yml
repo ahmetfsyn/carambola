@@ -2,13 +2,17 @@ name: Native Windows tests
 
 on:
   push:
+    branches:
+      - "**"
     paths:
       - "native-app/**"
       - ".github/workflows/windows-native-tests.yml"
+      - ".github/workflows/release-native.yml"
   pull_request:
     paths:
       - "native-app/**"
       - ".github/workflows/windows-native-tests.yml"
+      - ".github/workflows/release-native.yml"
 
 permissions:
   contents: read
@@ -22,8 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test release metadata validation
+        run: ./tools/Test-ReleaseMetadata.ps1
+        shell: pwsh
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: Check Clippy
+        run: cargo clippy --locked --all-targets
       - name: Check Windows build
         run: cargo check --locked
       - name: Run Windows tests

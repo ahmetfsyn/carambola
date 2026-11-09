@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::atomic_file;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AppSettings {
@@ -47,13 +49,8 @@ impl AppSettings {
             .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
         let contents = serde_json::to_vec_pretty(self)
             .map_err(|error| format!("Could not encode Carambola settings: {error}"))?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, contents)
-            .map_err(|error| format!("Could not save {}: {error}", temporary.display()))?;
-        fs::rename(&temporary, path).map_err(|error| {
-            let _ = fs::remove_file(&temporary);
-            format!("Could not replace {}: {error}", path.display())
-        })
+        atomic_file::write(path, &contents)
+            .map_err(|error| format!("Could not save {}: {error}", path.display()))
     }
 }
 
