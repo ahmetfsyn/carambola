@@ -1,5 +1,6 @@
 pub mod annotation_render;
 pub mod annotations;
+pub mod atomic_file;
 pub mod clipboard;
 pub mod display;
 pub mod export;

@@ -1,0 +1,149 @@
+name: Native Windows release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: native-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-windows-x64:
+    if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: native-app
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}\carambola-target
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate release metadata and tag state
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          ./tools/Test-ReleaseMetadata.ps1
+          ./tools/Validate-ReleaseMetadata.ps1 -Tag $env:RELEASE_TAG
+
+          git merge-base --is-ancestor HEAD origin/master
+          if ($LASTEXITCODE -ne 0) { throw 'The release tag is not on the current master history.' }
+
+          $releaseCheck = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" 2>&1
+          $releaseCheckExit = $LASTEXITCODE
+          if ($releaseCheckExit -eq 0) { throw "A GitHub Release already exists for $env:RELEASE_TAG; refusing to overwrite it." }
+          if (($releaseCheck -join "`n") -notmatch 'Not Found|404') {
+            throw "Could not prove that no GitHub Release exists for $env:RELEASE_TAG. $($releaseCheck -join ' ')"
+          }
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets
+
+      - name: Run all Rust tests
+        run: cargo test --locked --all-targets
+
+      - name: Check Windows target
+        run: cargo check --locked
+
+      - name: Build optimized Windows executable
+        run: cargo build --locked --release
+
+      - name: Stage portable release files and checksums
+        id: package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $exeName = "Carambola_${version}_windows_x64.exe"
+          $zipName = "Carambola_${version}_windows_x64_portable.zip"
+          $releaseDir = Join-Path $env:RUNNER_TEMP "carambola-release-$version"
+          $portableDir = Join-Path $releaseDir 'portable'
+          New-Item -ItemType Directory -Path $portableDir -Force | Out-Null
+
+          $builtExe = Join-Path $env:CARGO_TARGET_DIR 'release/carambola-native.exe'
+          if (!(Test-Path -LiteralPath $builtExe)) { throw "Release build did not produce $builtExe" }
+          Copy-Item -LiteralPath $builtExe -Destination (Join-Path $releaseDir $exeName)
+          Copy-Item -LiteralPath $builtExe -Destination (Join-Path $portableDir 'carambola-native.exe')
+          @'
+          Carambola Native for Windows x64
+
+          Extract this folder to a stable location and run carambola-native.exe.
+          The app starts in the notification area. Default capture shortcut: Ctrl+Shift+S.
+          OCR uses the Windows OCR language packs installed on this PC.
+          This portable build has no installer and is not Authenticode-signed.
+          See the project README for usage, privacy, requirements, and limitations.
+          '@ | Set-Content -Encoding utf8 -LiteralPath (Join-Path $portableDir 'README.txt')
+          Compress-Archive -Path (Join-Path $portableDir '*') -DestinationPath (Join-Path $releaseDir $zipName)
+
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir $exeName)).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir $zipName)).Hash.ToLowerInvariant()
+          @("$exeHash  $exeName", "$zipHash  $zipName") | Set-Content -Encoding ascii -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt')
+
+          "release_dir=$releaseDir" >> $env:GITHUB_OUTPUT
+          "exe_name=$exeName" >> $env:GITHUB_OUTPUT
+          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+
+      - name: Create draft release with verified build outputs
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
+          EXE_NAME: ${{ steps.package.outputs.exe_name }}
+          ZIP_NAME: ${{ steps.package.outputs.zip_name }}
+        shell: pwsh
+        run: |
+          $releaseNotes = Join-Path $env:GITHUB_WORKSPACE 'RELEASE_NOTES.md'
+          $exePath = Join-Path $env:RELEASE_DIR $env:EXE_NAME
+          $zipPath = Join-Path $env:RELEASE_DIR $env:ZIP_NAME
+          $checksumsPath = Join-Path $env:RELEASE_DIR 'SHA256SUMS.txt'
+          gh release create $env:RELEASE_TAG $exePath $zipPath $checksumsPath `
+            --draft --verify-tag --title "Carambola Native $env:RELEASE_TAG (Windows x64)" `
+            --notes-file $releaseNotes --target $env:GITHUB_SHA --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release and upload every artifact.' }
+
+          $checkDir = Join-Path $env:RUNNER_TEMP 'carambola-release-remote-check'
+          New-Item -ItemType Directory -Path $checkDir -Force | Out-Null
+          gh release download $env:RELEASE_TAG --pattern $env:EXE_NAME --pattern $env:ZIP_NAME --pattern SHA256SUMS.txt --dir $checkDir --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download release assets for integrity verification.' }
+
+          foreach ($name in @($env:EXE_NAME, $env:ZIP_NAME)) {
+            $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $env:RELEASE_DIR $name)).Hash
+            $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $checkDir $name)).Hash
+            if ($localHash -ne $remoteHash) { throw "Uploaded asset $name failed SHA-256 verification." }
+          }
+          if ((Get-Content -Raw -LiteralPath (Join-Path $env:RELEASE_DIR 'SHA256SUMS.txt')) -ne
+              (Get-Content -Raw -LiteralPath (Join-Path $checkDir 'SHA256SUMS.txt'))) {
+            throw 'Uploaded SHA256SUMS.txt differs from the locally generated file.'
+          }
+
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if (!$release.draft) { throw 'The release must remain a draft until all uploaded assets have been verified.' }
+          $names = @($release.assets | ForEach-Object name)
+          foreach ($name in @($env:EXE_NAME, $env:ZIP_NAME, 'SHA256SUMS.txt')) {
+            if ($names -notcontains $name) { throw "Expected release asset is missing: $name" }
+          }
+
+          gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" -F draft=false | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Assets passed verification, but the release could not be published.' }
+
+          $published = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($published.draft -or $published.tag_name -ne $env:RELEASE_TAG) {
+            throw 'The release was not published under the requested tag.'
+          }

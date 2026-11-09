@@ -1,12 +1,9 @@
 //! PNG encoding and file output for rendered screenshot frames.
 
 use image::ImageEncoder;
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use super::frame::CapturedFrame;
+use super::{atomic_file, frame::CapturedFrame};
 
 pub fn encode_png(frame: &CapturedFrame) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
@@ -23,12 +20,8 @@ pub fn encode_png(frame: &CapturedFrame) -> Result<Vec<u8>, String> {
 
 pub fn write_png(path: &Path, frame: &CapturedFrame) -> Result<(), String> {
     let bytes = encode_png(frame)?;
-    let mut file = std::fs::File::create(path)
-        .map_err(|error| format!("Could not create PNG at {}: {error}", path.display()))?;
-    file.write_all(&bytes)
-        .map_err(|error| format!("Could not write PNG to {}: {error}", path.display()))?;
-    file.sync_all()
-        .map_err(|error| format!("Could not commit PNG to {}: {error}", path.display()))
+    atomic_file::write(path, &bytes)
+        .map_err(|error| format!("Could not write PNG at {}: {error}", path.display()))
 }
 
 pub fn ensure_png_extension(mut path: PathBuf) -> Result<PathBuf, String> {
@@ -90,7 +83,7 @@ mod tests {
         let path = scratch_dir().join("missing").join("image.png");
         let frame = CapturedFrame::new(1, 1, vec![1, 2, 3, 255]).unwrap();
         let error = write_png(&path, &frame).unwrap_err();
-        assert!(error.contains("Could not create PNG"));
+        assert!(error.contains("Could not write PNG"));
     }
 
     #[test]

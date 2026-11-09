@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
 const REPOSITORY = "https://github.com/ahmetfsyn/carambola";
-const RELEASES = `${REPOSITORY}/releases`;
+const RELEASES = `${REPOSITORY}/releases/latest`;
 
 type Language = "en" | "tr";
 
@@ -11,7 +11,7 @@ const copy = {
     eyebrow: "A little tool for the things you need to show",
     title: <>A clearer way to<br /><span>show what you mean.</span></>,
     intro: "Capture a part of your screen, mark it up, and send it on. Carambola keeps the whole thing quick and close at hand.",
-    download: "Get Carambola", github: "View on GitHub", platform: "For Windows, macOS & Linux", preview: "A closer look",
+    download: "Get Carambola", github: "View on GitHub", platform: "Windows 10/11 · 64-bit", preview: "A closer look",
     previewTitle: "Just the part that matters.", previewSub: "Select · annotate · share",
     selection: "A tiny detail, made clear.", toolSelect: "Select", toolPen: "Pen", toolText: "Text", toolMosaic: "Mosaic", toolCopy: "Copy image",
     sectionLabel: "MADE FOR THE MOMENT", featureTitle: <>Everything you need.<br /><span>Nothing in the way.</span></>,
@@ -27,8 +27,8 @@ const copy = {
     workflowLabel: "THREE SMALL STEPS", workflowTitle: "From screen to shared in seconds.",
     steps: [["01", "Start a capture", "Use your keyboard shortcut or choose Capture Screen from the tray."], ["02", "Select and annotate", "Drag to choose an area. Add a note, arrow, shape, or mosaic."], ["03", "Copy or save", "Copy the image straight to your clipboard or save a PNG." ]],
     privacyLabel: "YOUR SCREEN STAYS YOURS", privacyTitle: <>Made to stay<br /><span>on your computer.</span></>, privacyBody: "Carambola captures and edits screenshots locally. It does not upload them to a cloud service. Copy or save only when you choose.", privacyNote: "No account. No cloud upload feature.",
-    downloadLabel: "READY WHEN YOU ARE", downloadTitle: "Make your next screenshot simpler.", downloadBody: "Check GitHub Releases for available builds and the latest version.", releases: "See GitHub Releases", source: "Explore the source",
-    buildsTitle: "About downloads", mac: "macOS", macText: "An Apple Silicon build has been produced for QA, but no public release asset is verified yet. The app is not notarized, so Gatekeeper may show a warning.", windows: "Windows", windowsText: "No Windows installer is currently verified or published.", linux: "Linux", linuxText: "Linux code paths exist; packaged builds have not been verified.",
+    downloadLabel: "READY WHEN YOU ARE", downloadTitle: "Make your next screenshot simpler.", downloadBody: "Download Carambola Native for Windows 10/11 x64. Releases include a standalone EXE, portable ZIP, and SHA-256 checksums.", releases: "Download for Windows", source: "Explore the source",
+    buildsTitle: "Current build", mac: "macOS", macText: "Not a supported release target. No verified macOS build is available.", windows: "Windows 10/11 x64", windowsText: "Portable EXE and ZIP available. No installer; the executable is unsigned.", linux: "Linux", linuxText: "Not a supported release target. No verified Linux build is available.",
     footerLine: "A small tool for clearer communication.", license: "No license has been selected yet.", made: "Made with care.",
     ariaLanguage: "Choose language", ariaMock: "Illustrative Carambola interface mockup, not an app screenshot",
     ready: "READY", demoDay: "TUESDAY", captureTagline: "CAPTURE THE LITTLE THINGS", scrollExplore: "SCROLL TO EXPLORE",
@@ -39,7 +39,7 @@ const copy = {
     eyebrow: "Göstermek istedikleriniz için küçük bir araç",
     title: <>Ne demek istediğinizi<br /><span>daha net gösterin.</span></>,
     intro: "Ekranınızdan bir alan seçin, üzerine not ekleyin ve paylaşın. Carambola bu işi hızlı ve elinizin altında tutar.",
-    download: "Carambola’yı alın", github: "GitHub’da görüntüle", platform: "Windows, macOS ve Linux için", preview: "Yakından bakın",
+    download: "Carambola’yı alın", github: "GitHub’da görüntüle", platform: "Windows 10/11 · 64 bit", preview: "Yakından bakın",
     previewTitle: "Önemli olanı seçin.", previewSub: "Seç · not ekle · paylaş",
     selection: "Küçük bir ayrıntı, artık daha net.", toolSelect: "Seç", toolPen: "Kalem", toolText: "Metin", toolMosaic: "Mozaik", toolCopy: "Görseli kopyala",
     sectionLabel: "İHTİYACINIZ OLDUĞUNDA", featureTitle: <>İhtiyacınız olan her şey.<br /><span>Önünüze çıkmadan.</span></>,
@@ -55,8 +55,8 @@ const copy = {
     workflowLabel: "ÜÇ KOLAY ADIM", workflowTitle: "Ekrandan paylaşıma, saniyeler içinde.",
     steps: [["01", "Yakalamayı başlatın", "Klavye kısayolunu kullanın veya tepsiden Ekranı Yakala’yı seçin."], ["02", "Alanı seçip not ekleyin", "Bir alan seçmek için sürükleyin. Not, ok, şekil veya mozaik ekleyin."], ["03", "Kopyalayın veya kaydedin", "Görseli doğrudan panoya kopyalayın ya da PNG olarak kaydedin." ]],
     privacyLabel: "EKRANINIZ SİZE AİT", privacyTitle: <>Bilgisayarınızda<br /><span>kalacak şekilde tasarlandı.</span></>, privacyBody: "Carambola ekran görüntülerini yerel olarak alır ve düzenler. Görselleri bulut hizmetine yüklemez. Yalnızca siz istediğinizde kopyalar veya kaydeder.", privacyNote: "Hesap gerekmez. Buluta yükleme özelliği yoktur.",
-    downloadLabel: "HAZIR OLDUĞUNUZDA", downloadTitle: "Bir sonraki ekran görüntünüzü kolaylaştırın.", downloadBody: "Mevcut derlemeleri ve son sürümü GitHub Releases sayfasında görebilirsiniz.", releases: "GitHub Releases sayfası", source: "Kaynak kodu inceleyin",
-    buildsTitle: "İndirmeler hakkında", mac: "macOS", macText: "Kalite kontrol için Apple Silicon derlemesi alındı, ancak doğrulanmış herkese açık bir sürüm dosyası henüz yok. Uygulama noter onaylı olmadığından Gatekeeper uyarı gösterebilir.", windows: "Windows", windowsText: "Doğrulanmış veya yayımlanmış bir Windows yükleyicisi henüz yok.", linux: "Linux", linuxText: "Linux kod yolları mevcut; paketlenmiş derlemeler doğrulanmadı.",
+    downloadLabel: "HAZIR OLDUĞUNUZDA", downloadTitle: "Bir sonraki ekran görüntünüzü kolaylaştırın.", downloadBody: "Carambola Native'i Windows 10/11 x64 için indirin. Sürümlerde tek başına EXE, taşınabilir ZIP ve SHA-256 sağlama toplamları bulunur.", releases: "Windows için indir", source: "Kaynak kodu inceleyin",
+    buildsTitle: "Mevcut derleme", mac: "macOS", macText: "Desteklenen bir sürüm hedefi değildir. Doğrulanmış macOS derlemesi yoktur.", windows: "Windows 10/11 x64", windowsText: "Taşınabilir EXE ve ZIP mevcut. Yükleyici yoktur; yürütülebilir dosya imzalı değildir.", linux: "Linux", linuxText: "Desteklenen bir sürüm hedefi değildir. Doğrulanmış Linux derlemesi yoktur.",
     footerLine: "Daha net iletişim için küçük bir araç.", license: "Henüz bir lisans seçilmedi.", made: "Özenle geliştirildi.",
     ariaLanguage: "Dil seçin", ariaMock: "Carambola arayüzünü gösteren örnek tasarım, uygulama ekran görüntüsü değildir",
     ready: "HAZIR", demoDay: "SALI", captureTagline: "KÜÇÜK AYRINTILARI YAKALAYIN", scrollExplore: "KEŞFETMEK İÇİN KAYDIRIN",

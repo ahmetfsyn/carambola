@@ -1,22 +1,22 @@
-# Carambola v1.0.0
+# Carambola Native v1.1.1
 
-The initial production release supports **Windows x86_64** only.
+This patch release makes the native Rust and Slint Windows application the
+single active desktop product and establishes a native-only tagged release
+workflow. The existing v1.1.0 release and tag are unchanged.
 
 ## Included
 
-- Per-user Windows NSIS installer.
-- Signed in-app update artifact and Windows-only `latest.json` entry.
-- Screenshot capture, selection, annotation, clipboard export, PNG saving, tray controls, and configurable capture shortcut.
-- Optional screenshot notifications and update status in Settings.
+- Standalone Windows x64 executable and portable ZIP.
+- Windows file and product version metadata generated from the Cargo package
+  version.
+- Release tag validation, automated checks, uploaded-asset integrity checks,
+  and SHA-256 checksums.
+- Disabled unused Winit file-drop targets in the native app.
+- Updated native-first project documentation and website download status.
 
-## Upgrade
+## Requirements and limitations
 
-Install v1.0.0 manually from the Windows installer. Signed in-app updates are available from this release onward for supported Windows x86_64 installations.
-
-## Platform status
-
-- Windows x86_64: production release target. See the release page for verified installer and updater assets.
-- macOS Apple Silicon and Intel: not included in this release; they will be added to this same GitHub Release after separate production-readiness testing.
-- Linux x86_64: not included in this release; it will be added to this same GitHub Release after separate production-readiness testing.
-
-The Windows installer is not Authenticode-signed. The updater artifact uses Carambola's existing Tauri updater key. macOS and Linux are not included and are not claimed as supported by this release.
+- Windows 10/11 x64. OCR requires a suitable installed Windows OCR language.
+- No installer, uninstaller, automatic updater, or Authenticode signature.
+- macOS and Linux are not supported release targets.
+- The repository has no top-level project license file.
