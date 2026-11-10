@@ -265,6 +265,7 @@ jobs:
 
       - name: Create draft release with verified build outputs
         env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
           EXE_NAME: ${{ steps.package.outputs.exe_name }}
