@@ -4,6 +4,18 @@ pub mod macos;
 pub mod windows;
 #[cfg(target_os = "windows")]
 mod windows_notifications;
+#[cfg(target_os = "windows")]
+pub mod windows_startup;
+
+#[cfg(target_os = "windows")]
+pub fn initialize_notification_registration() -> Result<(), String> {
+    windows_notifications::initialize_notification_registration()
+}
+
+#[cfg(target_os = "windows")]
+pub fn notification_center_entry_count() -> Result<u32, String> {
+    windows_notifications::notification_center_entry_count()
+}
 
 /// Configure native DPI behavior before the first window is created.
 pub fn initialize() -> Result<(), String> {

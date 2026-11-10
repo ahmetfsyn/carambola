@@ -1,7 +1,8 @@
-# Carambola native v1.1.0 — release candidate
+# Carambola 1.1 — archived release notes
 
-This is the first portable Windows x64 build of the Rust and Slint application.
-It is separate from the existing Tauri v1.0.0 release.
+This was the first portable Windows x64 build of the Rust and Slint application.
+The archived Git tag used the earlier three-part label `v1.1.0`; its public
+version under the two-part scheme is `1.1`.
 
 ## Included
 
@@ -13,7 +14,7 @@ It is separate from the existing Tauri v1.0.0 release.
   notification preference, and screenshot-preview Windows toasts.
 - One native process per Windows session; a second launch exits without adding
   another tray icon or competing for the global hotkey.
-- Existing Carambola icon and v1.1.0 metadata embedded in the executable.
+- Carambola icon and public version `1.1` embedded in the executable.
 
 ## Requirements and limitations
 

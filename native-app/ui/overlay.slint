@@ -49,7 +49,7 @@ component ToolbarIconButton inherits Rectangle {
 }
 
 export component OverlayPrototype inherits Window {
-    title: "Carambola screenshot selection";
+    title: "Carambola";
     in property <length> frame-viewport-width: 1280px;
     in property <length> frame-viewport-height: 720px;
     width: root.frame-viewport-width;
@@ -64,6 +64,7 @@ export component OverlayPrototype inherits Window {
     in property <length> selection-width: 0px;
     in property <length> selection-height: 0px;
     in property <bool> annotation-mode: false;
+    in property <bool> toolbar-resize-active: false;
     in property <bool> overlay-closing: false;
     in-out property <bool> control-held: false;
     in-out property <color> fade-cover-color: #00000000;
@@ -150,6 +151,13 @@ export component OverlayPrototype inherits Window {
     changed text-entry-visible => {
         if (self.text-entry-visible) { root.control-held = false; text-input.focus(); }
         else { escape-scope.focus(); }
+    }
+
+    changed text-entry-awaiting-position => {
+        if (root.text-entry-visible) {
+            if (self.text-entry-awaiting-position) { escape-scope.focus(); }
+            else { text-input.focus(); }
+        }
     }
 
     Image {
@@ -290,6 +298,8 @@ export component OverlayPrototype inherits Window {
         transform-scale-y: root.toolbar-scale * 100%;
         transform-origin: { x: 0px, y: 0px };
         visible: root.annotation-mode;
+        opacity: root.toolbar-resize-active ? 0.0 : 1.0;
+        animate opacity { duration: 140ms; easing: ease-in-out; enabled: root.fade-animation-enabled; }
         background: #0f172af2;
         border-color: #64748b;
         border-width: 1px;
@@ -700,26 +710,40 @@ export component OverlayPrototype inherits Window {
         animate background { duration: 140ms; easing: ease-in-out; enabled: root.fade-animation-enabled; }
     }
 
+    // This is the single owner of overlay shortcuts. TextEdit takes focus
+    // while entering text and keeps its own native undo/redo behavior.
     escape-scope := FocusScope {
         width: 1px;
         height: 1px;
         key-pressed(event) => {
             if (root.overlay-closing) {
                 reject
-            } else if (root.text-entry-visible) {
-                if (event.text == Key.Escape) { root.cancel-text(); accept }
-                else { reject }
+            } else if (root.text-entry-visible && event.text == Key.Escape) {
+                root.cancel-text();
+                accept
+            } else if (root.text-entry-visible && text-input.has-focus) {
+                // The focused TextEdit owns its standard Ctrl+Z/Ctrl+Y editing.
+                reject
+            } else if (root.text-entry-visible
+                && !(event.modifiers.control
+                    && (event.text == "z" || event.text == "Z" || event.text == "y" || event.text == "Y"))) {
+                reject
             } else if (event.text == Key.Control) {
                 root.control-held = true;
                 reject
             } else if (root.annotation-mode && root.selection-width > 0px && root.selection-height > 0px
                 && event.modifiers.control
-                && (event.text == "c" || event.text == "C" || event.text == "s" || event.text == "S")) {
+                && (
+                    ((event.text == "c" || event.text == "C") && !event.modifiers.shift)
+                    || (event.text == "s" || event.text == "S")
+                    || ((event.text == "z" || event.text == "Z" || event.text == "y" || event.text == "Y")
+                        && !event.modifiers.shift)
+                )) {
                 root.overlay-shortcut-requested(
                     event.text,
                     event.modifiers.control,
                     event.modifiers.shift,
-                    root.text-entry-visible
+                    text-input.has-focus
                 );
                 accept
             } else if (event.text == Key.Escape) {
@@ -744,19 +768,22 @@ export component SettingsPrototype inherits Window {
     title: "Carambola Settings";
     icon: @image-url("../assets/carambola.ico");
     preferred-width: 440px;
-    preferred-height: 324px;
+    preferred-height: 370px;
     min-width: 440px;
-    min-height: 324px;
+    min-height: 370px;
     background: #0b1220;
 
     in-out property <string> save-directory: "";
     in-out property <string> capture-shortcut: "Ctrl+Shift+S";
     in-out property <bool> notifications-enabled: true;
+    in-out property <bool> startup-enabled: false;
+    in property <bool> startup-supported: false;
     in-out property <bool> shortcut-recording: false;
     in-out property <string> settings-message: "";
     callback choose-save-directory();
     callback shortcut-key-captured(string, bool, bool, bool, bool);
     callback notifications-toggled(bool);
+    callback startup-toggled(bool);
     callback close-settings();
 
     Rectangle {
@@ -852,7 +879,46 @@ export component SettingsPrototype inherits Window {
         }
     }
     Text {
-        x: 40px; y: 248px; width: parent.width - 180px; height: 32px;
+        x: 40px; y: 246px; width: 290px; height: 22px;
+        visible: root.startup-supported;
+        text: "Start Carambola when Windows starts";
+        color: #e2e8f0;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+    Text {
+        x: 40px; y: 268px; width: parent.width - 170px; height: 18px;
+        visible: root.startup-supported;
+        text: "Launch automatically when you sign in";
+        color: #94a3b8;
+        font-size: 10px;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: parent.width - 102px; y: 246px; width: 62px; height: 26px;
+        visible: root.startup-supported;
+        border-radius: 13px;
+        background: root.startup-enabled ? #0e7490 : #334155;
+        accessible-role: switch;
+        accessible-label: "Start Carambola when Windows starts";
+        accessible-checkable: true;
+        accessible-checked <=> root.startup-enabled;
+        accessible-action-default => { root.startup-toggled(!root.startup-enabled); }
+        Text {
+            text: root.startup-enabled ? "On" : "Off";
+            color: #f8fafc;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.startup-toggled(!root.startup-enabled); }
+        }
+    }
+    Text {
+        x: 40px; y: 292px; width: parent.width - 180px; height: 30px;
         visible: root.settings-message != "";
         text: root.settings-message;
         color: #fbbf24;

@@ -1,22 +1,31 @@
-# Carambola Native v1.1.1
+# Carambola 1.0
 
-This patch release makes the native Rust and Slint Windows application the
-single active desktop product and establishes a native-only tagged release
-workflow. The existing v1.1.0 release and tag are unchanged.
+Carambola 1.0 is the first official release of the unified Rust and Slint
+desktop application for Windows 10/11 x64.
 
 ## Included
 
-- Standalone Windows x64 executable and portable ZIP.
-- Windows file and product version metadata generated from the Cargo package
-  version.
-- Release tag validation, automated checks, uploaded-asset integrity checks,
-  and SHA-256 checksums.
-- Disabled unused Winit file-drop targets in the native app.
-- Updated native-first project documentation and website download status.
+- Monitor-under-pointer capture with a movable and resizable selection.
+- Toolbar fades out while resizing and returns when the resize finishes.
+- Pen, arrow, rectangle, triangle, ellipse, text, and mosaic annotations.
+- Ctrl+Z undo and Ctrl+Y redo for annotation edits while a selection is active.
+- Clipboard copy, PNG save, background Windows OCR, tray controls, and a
+  configurable global capture shortcut.
+- Per-user `Carambola-Setup-1.0.exe` installer with Apps & Features
+  registration, Start Menu shortcuts, and an optional desktop shortcut.
+- Standalone `Carambola.exe` and `Carambola-1.0-Windows-x64.zip` with
+  `Carambola.exe` and `README.txt`.
+- Upgrades and uninstall retain settings and diagnostics under
+  `%APPDATA%\Carambola`; close the app before upgrading or uninstalling.
+- Windows file and product metadata use the name Carambola and public version
+  `1.0`.
 
 ## Requirements and limitations
 
 - Windows 10/11 x64. OCR requires a suitable installed Windows OCR language.
-- No installer, uninstaller, automatic updater, or Authenticode signature.
+- The installer and portable EXE/ZIP are not Authenticode-signed. There is no
+  automatic updater.
 - macOS and Linux are not supported release targets.
 - The repository has no top-level project license file.
+- Interactive physical Windows regression checks are still needed; this
+  release note does not claim that they have been completed.

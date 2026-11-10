@@ -1,4 +1,4 @@
-# Native Carambola application
+# Carambola application
 
 The Rust and Slint application runs on Windows 10/11 x64. It starts in the
 notification area, captures the monitor under the pointer, and supports crop
@@ -22,9 +22,22 @@ cargo build --locked --release
 ./tools/Test-ReleaseMetadata.ps1
 ```
 
-The executable is `target\release\carambola-native.exe`. Release metadata is
-generated from the version in `Cargo.toml`, and the tagged release workflow
-checks that the tag matches it.
+From the repository root, build the per-user Windows installer with:
+
+```powershell
+.\scripts\build-windows-installer.ps1
+```
+
+This command builds the release executable if needed, then invokes Inno Setup's
+`ISCC.exe` compiler. Install Inno Setup 7 from its official download page when
+the compiler is missing; the script never downloads or runs the Inno Setup
+installer itself.
+
+Cargo builds `target\release\carambola.exe`; release packages present the
+application as `Carambola.exe`. Cargo's technical version uses three numeric
+components (for example, `1.0.0`) and maps to the public two-part version `1.0`.
+The package metadata is the authoritative source; the release workflow checks
+that a two-part tag such as `v1.0` matches it.
 
 See [WINDOWS_MANUAL_REGRESSION.md](WINDOWS_MANUAL_REGRESSION.md) for
 hardware-dependent checks. Do not treat automated tests as physical Windows

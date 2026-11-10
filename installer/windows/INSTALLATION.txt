@@ -1,0 +1,9 @@
+Carambola
+
+Launch Carambola from the Start Menu shortcut. The desktop shortcut is optional.
+Close Carambola before installing an upgrade or uninstalling it. Setup and the
+uninstaller do not terminate the app automatically.
+
+User settings and diagnostics under %APPDATA%\Carambola are retained during
+upgrades and uninstall. Remove that folder yourself only if you also want to
+delete your Carambola user data.

@@ -1,9 +1,10 @@
-name: Native Windows release
+name: Carambola Windows release
 
 on:
   push:
     tags:
-      - "v*.*.*"
+      # GitHub Actions filters are globs; the metadata validator enforces exact MAJOR.MINOR syntax.
+      - 'v[0-9]*.[0-9]*'
 
 permissions:
   contents: write
@@ -65,27 +66,65 @@ jobs:
       - name: Build optimized Windows executable
         run: cargo build --locked --release
 
-      - name: Stage portable release files and checksums
+      - name: Install pinned Inno Setup 7.1.1
+        shell: pwsh
+        run: |
+          $installerPath = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          $installerUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe'
+          $expectedSha256 = '8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0'
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath
+
+          $actualSha256 = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) { throw 'The pinned Inno Setup installer failed SHA-256 verification.' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notlike '*Pyrsys B.V.*') {
+            throw 'The pinned Inno Setup installer does not have a valid Pyrsys B.V. signature.'
+          }
+
+          $process = Start-Process -FilePath $installerPath `
+            -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-') `
+            -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed with exit code $($process.ExitCode)." }
+
+          $compilerPath = $null
+          foreach ($candidate in @(
+            (Join-Path $env:ProgramFiles 'Inno Setup 7/ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7/ISCC.exe')
+          )) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $compilerPath = $candidate; break }
+          }
+          if (!$compilerPath) { throw 'ISCC.exe was not found after installing the pinned Inno Setup release.' }
+          "INNO_SETUP_ISCC=$compilerPath" >> $env:GITHUB_ENV
+          & $compilerPath --version
+
+      - name: Stage release files and checksums
         id: package
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         shell: pwsh
         run: |
           $version = $env:RELEASE_TAG.Substring(1)
-          $exeName = "Carambola_${version}_windows_x64.exe"
-          $zipName = "Carambola_${version}_windows_x64_portable.zip"
+          $exeName = 'Carambola.exe'
+          $zipName = "Carambola-$version-Windows-x64.zip"
           $releaseDir = Join-Path $env:RUNNER_TEMP "carambola-release-$version"
           $portableDir = Join-Path $releaseDir 'portable'
           New-Item -ItemType Directory -Path $portableDir -Force | Out-Null
 
-          $builtExe = Join-Path $env:CARGO_TARGET_DIR 'release/carambola-native.exe'
+          $builtExe = Join-Path $env:CARGO_TARGET_DIR 'release/carambola.exe'
           if (!(Test-Path -LiteralPath $builtExe)) { throw "Release build did not produce $builtExe" }
+          $versionInfo = (Get-Item -LiteralPath $builtExe).VersionInfo
+          if ($versionInfo.ProductName -ne 'Carambola' -or
+              $versionInfo.ProductVersion -ne $version -or
+              $versionInfo.FileVersion -ne $version -or
+              $versionInfo.OriginalFilename -ne 'Carambola.exe') {
+            throw "Windows executable metadata does not match Carambola $version."
+          }
           Copy-Item -LiteralPath $builtExe -Destination (Join-Path $releaseDir $exeName)
-          Copy-Item -LiteralPath $builtExe -Destination (Join-Path $portableDir 'carambola-native.exe')
+          Copy-Item -LiteralPath $builtExe -Destination (Join-Path $portableDir 'Carambola.exe')
           @'
-          Carambola Native for Windows x64
+          Carambola for Windows x64
 
-          Extract this folder to a stable location and run carambola-native.exe.
+          Extract this folder to a stable location and run Carambola.exe.
           The app starts in the notification area. Default capture shortcut: Ctrl+Shift+S.
           OCR uses the Windows OCR language packs installed on this PC.
           This portable build has no installer and is not Authenticode-signed.
@@ -93,13 +132,119 @@ jobs:
           '@ | Set-Content -Encoding utf8 -LiteralPath (Join-Path $portableDir 'README.txt')
           Compress-Archive -Path (Join-Path $portableDir '*') -DestinationPath (Join-Path $releaseDir $zipName)
 
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $releaseDir $zipName))
+          try {
+            $entries = @($archive.Entries | ForEach-Object FullName | Sort-Object)
+          } finally {
+            $archive.Dispose()
+          }
+          $expectedEntries = @('Carambola.exe', 'README.txt')
+          if (($entries -join "`n") -ne ($expectedEntries -join "`n")) {
+            throw "Portable archive contents are unexpected: $($entries -join ', ')"
+          }
+
+          $installerScript = Join-Path $env:GITHUB_WORKSPACE 'scripts/build-windows-installer.ps1'
+          & $installerScript -Version $version -OutputDirectory $releaseDir `
+            -ExecutablePath $builtExe -ISCCPath $env:INNO_SETUP_ISCC -SkipBuild
+          $setupName = "Carambola-Setup-$version.exe"
+          $setupPath = Join-Path $releaseDir $setupName
+          if (!(Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+            throw "Installer build did not produce $setupPath"
+          }
+
           $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir $exeName)).Hash.ToLowerInvariant()
           $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir $zipName)).Hash.ToLowerInvariant()
-          @("$exeHash  $exeName", "$zipHash  $zipName") | Set-Content -Encoding ascii -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt')
+          $setupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $setupPath).Hash.ToLowerInvariant()
+          @("$exeHash  $exeName", "$zipHash  $zipName", "$setupHash  $setupName") |
+            Set-Content -Encoding ascii -LiteralPath (Join-Path $releaseDir 'SHA256SUMS.txt')
 
           "release_dir=$releaseDir" >> $env:GITHUB_OUTPUT
           "exe_name=$exeName" >> $env:GITHUB_OUTPUT
           "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+          "setup_name=$setupName" >> $env:GITHUB_OUTPUT
+
+      - name: Test installer install, registration, uninstall, and user-data retention
+        env:
+          RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
+          SETUP_NAME: ${{ steps.package.outputs.setup_name }}
+        shell: pwsh
+        run: |
+          $setupPath = Join-Path $env:RELEASE_DIR $env:SETUP_NAME
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs/Carambola'
+          $dataDir = Join-Path $env:APPDATA 'Carambola'
+          $sentinelPath = Join-Path $dataDir 'installer-validation-sentinel.txt'
+          $programsDir = Join-Path $env:APPDATA 'Microsoft/Windows/Start Menu/Programs'
+          $mainShortcut = Join-Path $programsDir 'Carambola.lnk'
+          $legacyShortcut = Join-Path $programsDir 'Carambola Screenshot Notifications.lnk'
+          $sentinelContents = 'Carambola installer validation sentinel'
+
+          foreach ($path in @($installDir, $dataDir, $mainShortcut, $legacyShortcut)) {
+            if (Test-Path -LiteralPath $path) { throw "Refusing to overwrite pre-existing runner data: $path" }
+          }
+          New-Item -ItemType Directory -Path $dataDir | Out-Null
+          Set-Content -LiteralPath $sentinelPath -Value $sentinelContents -Encoding utf8
+
+          try {
+            $install = Start-Process -FilePath $setupPath `
+              -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') `
+              -Wait -PassThru
+            if ($install.ExitCode -ne 0) { throw "Installer test returned exit code $($install.ExitCode)." }
+
+            foreach ($file in @('Carambola.exe', 'README.txt', 'unins000.exe')) {
+              if (!(Test-Path -LiteralPath (Join-Path $installDir $file) -PathType Leaf)) {
+                throw "Expected installed file is missing: $file"
+              }
+            }
+            if (!(Test-Path -LiteralPath $mainShortcut -PathType Leaf) -or
+                (Test-Path -LiteralPath $legacyShortcut)) {
+              throw 'The Carambola Start Menu shortcut was not installed cleanly.'
+            }
+            $shell = New-Object -ComObject Shell.Application
+            $shortcutItem = $shell.Namespace($programsDir).ParseName('Carambola.lnk')
+            if (!$shortcutItem -or
+                $shortcutItem.ExtendedProperty('System.AppUserModel.ID') -ne 'io.carambola.desktop') {
+              throw 'The Carambola shortcut has the wrong notification identity.'
+            }
+            $uninstallEntry = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' |
+              ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath } |
+              Where-Object { $_.DisplayName -eq 'Carambola' } |
+              Select-Object -First 1
+            if (!$uninstallEntry) { throw 'Carambola was not registered in Apps & Features.' }
+            if ((Get-Content -Raw -LiteralPath $sentinelPath).Trim() -ne $sentinelContents) {
+              throw 'Installing Carambola changed the user-data sentinel.'
+            }
+
+            $uninstall = Start-Process -FilePath (Join-Path $installDir 'unins000.exe') `
+              -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') `
+              -Wait -PassThru
+            if ($uninstall.ExitCode -ne 0) { throw "Uninstaller test returned exit code $($uninstall.ExitCode)." }
+
+            foreach ($file in @('Carambola.exe', 'README.txt', 'unins000.exe')) {
+              if (Test-Path -LiteralPath (Join-Path $installDir $file)) {
+                throw "Uninstall left an application file behind: $file"
+              }
+            }
+            if ((Test-Path -LiteralPath $mainShortcut) -or (Test-Path -LiteralPath $legacyShortcut)) {
+              throw 'Uninstall left a Carambola Start Menu shortcut behind.'
+            }
+            $remainingEntry = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' |
+              ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath } |
+              Where-Object { $_.DisplayName -eq 'Carambola' } |
+              Select-Object -First 1
+            if ($remainingEntry) { throw 'Uninstall left the Apps & Features entry behind.' }
+            if ((Get-Content -Raw -LiteralPath $sentinelPath).Trim() -ne $sentinelContents) {
+              throw 'Uninstall deleted or changed the user-data sentinel.'
+            }
+          } finally {
+            if (Test-Path -LiteralPath $sentinelPath) {
+              $dataFiles = @(Get-ChildItem -LiteralPath $dataDir -Force)
+              if ($dataFiles.Count -eq 1 -and $dataFiles[0].FullName -eq $sentinelPath) {
+                Remove-Item -LiteralPath $sentinelPath -Force
+                Remove-Item -LiteralPath $dataDir -Force
+              }
+            }
+          }
 
       - name: Create draft release with verified build outputs
         env:
@@ -107,23 +252,26 @@ jobs:
           RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
           EXE_NAME: ${{ steps.package.outputs.exe_name }}
           ZIP_NAME: ${{ steps.package.outputs.zip_name }}
+          SETUP_NAME: ${{ steps.package.outputs.setup_name }}
         shell: pwsh
         run: |
           $releaseNotes = Join-Path $env:GITHUB_WORKSPACE 'RELEASE_NOTES.md'
           $exePath = Join-Path $env:RELEASE_DIR $env:EXE_NAME
           $zipPath = Join-Path $env:RELEASE_DIR $env:ZIP_NAME
+          $setupPath = Join-Path $env:RELEASE_DIR $env:SETUP_NAME
           $checksumsPath = Join-Path $env:RELEASE_DIR 'SHA256SUMS.txt'
-          gh release create $env:RELEASE_TAG $exePath $zipPath $checksumsPath `
-            --draft --verify-tag --title "Carambola Native $env:RELEASE_TAG (Windows x64)" `
+          gh release create $env:RELEASE_TAG $exePath $zipPath $setupPath $checksumsPath `
+            --draft --verify-tag --title "Carambola $env:RELEASE_TAG (Windows x64)" `
             --notes-file $releaseNotes --target $env:GITHUB_SHA --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release and upload every artifact.' }
 
           $checkDir = Join-Path $env:RUNNER_TEMP 'carambola-release-remote-check'
           New-Item -ItemType Directory -Path $checkDir -Force | Out-Null
-          gh release download $env:RELEASE_TAG --pattern $env:EXE_NAME --pattern $env:ZIP_NAME --pattern SHA256SUMS.txt --dir $checkDir --repo $env:GITHUB_REPOSITORY
+          gh release download $env:RELEASE_TAG --pattern $env:EXE_NAME --pattern $env:ZIP_NAME `
+            --pattern $env:SETUP_NAME --pattern SHA256SUMS.txt --dir $checkDir --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'Could not download release assets for integrity verification.' }
 
-          foreach ($name in @($env:EXE_NAME, $env:ZIP_NAME)) {
+          foreach ($name in @($env:EXE_NAME, $env:ZIP_NAME, $env:SETUP_NAME)) {
             $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $env:RELEASE_DIR $name)).Hash
             $remoteHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $checkDir $name)).Hash
             if ($localHash -ne $remoteHash) { throw "Uploaded asset $name failed SHA-256 verification." }
@@ -136,7 +284,7 @@ jobs:
           $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
           if (!$release.draft) { throw 'The release must remain a draft until all uploaded assets have been verified.' }
           $names = @($release.assets | ForEach-Object name)
-          foreach ($name in @($env:EXE_NAME, $env:ZIP_NAME, 'SHA256SUMS.txt')) {
+          foreach ($name in @($env:EXE_NAME, $env:ZIP_NAME, $env:SETUP_NAME, 'SHA256SUMS.txt')) {
             if ($names -notcontains $name) { throw "Expected release asset is missing: $name" }
           }
 

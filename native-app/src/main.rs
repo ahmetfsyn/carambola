@@ -22,7 +22,7 @@ use core::{
     ocr::{complete as complete_ocr, normalize_result, OcrCompletion},
     selection::{hit_test_selection, GestureKind, LogicalRect, SelectionGeometry, SelectionHit},
     session::CaptureSession,
-    settings::{self, AppSettings},
+    settings::{self, AppSettings, StartupRegistrar},
 };
 use overlay_ui::{OverlayPrototype, SettingsPrototype};
 use slint::private_unstable_api::re_exports::PointerEventKind;
@@ -1016,6 +1016,7 @@ fn reset_to_new_selection(
     *state.geometry.lock().expect("selection geometry lock") =
         SelectionGeometry::new(None, transform)?;
     *state.active_kind.lock().expect("active gesture lock") = None;
+    overlay.set_toolbar_resize_active(false);
     *state.crop.lock().expect("selected crop lock") = None;
     *state.bounds.lock().expect("selection bounds lock") = None;
     state.clear_text_interaction();
@@ -1037,6 +1038,10 @@ fn reset_to_new_selection(
     clear_selection_preview(overlay);
     overlay.invoke_focus_selection();
     Ok(())
+}
+
+fn toolbar_hidden_for_gesture(kind: GestureKind) -> bool {
+    matches!(kind, GestureKind::Resize(_))
 }
 
 fn begin_selection_gesture(
@@ -1095,6 +1100,9 @@ fn begin_selection_gesture(
         .expect("selection geometry lock")
         .begin(kind, x, y, transform)?;
     *state.active_kind.lock().expect("active gesture lock") = Some(kind);
+    if toolbar_hidden_for_gesture(kind) {
+        overlay.set_toolbar_resize_active(true);
+    }
     // The committed annotation image belongs to the old crop. The frozen
     // capture beneath it tracks the live geometry until a new crop is committed.
     overlay.set_annotation_image(Image::default());
@@ -1168,7 +1176,14 @@ fn cancel_selection_gesture(
         .lock()
         .expect("selection geometry lock")
         .cancel();
-    *state.active_kind.lock().expect("active gesture lock") = None;
+    let kind = state
+        .active_kind
+        .lock()
+        .expect("active gesture lock")
+        .take();
+    if kind.is_some_and(toolbar_hidden_for_gesture) {
+        overlay.set_toolbar_resize_active(false);
+    }
     if let Some(transform) = state.current_transform(width, height) {
         let committed = state
             .geometry
@@ -1219,6 +1234,9 @@ fn finish_selection_gesture(
         .lock()
         .expect("active gesture lock")
         .take();
+    if kind.is_some_and(toolbar_hidden_for_gesture) {
+        overlay.set_toolbar_resize_active(false);
+    }
     let Some(candidate) = candidate else {
         state
             .geometry
@@ -1535,6 +1553,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup_started = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     #[cfg(target_os = "windows")]
+    if std::env::args_os().any(|argument| argument == "--test-notification") {
+        let frame = CapturedFrame::new(8, 8, vec![48, 128, 224, 255].repeat(64))
+            .map_err(std::io::Error::other)?;
+        platform::show_screenshot_notification("Carambola test notification", 0, &frame)
+            .map_err(std::io::Error::other)?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let history_count =
+            platform::notification_center_entry_count().map_err(std::io::Error::other)?;
+        if history_count == 0 {
+            return Err(std::io::Error::other(
+                "Windows accepted the test toast, but Notification Center has no Carambola entry",
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
     let _single_instance =
         match platform::windows::SingleInstanceGuard::acquire().map_err(std::io::Error::other)? {
             Some(guard) => guard,
@@ -1544,6 +1580,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
     platform::initialize().map_err(std::io::Error::other)?;
+    #[cfg(target_os = "windows")]
+    if let Err(error) = platform::initialize_notification_registration() {
+        log::warn!("Could not register Windows notifications at startup: {error}");
+    }
     #[cfg(target_os = "windows")]
     let _window_diagnostics = match platform::window_diagnostics::WindowDiagnostics::start() {
         Ok(diagnostics) => diagnostics,
@@ -1569,7 +1609,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         backend_result?;
     }
-    log::info!("Carambola native capture app started");
+    log::info!("Carambola capture app started");
 
     platform::trace_event("main.before_overlay_create");
     let overlay = OverlayPrototype::new().map_err(|error| {
@@ -1600,6 +1640,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     initial_settings.capture_shortcut = initial_settings.capture_shortcut.normalize_legacy_letter();
+    #[cfg(target_os = "windows")]
+    let initial_startup_enabled = {
+        let mut registrar = platform::windows_startup::WindowsStartupRegistrar;
+        let mut startup_error = registrar
+            .set_enabled(initial_settings.launch_on_startup)
+            .err()
+            .map(|error| format!("Could not apply the Windows startup preference: {error}"));
+        let actual_enabled = match registrar.is_enabled() {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                let message = format!("Could not read the Windows startup registration: {error}");
+                startup_error = Some(match startup_error {
+                    Some(previous) => format!("{previous}. {message}"),
+                    None => message,
+                });
+                false
+            }
+        };
+        if let Some(error) = startup_error {
+            log::warn!("{error}");
+            settings_load_error = Some(match settings_load_error.take() {
+                Some(previous) => format!("{previous}. {error}"),
+                None => error,
+            });
+        }
+        actual_enabled
+    };
+    #[cfg(not(target_os = "windows"))]
+    let initial_startup_enabled = false;
     let settings_path = Arc::new(loaded_settings_path);
     let application_settings = Arc::new(Mutex::new(initial_settings));
     let settings_window = SettingsPrototype::new().map_err(|error| {
@@ -1620,6 +1689,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings_window.set_capture_shortcut(current.capture_shortcut.display().into());
         settings_window.set_notifications_enabled(current.notifications_enabled);
     }
+    settings_window.set_startup_supported(cfg!(target_os = "windows"));
+    settings_window.set_startup_enabled(initial_startup_enabled);
     if let Some(error) = settings_load_error {
         settings_window.set_settings_message(error.into());
     }
@@ -1696,6 +1767,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    #[cfg(target_os = "windows")]
+    {
+        let settings_for_startup = application_settings.clone();
+        let settings_path_for_startup = settings_path.clone();
+        let weak_settings_for_startup = settings_window.as_weak();
+        settings_window.on_startup_toggled(move |enabled| {
+            let result = (|| {
+                let mut current = settings_for_startup
+                    .lock()
+                    .map_err(|_| "Application settings lock is unavailable".to_string())?;
+                let mut registrar = platform::windows_startup::WindowsStartupRegistrar;
+                settings::change_startup_preference(
+                    &mut current,
+                    enabled,
+                    &mut registrar,
+                    |updated| {
+                        let path =
+                            settings_path_for_startup.as_ref().as_ref().ok_or_else(|| {
+                                "Carambola settings file path is unavailable".to_string()
+                            })?;
+                        updated.save_to(path)
+                    },
+                )
+            })();
+            if let Some(window) = weak_settings_for_startup.upgrade() {
+                match result {
+                    Ok(()) => {
+                        window.set_startup_enabled(enabled);
+                        window.set_settings_message(if enabled {
+                            "Carambola will start when you sign in.".into()
+                        } else {
+                            "Carambola will not start automatically.".into()
+                        });
+                    }
+                    Err(error) => {
+                        let actual_enabled =
+                            platform::windows_startup::is_startup_enabled().unwrap_or(false);
+                        window.set_startup_enabled(actual_enabled);
+                        window.set_settings_message(
+                            format!("Could not update the Windows startup setting: {error}").into(),
+                        );
+                    }
+                }
+            }
+        });
+    }
     let settings_for_shortcut = application_settings.clone();
     let settings_path_for_shortcut = settings_path.clone();
     #[cfg(target_os = "windows")]
@@ -3178,6 +3295,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
         match overlay_shortcut(key.as_str(), control, shift, text_editor_active) {
+            Some(OverlayShortcut::Undo) => overlay.invoke_undo_annotation(),
+            Some(OverlayShortcut::Redo) => overlay.invoke_redo_annotation(),
             Some(OverlayShortcut::Copy) => overlay.invoke_copy_image(),
             Some(OverlayShortcut::SaveDefault) => overlay.invoke_save_default_png(),
             Some(OverlayShortcut::SaveAs) => overlay.invoke_save_png(),
@@ -3240,6 +3359,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         settings.capture_shortcut.display().into(),
                                     );
                                     settings_window.set_notifications_enabled(settings.notifications_enabled);
+                                }
+                                match platform::windows_startup::is_startup_enabled() {
+                                    Ok(enabled) => settings_window.set_startup_enabled(enabled),
+                                    Err(error) => {
+                                        settings_window.set_startup_enabled(false);
+                                        settings_window.set_settings_message(
+                                            format!("Could not read the Windows startup registration: {error}").into(),
+                                        );
+                                    }
                                 }
                                 settings_window.set_shortcut_recording(false);
                                 let background_ready = match platform::windows::prepare_settings_window(settings_window.window()) {
@@ -3353,6 +3481,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod toolbar_layout_tests {
     use super::*;
+    use crate::core::selection::ResizeHandle;
 
     fn viewport(width: f64, height: f64) -> LogicalViewport {
         LogicalViewport { width, height }
@@ -3365,6 +3494,15 @@ mod toolbar_layout_tests {
             width,
             height,
         }
+    }
+
+    #[test]
+    fn toolbar_hides_only_while_resizing_a_selection() {
+        assert!(!toolbar_hidden_for_gesture(GestureKind::Create));
+        assert!(!toolbar_hidden_for_gesture(GestureKind::Move));
+        assert!(toolbar_hidden_for_gesture(GestureKind::Resize(
+            ResizeHandle::BottomRight
+        )));
     }
 
     #[test]

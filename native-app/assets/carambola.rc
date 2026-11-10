@@ -13,11 +13,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "Carambola native screenshot annotation app\0"
-            VALUE "FileVersion", "@VERSION@\0"
-            VALUE "OriginalFilename", "carambola-native.exe\0"
+            VALUE "FileDescription", "Carambola screenshot and annotation app\0"
+            VALUE "FileVersion", "@PUBLIC_VERSION@\0"
+            VALUE "OriginalFilename", "Carambola.exe\0"
             VALUE "ProductName", "Carambola\0"
-            VALUE "ProductVersion", "@VERSION@\0"
+            VALUE "ProductVersion", "@PUBLIC_VERSION@\0"
         END
     END
     BLOCK "VarFileInfo"

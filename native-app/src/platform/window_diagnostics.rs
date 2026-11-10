@@ -41,7 +41,7 @@ use windows::Win32::{
     },
 };
 
-const OVERLAY_TITLE: &str = "Carambola screenshot selection";
+const OVERLAY_TITLE: &str = "Carambola";
 const TRAY_HOST_TITLE: &str = "Carambola tray callback";
 const TASKBAR_ROOT_CLASSES: &[&str] = &[
     "Shell_TrayWnd",

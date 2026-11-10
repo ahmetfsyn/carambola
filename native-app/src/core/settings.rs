@@ -13,6 +13,7 @@ pub struct AppSettings {
     pub save_directory: Option<PathBuf>,
     pub capture_shortcut: HotkeyConfig,
     pub notifications_enabled: bool,
+    pub launch_on_startup: bool,
 }
 
 impl Default for AppSettings {
@@ -21,6 +22,7 @@ impl Default for AppSettings {
             save_directory: default_save_directory(),
             capture_shortcut: HotkeyConfig::DEFAULT,
             notifications_enabled: true,
+            launch_on_startup: true,
         }
     }
 }
@@ -115,6 +117,35 @@ pub trait ShortcutRegistrar {
     fn replace(&mut self, current: HotkeyConfig, requested: HotkeyConfig) -> Result<(), String>;
 }
 
+pub trait StartupRegistrar {
+    fn is_enabled(&mut self) -> Result<bool, String>;
+    fn set_enabled(&mut self, enabled: bool) -> Result<(), String>;
+}
+
+pub fn change_startup_preference(
+    settings: &mut AppSettings,
+    requested: bool,
+    registrar: &mut impl StartupRegistrar,
+    persist: impl FnOnce(&AppSettings) -> Result<(), String>,
+) -> Result<(), String> {
+    let previous_registration = registrar.is_enabled()?;
+    registrar.set_enabled(requested)?;
+
+    let mut updated = settings.clone();
+    updated.launch_on_startup = requested;
+    if let Err(persist_error) = persist(&updated) {
+        return match registrar.set_enabled(previous_registration) {
+            Ok(()) => Err(persist_error),
+            Err(rollback_error) => Err(format!(
+                "{persist_error}; the previous Windows startup registration could not be restored: {rollback_error}"
+            )),
+        };
+    }
+
+    settings.launch_on_startup = requested;
+    Ok(())
+}
+
 pub fn change_shortcut(
     settings: &mut AppSettings,
     requested: HotkeyConfig,
@@ -147,7 +178,10 @@ pub fn change_shortcut(
 
 #[cfg(test)]
 mod tests {
-    use super::{change_shortcut, validate_save_directory, AppSettings, ShortcutRegistrar};
+    use super::{
+        change_shortcut, change_startup_preference, validate_save_directory, AppSettings,
+        ShortcutRegistrar, StartupRegistrar,
+    };
     use crate::core::hotkey::HotkeyConfig;
     use std::{
         cell::RefCell,
@@ -169,6 +203,27 @@ mod tests {
     struct MockRegistrar {
         results: Vec<Result<(), String>>,
         calls: Vec<(HotkeyConfig, HotkeyConfig)>,
+    }
+
+    struct MockStartupRegistrar {
+        enabled: bool,
+        set_results: Vec<Result<(), String>>,
+        calls: Vec<bool>,
+    }
+
+    impl StartupRegistrar for MockStartupRegistrar {
+        fn is_enabled(&mut self) -> Result<bool, String> {
+            Ok(self.enabled)
+        }
+
+        fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
+            self.calls.push(enabled);
+            if !self.set_results.is_empty() {
+                self.set_results.remove(0)?;
+            }
+            self.enabled = enabled;
+            Ok(())
+        }
     }
 
     impl ShortcutRegistrar for MockRegistrar {
@@ -222,6 +277,7 @@ mod tests {
         assert_eq!(legacy.capture_shortcut, HotkeyConfig::DEFAULT);
         assert_eq!(legacy.save_directory, AppSettings::default().save_directory);
         assert!(legacy.notifications_enabled);
+        assert!(legacy.launch_on_startup);
         settings.notifications_enabled = false;
         settings.save_to(&path).unwrap();
         let disabled: AppSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -317,5 +373,99 @@ mod tests {
                 (alternate_shortcut(), HotkeyConfig::DEFAULT),
             ]
         );
+    }
+
+    #[test]
+    fn startup_is_enabled_by_default_and_saved_off_preference_survives_upgrade() {
+        assert!(AppSettings::default().launch_on_startup);
+
+        let existing: AppSettings = serde_json::from_str(r#"{"launch_on_startup":false}"#).unwrap();
+        assert!(!existing.launch_on_startup);
+    }
+
+    #[test]
+    fn explicit_off_startup_preference_persists_across_settings_reload() {
+        let path = temporary_path().join("settings.json");
+        let settings = AppSettings {
+            launch_on_startup: false,
+            ..AppSettings::default()
+        };
+        settings.save_to(&path).unwrap();
+
+        let reloaded: AppSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(!reloaded.launch_on_startup);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn enabling_and_disabling_startup_updates_registration_and_persists_choice() {
+        let mut settings = AppSettings::default();
+        let mut registrar = MockStartupRegistrar {
+            enabled: false,
+            set_results: Vec::new(),
+            calls: Vec::new(),
+        };
+        let persisted = RefCell::new(Vec::new());
+
+        change_startup_preference(&mut settings, true, &mut registrar, |updated| {
+            persisted.borrow_mut().push(updated.launch_on_startup);
+            Ok(())
+        })
+        .unwrap();
+        assert!(settings.launch_on_startup);
+        assert!(registrar.enabled);
+
+        change_startup_preference(&mut settings, false, &mut registrar, |updated| {
+            persisted.borrow_mut().push(updated.launch_on_startup);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!settings.launch_on_startup);
+        assert!(!registrar.enabled);
+        assert_eq!(*persisted.borrow(), vec![true, false]);
+        assert_eq!(registrar.calls, vec![true, false]);
+    }
+
+    #[test]
+    fn failed_startup_registration_does_not_change_or_persist_preference() {
+        let mut settings = AppSettings::default();
+        let mut registrar = MockStartupRegistrar {
+            enabled: false,
+            set_results: vec![Err("registry is not writable".into())],
+            calls: Vec::new(),
+        };
+        let persisted = RefCell::new(false);
+
+        let result = change_startup_preference(&mut settings, true, &mut registrar, |_| {
+            *persisted.borrow_mut() = true;
+            Ok(())
+        });
+
+        assert_eq!(result, Err("registry is not writable".into()));
+        assert!(settings.launch_on_startup);
+        assert!(!registrar.enabled);
+        assert!(!*persisted.borrow());
+    }
+
+    #[test]
+    fn startup_preference_persistence_failure_restores_previous_registration() {
+        let mut settings = AppSettings {
+            launch_on_startup: false,
+            ..AppSettings::default()
+        };
+        let mut registrar = MockStartupRegistrar {
+            enabled: false,
+            set_results: vec![Ok(()), Ok(())],
+            calls: Vec::new(),
+        };
+
+        let result = change_startup_preference(&mut settings, true, &mut registrar, |_| {
+            Err("settings file is read-only".into())
+        });
+
+        assert_eq!(result, Err("settings file is read-only".into()));
+        assert!(!settings.launch_on_startup);
+        assert!(!registrar.enabled);
+        assert_eq!(registrar.calls, vec![true, false]);
     }
 }

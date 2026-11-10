@@ -682,8 +682,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "carambola-native"
-version = "1.1.1"
+name = "carambola"
+version = "1.0.0"
 dependencies = [
  "arboard",
  "cc",

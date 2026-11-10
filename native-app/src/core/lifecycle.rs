@@ -33,13 +33,16 @@ pub enum ExportKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayShortcut {
+    Undo,
+    Redo,
     Copy,
     SaveDefault,
     SaveAs,
 }
 
-/// Resolve the overlay's Ctrl shortcuts. Text entry owns every key while the
-/// text editor has focus, and Ctrl+Shift+S is deliberately checked first.
+/// Resolve the overlay's Ctrl shortcuts. Text entry owns its own undo and redo
+/// while the text editor has focus, and Ctrl+Shift+S is deliberately checked
+/// before the default save shortcut.
 pub fn overlay_shortcut(
     key: &str,
     control: bool,
@@ -53,6 +56,8 @@ pub fn overlay_shortcut(
         ("s", true) => Some(OverlayShortcut::SaveAs),
         ("s", false) => Some(OverlayShortcut::SaveDefault),
         ("c", false) => Some(OverlayShortcut::Copy),
+        ("z", false) => Some(OverlayShortcut::Undo),
+        ("y", false) => Some(OverlayShortcut::Redo),
         _ => None,
     }
 }
@@ -203,5 +208,29 @@ mod tests {
         assert_eq!(overlay_shortcut("c", true, true, false), None);
         assert_eq!(overlay_shortcut("c", false, false, false), None);
         assert_eq!(overlay_shortcut("s", true, true, true), None);
+    }
+
+    #[test]
+    fn overlay_undo_redo_shortcuts_route_only_when_text_entry_is_inactive() {
+        assert_eq!(
+            overlay_shortcut("z", true, false, false),
+            Some(OverlayShortcut::Undo)
+        );
+        assert_eq!(
+            overlay_shortcut("Z", true, false, false),
+            Some(OverlayShortcut::Undo)
+        );
+        assert_eq!(
+            overlay_shortcut("y", true, false, false),
+            Some(OverlayShortcut::Redo)
+        );
+        assert_eq!(
+            overlay_shortcut("Y", true, false, false),
+            Some(OverlayShortcut::Redo)
+        );
+        assert_eq!(overlay_shortcut("z", true, true, false), None);
+        assert_eq!(overlay_shortcut("y", true, true, false), None);
+        assert_eq!(overlay_shortcut("z", false, false, false), None);
+        assert_eq!(overlay_shortcut("y", true, false, true), None);
     }
 }

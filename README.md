@@ -9,14 +9,21 @@ notification area.
 
 Download the latest **Windows x64** release from
 [GitHub Releases](https://github.com/ahmetfsyn/carambola/releases/latest). Releases
-provide a standalone executable, a portable ZIP, and `SHA256SUMS.txt`.
+provide `Carambola-Setup-1.0.exe`, a portable ZIP, a standalone executable, and
+`SHA256SUMS.txt`.
+
+The per-user installer places Carambola under
+`%LOCALAPPDATA%\Programs\Carambola`, adds a Start Menu shortcut, and offers an
+optional desktop shortcut. Close Carambola before upgrading or uninstalling;
+the installer will not terminate it automatically. Settings and diagnostics
+under `%APPDATA%\Carambola` are retained by upgrades and uninstall.
 
 For the portable ZIP, extract it to a folder you control and run
-`carambola-native.exe`. Keep the folder in a stable location: Windows toast
-registration uses the executable's current path. The standalone download has
-the same native executable. There is no installer, uninstaller, or automatic
-updater. The executable is not Authenticode-signed, so Windows may show a
-publisher warning.
+`Carambola.exe`. Keep the folder in a stable location: Windows toast
+registration uses the executable's current path. The standalone download
+contains the same application. The standalone executable and installer are not
+Authenticode-signed, so Windows may show a publisher warning. There is no
+automatic updater.
 
 The supported release target is Windows 10 or 11, x64. macOS and Linux source
 adapters are experimental and are not supported release targets. The app does
@@ -85,11 +92,27 @@ cargo build --locked --release
 .\tools\Test-ReleaseMetadata.ps1
 ```
 
-The executable is `target\release\carambola-native.exe`. Cargo downloads are
-needed the first time; add `--offline` after dependencies are present locally.
+Cargo builds `target\release\carambola.exe`; distribution packages present it
+as `Carambola.exe`. Cargo stores a three-component technical version such as
+`1.0.0` because its package metadata and Windows numeric version resource need
+that form. The public Carambola version is the first two components (`1.0`),
+and release tags use `v1.0`. The patch component must stay zero; increment the
+public minor version for each new release. Cargo downloads are needed the
+first time; add `--offline` after dependencies are present locally.
+
 The release workflow runs the same checks, builds into a fresh runner directory,
-and validates the release tag against the Cargo package version before it
-creates a release.
+and validates the two-part public tag against the Cargo package version before
+it creates a release. It uses a pinned Inno Setup command-line compiler to add
+the per-user installer alongside the standalone EXE, portable ZIP, and SHA-256
+checksums. To build the installer locally, run this from the repository root:
+
+```powershell
+.\scripts\build-windows-installer.ps1
+```
+
+The script builds the Windows release executable when needed. Install Inno
+Setup 7 from its official download page if `ISCC.exe` is not found; the script
+does not download or run third-party installers.
 
 The native app implementation is under `native-app/src`, and the Slint overlay
 is in `native-app/ui/overlay.slint`. See
@@ -103,8 +126,8 @@ verification.
 - Winit for the Windows event loop and window integration.
 - Windows APIs for display capture, clipboard access, dialogs, OCR, notifications,
   tray operations, and global shortcuts.
-- GitHub Actions for Windows checks, release packaging, checksums, and website
-  deployment.
+- GitHub Actions for Windows checks, release packaging, and checksums.
+- Cloudflare Workers for the independently deployed marketing website.
 
 ## Contributing
 
@@ -117,8 +140,8 @@ fixtures.
 
 ## Limitations and license
 
-Only Windows x64 is a supported release target. No installer, updater, code
-signature, or other platform release is provided. Display layouts, OCR language
+Only Windows x64 is a supported release target. There is no automatic updater
+or Authenticode code signature, and no other platform release is provided. Display layouts, OCR language
 availability, and notification behavior depend on the Windows environment.
 Some display and tray lifecycle cases still require manual verification.
 

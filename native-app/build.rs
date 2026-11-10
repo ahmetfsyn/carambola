@@ -14,6 +14,11 @@ fn main() {
             })
             .collect::<Vec<_>>();
         assert_eq!(parts.len(), 3, "Windows version must be major.minor.patch");
+        assert_eq!(
+            parts[2], 0,
+            "Cargo patch version must be zero; public Carambola releases use MAJOR.MINOR"
+        );
+        let public_version = format!("{}.{}", parts[0], parts[1]);
 
         let icon = PathBuf::from(
             env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"),
@@ -26,7 +31,7 @@ fn main() {
         let rc = rc_template
             .replace("@ICON_PATH@", &icon)
             .replace("@VERSION_FIELDS@", &version_fields)
-            .replace("@VERSION@", &version);
+            .replace("@PUBLIC_VERSION@", &public_version);
         assert!(
             !rc.contains('@'),
             "Windows resource template contains an unresolved placeholder"

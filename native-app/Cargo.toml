@@ -1,6 +1,6 @@
 [package]
-name = "carambola-native"
-version = "1.1.1"
+name = "carambola"
+version = "1.0.0"
 edition = "2021"
 publish = false
 build = "build.rs"
@@ -49,6 +49,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_Registry",
       "Win32_System_WinRT",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",

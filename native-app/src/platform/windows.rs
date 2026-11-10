@@ -296,7 +296,7 @@ pub fn save_png_dialog(
         },
     };
 
-    let owner = find_app_window(w!("Carambola screenshot selection"))?;
+    let owner = find_app_window(w!("Carambola"))?;
     crate::platform::window_diagnostics::trace_native_operation("save_png_dialog.before", owner);
     let mut file_name = "Carambola Screenshot.png"
         .encode_utf16()
@@ -1014,7 +1014,7 @@ pub fn activate_overlay() -> Result<(), String> {
     };
 
     let window: HWND = unsafe {
-        FindWindowW(None, w!("Carambola screenshot selection"))
+        FindWindowW(None, w!("Carambola"))
             .map_err(|error| format!("Could not locate the selection overlay window: {error}"))?
     };
     let mut process_id = 0u32;
