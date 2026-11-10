@@ -5,41 +5,55 @@ on:
     tags:
       # GitHub Actions filters are globs; the metadata validator enforces exact MAJOR.MINOR syntax.
       - 'v[0-9]*.[0-9]*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: native-release-${{ github.ref_name }}
+  group: native-release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   release-windows-x64:
-    if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+    if: ${{ (github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
     runs-on: windows-latest
     defaults:
       run:
         working-directory: native-app
     env:
       GH_TOKEN: ${{ github.token }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}\carambola-target
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
+
+      - name: Configure Cargo target directory
+        shell: pwsh
+        run: |
+          $targetDirectory = Join-Path $env:RUNNER_TEMP 'carambola-target'
+          "CARGO_TARGET_DIR=$targetDirectory" >> $env:GITHUB_ENV
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Validate release metadata and tag state
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: pwsh
         run: |
           ./tools/Test-ReleaseMetadata.ps1
           ./tools/Validate-ReleaseMetadata.ps1 -Tag $env:RELEASE_TAG
+
+          $releaseCommit = (git rev-parse HEAD).Trim()
+          "RELEASE_COMMIT=$releaseCommit" >> $env:GITHUB_ENV
 
           git merge-base --is-ancestor HEAD origin/master
           if ($LASTEXITCODE -ne 0) { throw 'The release tag is not on the current master history.' }
@@ -100,7 +114,7 @@ jobs:
       - name: Stage release files and checksums
         id: package
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: pwsh
         run: |
           $version = $env:RELEASE_TAG.Substring(1)
@@ -248,7 +262,7 @@ jobs:
 
       - name: Create draft release with verified build outputs
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
           EXE_NAME: ${{ steps.package.outputs.exe_name }}
           ZIP_NAME: ${{ steps.package.outputs.zip_name }}
@@ -262,7 +276,7 @@ jobs:
           $checksumsPath = Join-Path $env:RELEASE_DIR 'SHA256SUMS.txt'
           gh release create $env:RELEASE_TAG $exePath $zipPath $setupPath $checksumsPath `
             --draft --verify-tag --title "Carambola $env:RELEASE_TAG (Windows x64)" `
-            --notes-file $releaseNotes --target $env:GITHUB_SHA --repo $env:GITHUB_REPOSITORY
+            --notes-file $releaseNotes --target $env:RELEASE_COMMIT --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release and upload every artifact.' }
 
           $checkDir = Join-Path $env:RUNNER_TEMP 'carambola-release-remote-check'
