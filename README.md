@@ -9,7 +9,7 @@ notification area.
 
 Download the latest **Windows x64** release from
 [GitHub Releases](https://github.com/ahmetfsyn/carambola/releases/latest). Releases
-provide `Carambola-Setup-1.0.exe`, a portable ZIP, a standalone executable, and
+provide `Carambola-Setup-1.2.exe`, a portable ZIP, a standalone executable, and
 `SHA256SUMS.txt`.
 
 The per-user installer places Carambola under
@@ -94,11 +94,11 @@ cargo build --locked --release
 
 Cargo builds `target\release\carambola.exe`; distribution packages present it
 as `Carambola.exe`. Cargo stores a three-component technical version such as
-`1.0.0` because its package metadata and Windows numeric version resource need
-that form. The public Carambola version is the first two components (`1.0`),
-and release tags use `v1.0`. The patch component must stay zero; increment the
-public minor version for each new release. Cargo downloads are needed the
-first time; add `--offline` after dependencies are present locally.
+`1.2.0` because its package metadata and Windows numeric version resource need
+that form. The public Carambola version is the first two components (`1.2`),
+and the matching release tag is `v1.2`. The patch component must stay zero;
+increment the public minor version for each new release. Cargo downloads are
+needed the first time; add `--offline` after dependencies are present locally.
 
 The release workflow runs the same checks, builds into a fresh runner directory,
 and validates the two-part public tag against the Cargo package version before

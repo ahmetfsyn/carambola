@@ -4,6 +4,7 @@ Import-Module (Join-Path $PSScriptRoot 'ReleaseMetadata.psm1') -Force
 $validCases = @(
     @{ Tag = 'v1.0'; PackageVersion = '1.0.0'; PublicVersion = '1.0' },
     @{ Tag = 'v1.1'; PackageVersion = '1.1.0'; PublicVersion = '1.1' },
+    @{ Tag = 'v1.2'; PackageVersion = '1.2.0'; PublicVersion = '1.2' },
     @{ Tag = 'v2.0'; PackageVersion = '2.0.0'; PublicVersion = '2.0' }
 )
 
