@@ -13,5 +13,7 @@ pub mod ocr;
 pub mod selection;
 pub mod session;
 pub mod settings;
+#[cfg(target_os = "windows")]
+pub mod updater;
 #[cfg(test)]
 mod workflow_test;

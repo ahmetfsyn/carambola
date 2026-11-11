@@ -696,6 +696,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "semver",
  "slint",
  "slint-build",
  "windows",

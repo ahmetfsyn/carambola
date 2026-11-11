@@ -6,6 +6,8 @@ pub mod windows;
 mod windows_notifications;
 #[cfg(target_os = "windows")]
 pub mod windows_startup;
+#[cfg(target_os = "windows")]
+pub mod windows_updater;
 
 #[cfg(target_os = "windows")]
 pub fn initialize_notification_registration() -> Result<(), String> {

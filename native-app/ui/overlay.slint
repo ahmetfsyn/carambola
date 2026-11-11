@@ -89,6 +89,7 @@ export component OverlayPrototype inherits Window {
     in property <bool> text-entry-visible: false;
     in property <bool> text-entry-existing: false;
     in property <bool> text-entry-awaiting-position: false;
+    out property <bool> text-entry-input-focused: text-input.has-focus;
     in property <string> text-entry-message: "";
     in-out property <string> text-entry-value: "";
     in property <int> text-entry-line-count: 1;
@@ -128,6 +129,7 @@ export component OverlayPrototype inherits Window {
     callback tool-selected(int);
     callback submit-text(string);
     callback cancel-text();
+    callback request-text-entry-focus();
     callback text-content-changed(string);
     callback text-style-changed(bool, bool, int);
     callback request-text-reposition();
@@ -141,6 +143,7 @@ export component OverlayPrototype inherits Window {
     callback request-capture();
 
     focus-selection => { escape-scope.focus(); }
+    request-text-entry-focus => { text-input.focus(); }
 
     changed visible => {
         if (self.visible) {
@@ -768,9 +771,9 @@ export component SettingsPrototype inherits Window {
     title: "Carambola Settings";
     icon: @image-url("../assets/carambola.ico");
     preferred-width: 440px;
-    preferred-height: 370px;
+    preferred-height: 420px;
     min-width: 440px;
-    min-height: 370px;
+    min-height: 420px;
     background: #0b1220;
 
     in-out property <string> save-directory: "";
@@ -780,10 +783,13 @@ export component SettingsPrototype inherits Window {
     in property <bool> startup-supported: false;
     in-out property <bool> shortcut-recording: false;
     in-out property <string> settings-message: "";
+    in property <bool> updater-supported: false;
+    in-out property <bool> update-checking: false;
     callback choose-save-directory();
     callback shortcut-key-captured(string, bool, bool, bool, bool);
     callback notifications-toggled(bool);
     callback startup-toggled(bool);
+    callback check-for-updates();
     callback close-settings();
 
     Rectangle {
@@ -925,6 +931,35 @@ export component SettingsPrototype inherits Window {
         font-size: 10px;
         vertical-alignment: center;
         overflow: elide;
+    }
+    Text {
+        x: 40px; y: 326px; width: 250px; height: 22px;
+        visible: root.updater-supported;
+        text: "Windows app updates";
+        color: #e2e8f0;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: parent.width - 142px; y: 322px; width: 102px; height: 32px;
+        visible: root.updater-supported;
+        background: root.update-checking ? #075985 : #1e293b;
+        border-color: #334155;
+        border-width: 1px;
+        border-radius: 6px;
+        Text {
+            text: root.update-checking ? "Checking…" : "Check updates";
+            color: #e2e8f0;
+            font-size: 10px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        TouchArea {
+            enabled: !root.update-checking;
+            mouse-cursor: pointer;
+            clicked => { root.check-for-updates(); }
+        }
     }
     Rectangle {
         x: parent.width - 124px; y: parent.height - 60px; width: 84px; height: 30px;

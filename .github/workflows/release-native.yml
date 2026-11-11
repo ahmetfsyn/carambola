@@ -58,15 +58,20 @@ jobs:
           git merge-base --is-ancestor HEAD origin/master
           if ($LASTEXITCODE -ne 0) { throw 'The release tag is not on the current master history.' }
 
-          $releaseCheck = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" 2>&1
-          $releaseCheckExit = $LASTEXITCODE
-          if ($releaseCheckExit -eq 0) { throw "A GitHub Release already exists for $env:RELEASE_TAG; refusing to overwrite it." }
-          if (($releaseCheck -join "`n") -notmatch 'Not Found|404') {
-            throw "Could not prove that no GitHub Release exists for $env:RELEASE_TAG. $($releaseCheck -join ' ')"
+          $releaseList = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect existing GitHub Releases for $env:RELEASE_TAG. $($releaseList -join ' ')"
           }
-          # The 404 is expected for a new tag, but PowerShell steps propagate the
-          # last native exit code unless it is cleared after the check succeeds.
-          $global:LASTEXITCODE = 0
+          $releaseListJson = $releaseList -join "`n"
+          $matchingReleases = @(($releaseListJson | ConvertFrom-Json) | Where-Object { $_.tag_name -eq $env:RELEASE_TAG })
+          if ($matchingReleases.Count -gt 1) {
+            throw "Multiple GitHub Releases already use $env:RELEASE_TAG; refusing to modify an ambiguous release state."
+          }
+          if ($matchingReleases.Count -eq 1 -and !$matchingReleases[0].draft) {
+            Write-Host "A published release already exists for $env:RELEASE_TAG; the release step will verify it without modifying it."
+          } elseif ($matchingReleases.Count -eq 1) {
+            Write-Host "Found existing draft release $($matchingReleases[0].id) for $env:RELEASE_TAG; the release step will resume it."
+          }
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -278,10 +283,56 @@ jobs:
           $zipPath = Join-Path $env:RELEASE_DIR $env:ZIP_NAME
           $setupPath = Join-Path $env:RELEASE_DIR $env:SETUP_NAME
           $checksumsPath = Join-Path $env:RELEASE_DIR 'SHA256SUMS.txt'
-          gh release create $env:RELEASE_TAG $exePath $zipPath $setupPath $checksumsPath `
-            --draft --verify-tag --title "Carambola $env:RELEASE_TAG (Windows x64)" `
-            --notes-file $releaseNotes --target $env:RELEASE_COMMIT --repo $env:GITHUB_REPOSITORY
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release and upload every artifact.' }
+          $apiPath = "repos/$env:GITHUB_REPOSITORY"
+          $releaseListJson = gh api "$apiPath/releases?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect existing releases before creating or resuming a release.' }
+          $releaseListText = $releaseListJson -join "`n"
+          $releaseList = @($releaseListText | ConvertFrom-Json)
+          $matchingReleases = @($releaseList | Where-Object { $_.tag_name -eq $env:RELEASE_TAG })
+          if ($matchingReleases.Count -gt 1) {
+            throw "Multiple GitHub Releases already use $env:RELEASE_TAG; refusing to modify an ambiguous release state."
+          }
+
+          if ($matchingReleases.Count -eq 0) {
+            $requestPath = Join-Path $env:RUNNER_TEMP 'carambola-release-request.json'
+            $request = @{
+              tag_name = $env:RELEASE_TAG
+              target_commitish = $env:RELEASE_COMMIT
+              name = "Carambola $env:RELEASE_TAG (Windows x64)"
+              body = Get-Content -Raw -LiteralPath $releaseNotes
+              draft = $true
+              prerelease = $false
+            } | ConvertTo-Json -Depth 4
+            [System.IO.File]::WriteAllText($requestPath, $request, [System.Text.UTF8Encoding]::new($false))
+
+            $releaseJson = gh api --method POST "$apiPath/releases" --input $requestPath
+            if ($LASTEXITCODE -ne 0) { throw 'GitHub did not create the requested draft release.' }
+            $release = ($releaseJson -join "`n") | ConvertFrom-Json
+          } else {
+            $release = $matchingReleases[0]
+          }
+
+          if (!$release.id -or $release.tag_name -ne $env:RELEASE_TAG) {
+            throw "GitHub returned a release without the expected ID and tag $env:RELEASE_TAG."
+          }
+
+          $requiredPaths = @($exePath, $zipPath, $setupPath, $checksumsPath)
+          $requiredNames = @($env:EXE_NAME, $env:ZIP_NAME, $env:SETUP_NAME, 'SHA256SUMS.txt')
+          $existingNames = @($release.assets | ForEach-Object name)
+          $missingPaths = @()
+          for ($index = 0; $index -lt $requiredNames.Count; $index++) {
+            if ($existingNames -notcontains $requiredNames[$index]) {
+              $missingPaths += $requiredPaths[$index]
+            }
+          }
+
+          if ($missingPaths.Count -gt 0 -and !$release.draft) {
+            throw 'The published release is missing one or more required assets; refusing to modify it.'
+          }
+          if ($missingPaths.Count -gt 0) {
+            gh release upload $env:RELEASE_TAG @missingPaths --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) { throw 'Could not upload the missing assets to the existing draft release.' }
+          }
 
           $checkDir = Join-Path $env:RUNNER_TEMP 'carambola-release-remote-check'
           New-Item -ItemType Directory -Path $checkDir -Force | Out-Null
@@ -299,17 +350,27 @@ jobs:
             throw 'Uploaded SHA256SUMS.txt differs from the locally generated file.'
           }
 
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
-          if (!$release.draft) { throw 'The release must remain a draft until all uploaded assets have been verified.' }
+          $releaseJson = gh api "$apiPath/releases/$($release.id)"
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect release ID $($release.id) after asset verification." }
+          $release = ($releaseJson -join "`n") | ConvertFrom-Json
+          if ($release.tag_name -ne $env:RELEASE_TAG) {
+            throw "Release ID $($release.id) is associated with unexpected tag '$($release.tag_name)'."
+          }
           $names = @($release.assets | ForEach-Object name)
           foreach ($name in @($env:EXE_NAME, $env:ZIP_NAME, $env:SETUP_NAME, 'SHA256SUMS.txt')) {
             if ($names -notcontains $name) { throw "Expected release asset is missing: $name" }
           }
 
-          gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" -F draft=false | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'Assets passed verification, but the release could not be published.' }
+          if ($release.draft) {
+            gh api --method PATCH "$apiPath/releases/$($release.id)" -F draft=false | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Assets passed verification, but the release could not be published.' }
+          } else {
+            Write-Host "Release $($release.id) is already published; verified assets were left unchanged."
+          }
 
-          $published = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          $publishedJson = gh api "$apiPath/releases/$($release.id)"
+          if ($LASTEXITCODE -ne 0) { throw "Could not verify the final state of release ID $($release.id)." }
+          $published = ($publishedJson -join "`n") | ConvertFrom-Json
           if ($published.draft -or $published.tag_name -ne $env:RELEASE_TAG) {
             throw 'The release was not published under the requested tag.'
           }

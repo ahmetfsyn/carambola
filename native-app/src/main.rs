@@ -641,6 +641,31 @@ fn show_text_editor(
             .min((viewport_height - TEXT_EDITOR_HEIGHT).max(0.0)) as f32,
     );
     overlay.set_text_entry_visible(true);
+    schedule_text_entry_focus(overlay);
+}
+
+fn schedule_text_entry_focus(overlay: &OverlayPrototype) {
+    let weak_overlay = overlay.as_weak();
+    slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+        let Some(overlay) = weak_overlay.upgrade() else {
+            return;
+        };
+        if !should_focus_text_entry(
+            overlay.get_text_entry_visible(),
+            overlay.get_text_entry_awaiting_position(),
+        ) {
+            return;
+        }
+
+        overlay.invoke_request_text_entry_focus();
+        if !overlay.get_text_entry_input_focused() {
+            log::warn!("Text editor is visible but did not obtain keyboard focus");
+        }
+    });
+}
+
+fn should_focus_text_entry(visible: bool, awaiting_position: bool) -> bool {
+    visible && !awaiting_position
 }
 
 fn sync_annotation_controls(overlay: &OverlayPrototype, editor: &AnnotationEditor) {
@@ -1553,6 +1578,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup_started = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     #[cfg(target_os = "windows")]
+    if let Some(result) = platform::windows_updater::run_handoff_if_requested() {
+        result.map_err(std::io::Error::other)?;
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
     if std::env::args_os().any(|argument| argument == "--test-notification") {
         let frame = CapturedFrame::new(8, 8, vec![48, 128, 224, 255].repeat(64))
             .map_err(std::io::Error::other)?;
@@ -1691,6 +1721,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     settings_window.set_startup_supported(cfg!(target_os = "windows"));
     settings_window.set_startup_enabled(initial_startup_enabled);
+    #[cfg(target_os = "windows")]
+    settings_window.set_updater_supported(platform::windows_updater::is_installed_copy());
     if let Some(error) = settings_load_error {
         settings_window.set_settings_message(error.into());
     }
@@ -1811,6 +1843,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let weak_settings_for_update = settings_window.as_weak();
+        settings_window.on_check_for_updates(move || {
+            let Some(window) = weak_settings_for_update.upgrade() else {
+                return;
+            };
+            if window.get_update_checking() {
+                return;
+            }
+            if !platform::windows_updater::is_installed_copy() {
+                window.set_settings_message(
+                    "Updates are available for the installed copy of Carambola.".into(),
+                );
+                return;
+            }
+
+            window.set_update_checking(true);
+            window.set_settings_message("Checking for Carambola updates…".into());
+            let weak_settings_for_update_result = weak_settings_for_update.clone();
+            thread::spawn(move || {
+                let result = platform::windows_updater::check_for_updates(env!("CARGO_PKG_VERSION"));
+                if let Err(error) = &result {
+                    log::warn!("Carambola update check failed: {error}");
+                }
+                let dispatch_result = slint::invoke_from_event_loop(move || {
+                    let Some(window) = weak_settings_for_update_result.upgrade() else {
+                        return;
+                    };
+                    window.set_update_checking(false);
+                    match result {
+                        Ok(Some(offer)) => {
+                            let version = offer.version.to_string();
+                            if !platform::windows_updater::confirm_update(&version) {
+                                window.set_settings_message(
+                                    format!("Carambola {version} is available; installation was cancelled.")
+                                        .into(),
+                                );
+                                return;
+                            }
+
+                            window.set_update_checking(true);
+                            window.set_settings_message(
+                                format!("Downloading and verifying Carambola {version}…").into(),
+                            );
+                            let weak_settings_for_download = window.as_weak();
+                            thread::spawn(move || {
+                                let result = platform::windows_updater::download_and_verify(&offer)
+                                    .and_then(|installer| {
+                                        platform::windows_updater::start_handoff(&installer)
+                                    });
+                                match result {
+                                    Ok(()) => {
+                                        log::info!("Verified update is ready; closing Carambola for Setup");
+                                        if let Err(error) = slint::invoke_from_event_loop(move || {
+                                            if let Some(window) = weak_settings_for_download.upgrade() {
+                                                window.set_update_checking(false);
+                                                window.set_settings_message(
+                                                    "Update verified. Carambola is closing before Setup starts.".into(),
+                                                );
+                                            }
+                                            let _ = slint::quit_event_loop();
+                                        }) {
+                                            log::warn!("Could not finish the update handoff: {error}");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        log::warn!("Carambola update download or handoff failed: {error}");
+                                        let display_error = error.clone();
+                                        if let Err(dispatch_error) = slint::invoke_from_event_loop(move || {
+                                            if let Some(window) = weak_settings_for_download.upgrade() {
+                                                window.set_update_checking(false);
+                                                window.set_settings_message(
+                                                    format!("Update failed: {display_error}").into(),
+                                                );
+                                            }
+                                        }) {
+                                            log::warn!("Could not show the update error in Settings: {dispatch_error}");
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        Ok(None) => window.set_settings_message(
+                            "Carambola is up to date; no newer compatible Windows release was found."
+                                .into(),
+                        ),
+                        Err(error) => window.set_settings_message(
+                            format!("Could not check for updates: {error}").into(),
+                        ),
+                    }
+                });
+                if let Err(error) = dispatch_result {
+                    log::warn!("Could not display the Carambola update check result: {error}");
+                }
+            });
         });
     }
     let settings_for_shortcut = application_settings.clone();
@@ -3654,5 +3784,13 @@ mod toolbar_layout_tests {
         assert_eq!(text_editor_visual_line_count("one line"), 1);
         assert_eq!(text_editor_visual_line_count("one\ntwo\nthree"), 3);
         assert_eq!(text_editor_visual_line_count(&"x\n".repeat(12)), 6);
+    }
+
+    #[test]
+    fn deferred_text_focus_only_runs_for_an_active_editor() {
+        assert!(should_focus_text_entry(true, false));
+        assert!(!should_focus_text_entry(false, false));
+        assert!(!should_focus_text_entry(true, true));
+        assert!(!should_focus_text_entry(false, true));
     }
 }

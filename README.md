@@ -22,8 +22,7 @@ For the portable ZIP, extract it to a folder you control and run
 `Carambola.exe`. Keep the folder in a stable location: Windows toast
 registration uses the executable's current path. The standalone download
 contains the same application. The standalone executable and installer are not
-Authenticode-signed, so Windows may show a publisher warning. There is no
-automatic updater.
+Authenticode-signed, so Windows may show a publisher warning.
 
 The supported release target is Windows 10 or 11, x64. macOS and Linux source
 adapters are experimental and are not supported release targets. The app does
@@ -39,6 +38,7 @@ not require WebView2.
 - Run OCR on a background worker using Windows' installed OCR language packs.
 - Configure the capture shortcut, save folder, and notification preference in
   Settings.
+- Manually check for updates from Settings in an installed copy of Carambola.
 - Show optional Windows notifications after successful image export and OCR.
 
 ## Use Carambola
@@ -114,6 +114,16 @@ The script builds the Windows release executable when needed. Install Inno
 Setup 7 from its official download page if `ISCC.exe` is not found; the script
 does not download or run third-party installers.
 
+An installed copy can check GitHub Releases from **Settings → Check updates**.
+The updater considers only newer stable two-part versions with the current
+Windows x64 EXE, portable ZIP, installer, and checksum manifest; legacy tag
+formats and incomplete or prerelease releases are skipped. It downloads over
+HTTPS, verifies the installer SHA-256 against `SHA256SUMS.txt`, and asks before
+downloading. A small handoff waits for Carambola to exit before opening the
+normal per-user Setup program, which retains `%APPDATA%\Carambola`. Updates are
+manual and never install silently. Portable copies do not run the installer
+updater; replace their files using the portable release download.
+
 The native app implementation is under `native-app/src`, and the Slint overlay
 is in `native-app/ui/overlay.slint`. See
 [native-app/WINDOWS_MANUAL_REGRESSION.md](native-app/WINDOWS_MANUAL_REGRESSION.md)
@@ -140,8 +150,8 @@ fixtures.
 
 ## Limitations and license
 
-Only Windows x64 is a supported release target. There is no automatic updater
-or Authenticode code signature, and no other platform release is provided. Display layouts, OCR language
+Only Windows x64 is a supported release target. There is no Authenticode code
+signature, and no other platform release is provided. Display layouts, OCR language
 availability, and notification behavior depend on the Windows environment.
 Some display and tray lifecycle cases still require manual verification.
 
