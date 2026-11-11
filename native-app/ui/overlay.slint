@@ -90,6 +90,7 @@ export component OverlayPrototype inherits Window {
     in property <bool> text-entry-existing: false;
     in property <bool> text-entry-awaiting-position: false;
     out property <bool> text-entry-input-focused: text-input.has-focus;
+    out property <length> text-entry-input-viewport-height: text-input.visible-height;
     in property <string> text-entry-message: "";
     in-out property <string> text-entry-value: "";
     in property <int> text-entry-line-count: 1;
@@ -102,7 +103,8 @@ export component OverlayPrototype inherits Window {
     in-out property <bool> text-bold: false;
     in-out property <bool> text-italic: false;
     in-out property <int> text-alignment: 0;
-    out property <length> text-entry-content-height: max(24px, min(116px, root.text-entry-line-count * 18px));
+    // Fluent TextEdit reserves 12px above and below its input viewport.
+    out property <length> text-entry-content-height: max(42px, min(132px, 24px + root.text-entry-line-count * 18px));
     out property <length> text-entry-panel-height: root.text-entry-awaiting-position ? 96px : 78px + root.text-entry-content-height + (root.text-entry-message == "" ? 0px : 14px);
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;

@@ -540,7 +540,7 @@ const TOOLBAR_DESIGN_WIDTH: f64 = 466.0;
 const TOOLBAR_DESIGN_HEIGHT: f64 = 38.0;
 const TOOLBAR_GAP: f64 = 8.0;
 const TEXT_EDITOR_WIDTH: f64 = 360.0;
-const TEXT_EDITOR_HEIGHT: f64 = 208.0;
+const TEXT_EDITOR_HEIGHT: f64 = 224.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ToolbarLayout {
@@ -3792,5 +3792,56 @@ mod toolbar_layout_tests {
         assert!(!should_focus_text_entry(false, false));
         assert!(!should_focus_text_entry(true, true));
         assert!(!should_focus_text_entry(false, true));
+    }
+
+    #[test]
+    fn text_editor_provides_a_visible_viewport_and_accepts_unicode_and_multiline_input() {
+        i_slint_backend_testing::init_no_event_loop();
+        let overlay = OverlayPrototype::new().expect("create overlay test component");
+        overlay.show().expect("show overlay test component");
+        overlay
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::WindowActiveChanged(true));
+        let weak_overlay = overlay.as_weak();
+        overlay.on_text_content_changed(move |text| {
+            if let Some(overlay) = weak_overlay.upgrade() {
+                overlay.set_text_entry_line_count(text_editor_visual_line_count(text.as_str()));
+            }
+        });
+
+        overlay.set_text_entry_visible(true);
+        overlay.invoke_request_text_entry_focus();
+        assert!(overlay.get_text_entry_input_focused());
+        assert!(
+            overlay.get_text_entry_input_viewport_height() > 0.0,
+            "TextEdit's inner viewport must be tall enough to receive and display input"
+        );
+
+        let type_text = |text: &str| {
+            for character in text.chars() {
+                let text: slint::SharedString = character.to_string().into();
+                overlay
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                        text: text.clone(),
+                    });
+                overlay
+                    .window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyReleased { text });
+            }
+        };
+        type_text("Carambola ığüşöç");
+        overlay
+            .window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: slint::platform::Key::Return.into(),
+            });
+        type_text("second line");
+
+        assert_eq!(
+            overlay.get_text_entry_value().as_str(),
+            "Carambola ığüşöç\nsecond line"
+        );
+        assert!(overlay.get_text_entry_input_viewport_height() >= 36.0);
     }
 }

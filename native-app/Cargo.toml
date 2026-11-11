@@ -32,6 +32,9 @@ slint-build = "1.18.1"
 cc = "1"
 embed-resource = "3.0.12"
 
+[dev-dependencies]
+i-slint-backend-testing = "1.18.1"
+
 [patch.crates-io]
 winit = { path = "vendor/winit-0.30.13" }
 

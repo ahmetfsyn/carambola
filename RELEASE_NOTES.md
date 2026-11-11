@@ -5,8 +5,8 @@ application for Windows 10/11 x64.
 
 ## What's new
 
-- The text annotation editor receives keyboard focus when it opens, so typing
-  can begin immediately.
+- The text annotation editor now keeps a visible input area, so new and existing
+  text annotations accept keyboard input when the editor opens.
 - Installed copies can check for compatible stable updates from Settings.
   Downloads use HTTPS, verify the published SHA-256 checksum, and require
   confirmation before opening the normal per-user installer.
